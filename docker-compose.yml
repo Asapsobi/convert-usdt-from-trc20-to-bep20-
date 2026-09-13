@@ -1,7 +1,8 @@
-# Stands up the whole MVP: C1-C5, S1, C6 (the API gateway), and the
-# proofrun driver, each against its own real Postgres. Scoped to that
-# task, NOT a production deployment artifact -- no TLS between services,
-# no secrets manager, single-replica everything, matching every
+# Stands up the whole MVP: C1-C5, S1, C6 (the API gateway), the proofrun
+# driver, and the ops console, each service against its own real Postgres
+# (the ops console owns no database -- see its own section below). Scoped
+# to that task, NOT a production deployment artifact -- no TLS between
+# services, no secrets manager, single-replica everything, matching every
 # component's own existing per-module docker-compose.yml (this file's own
 # DB user/password/db-name/port choices are copied from those, unchanged,
 # so this can run alongside or instead of them).
@@ -29,7 +30,8 @@
 # contract's already-verified address (pre-filled below, see
 # c2-deposit-watcher-build-prompts.md's own BscScan citation), a real
 # TronGrid API key, a real Tronsell/Netts/Catfee account, the real
-# funded TRON slot address(es), and a TRON gRPC node.
+# funded TRON slot address(es), a TRON gRPC node, and the ops console's
+# own operator credentials/session secret (OC_OPERATORS, OC_SESSION_SECRET).
 
 services:
   # ---- C1: ledger ----
@@ -275,6 +277,45 @@ services:
       GATEWAY_WATCHER_API_TOKEN: ${WATCHER_API_TOKEN_VALUE:-watchertoken}
     ports: ["8087:8087"]
 
+  # ---- ops console: internal dashboard over C1-C5/S1 ----
+  # No database of its own (session state is a signed cookie, not a
+  # server-side table) -- see opsconsole/cmd/opsconsoled/main.go's own
+  # doc comment and docs/03-build/ops-console-build-prompts.md.
+  opsconsole:
+    build: { context: ., dockerfile: Dockerfile, args: { MODULE_DIR: opsconsole, SERVER_BIN: opsconsoled, HAS_MIGRATE: "false" } }
+    depends_on:
+      ledger: { condition: service_started }
+      watcher: { condition: service_started }
+      screening: { condition: service_started }
+      broker: { condition: service_started }
+      dispatcher: { condition: service_started }
+      s1: { condition: service_started }
+    environment:
+      OC_LISTEN_ADDR: ":8091"
+      OC_LEDGER_BASE_URL: http://ledger:8080
+      OC_LEDGER_TOKEN: ${LEDGER_API_TOKEN_VALUE:-ledgertoken}
+      OC_WATCHER_BASE_URL: http://watcher:8082
+      OC_WATCHER_TOKEN: ${WATCHER_API_TOKEN_VALUE:-watchertoken}
+      OC_SCREENING_BASE_URL: http://screening:8083
+      OC_SCREENING_TOKEN: ${SCREENING_API_TOKEN_VALUE:-screentoken}
+      OC_BROKER_BASE_URL: http://broker:8084
+      OC_BROKER_TOKEN: ${BROKER_API_TOKEN_VALUE:-brokertoken}
+      OC_DISPATCHER_BASE_URL: http://dispatcher:8086
+      OC_DISPATCHER_TOKEN: ${DISPATCHER_API_TOKEN_VALUE:-dispatchertoken}
+      OC_S1_BASE_URL: http://s1:8085
+      OC_S1_C5_TOKEN: ${S1_C5_API_TOKEN_VALUE:-s1c5token}
+      # Signs the operator session cookie -- operator-supplied, no
+      # default (a placeholder here would sign every session with a
+      # publicly-known secret). See .env.proofrun.example.
+      OC_SESSION_SECRET: ${OC_SESSION_SECRET:?set OC_SESSION_SECRET in .env -- see .env.proofrun.example}
+      # "username:bcrypt_hash:display_name,..." -- see
+      # ops-console-build-prompts.md's own OC.1 operator-auth section.
+      # Operator-supplied, no default.
+      OC_OPERATORS: ${OC_OPERATORS:?set OC_OPERATORS in .env -- see .env.proofrun.example}
+      OC_AUDIT_LOG_PATH: /var/log/opsconsole/audit.log
+    volumes: ["opsconsole_audit:/var/log/opsconsole"]
+    ports: ["8091:8091"]
+
   # ---- proof-run driver (docs/03-build/mvp-proof-run-plan.md §2(b)) ----
   proofrun:
     build: { context: ., dockerfile: Dockerfile, args: { MODULE_DIR: proofrun, SERVER_BIN: proofrund, HAS_MIGRATE: "false" } }
@@ -306,3 +347,4 @@ volumes:
   s1_pgdata:
   dispatcher_pgdata:
   gateway_pgdata:
+  opsconsole_audit:

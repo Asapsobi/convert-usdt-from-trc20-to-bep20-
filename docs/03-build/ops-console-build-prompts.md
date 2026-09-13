@@ -1,5 +1,14 @@
 # Ops Console — build prompts
 
+> **This is the built one.** A separate, much larger, unbuilt design for the
+> same "operator dashboard" concern exists at
+> `operations-control-center-build-prompts.md` — written independently on
+> `origin/main` while this doc/service was being built on another branch, and
+> kept as a distinct file (rather than one overwriting the other) by merge
+> commit `3aed5fd`. Nothing in that doc has been built; reconciling the two
+> designs was explicitly deferred and is still open. If you're looking for
+> what actually runs today, see `opsconsole/` and this doc, not that one.
+
 **Target:** Go, no dedicated database of its own. **Consumer:** an AI coding
 agent (Claude Code or equivalent), same usage pattern as every prior
 build-prompts doc in this project — paste §0 once, then work chunk by chunk.

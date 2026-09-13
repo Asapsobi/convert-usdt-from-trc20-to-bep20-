@@ -1,6 +1,7 @@
 # Shared build for every Go module in this repo (ledger/, depositwatcher/,
-# screening/, energybroker/, dispatcher/, s1/, proofrun/) -- one Dockerfile,
-# parametrized by build args, rather than seven near-identical copies.
+# screening/, energybroker/, dispatcher/, s1/, gateway/, proofrun/,
+# opsconsole/) -- one Dockerfile, parametrized by build args, rather than
+# nine near-identical copies.
 # Written for docs/03-build/mvp-proof-run-plan.md's own stack; NOT exercised
 # against a real Docker daemon while writing it (this session's own
 # environment has no Docker installed) -- verify `docker compose build`
@@ -10,7 +11,7 @@
 # SERVER_BIN: the cmd/ subdirectory under MODULE_DIR to build as the
 #   server binary, e.g. "ledgerd", "dispatchd".
 # HAS_MIGRATE: "true" for every module with its own cmd/migrate (all of
-#   them except proofrun, which owns no database).
+#   them except proofrun and opsconsole, which own no database).
 
 ARG GO_VERSION=1.27
 FROM golang:${GO_VERSION}-alpine AS build
