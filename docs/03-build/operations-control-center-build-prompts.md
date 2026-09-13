@@ -1,5 +1,16 @@
 # Build prompt: Operations Control Center for `usdt-settlement-corridor`
 
+> **Status: not built, not reconciled.** While this doc was being written on
+> `origin/main`, a simpler operator dashboard covering much of the same need
+> was independently designed and built on another branch — see
+> `ops-console-build-prompts.md` and `opsconsole/`, which is the thing that
+> actually runs today. Merge commit `3aed5fd` kept both docs side by side
+> rather than picking one, and explicitly left reconciling them as a separate,
+> still-open decision. Read this as an unbuilt superset proposal (RBAC, a
+> dedicated Ops BFF, a React frontend, customer CRUD, an audit log) to weigh
+> against extending the already-shipped `opsconsole/` instead of building this
+> from scratch — not as a description of anything currently running.
+
 > Rewritten against the real, current codebase (checked directly against git on
 > `main`, commit `18edadb`) rather than assumptions. Everywhere the original ask
 > described something that doesn't exist yet, this version says so explicitly and
