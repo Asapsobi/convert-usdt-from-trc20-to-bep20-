@@ -117,16 +117,56 @@ the customer's own TRC20 address.
     a human decision is now required (see architecture §4 and "Open items" below).
   - Replay scenarios cover all three refund-triggering states plus the ordinary
     settle path.
+- **Shipped (13 Sep 2026), first slice — recorded here rather than silently closed:**
+  a leg stuck unable to broadcast its own forward transfer past
+  `RELAYD_FORWARDING_TIMEOUT` is refunded automatically (reuses C1's *existing*
+  `Dispatching→Held→Refunded` transitions, zero `ledger/` changes), and a leg whose
+  forward transfer already confirmed but whose upstream swap then failed lands
+  `UNRECOVERABLE` and fires a real alert (`internal/alert`). **Still open:** the manual
+  `HELD→REFUNDED` path via C3's own hold-review queue (cross-module — C3's own
+  `RefundEntryBuilder` is still `StubRefundEntryBuilder` repo-wide, not
+  Model-F-specific; needs a new relayd-facing endpoint C3's `Reject` can call), a leg
+  stuck `AWAITING_DEPOSIT` because `upstream.CreateOrder` itself never succeeds (needs
+  a new C1 `{Screened, Refunded}` transition plus a per-state timestamp neither exists
+  today), and real per-vendor `EXPIRED` semantics (gated on R2/R4 — see
+  `internal/orchestrate/settle.go`'s own doc comment on why `EXPIRED` is treated
+  identically to `FAILED` post-`FORWARDED` for now).
 
 ### R6 — replay ship-gate harness
-- **Scope:** `relayd`'s own `internal/replay`, mirroring C5's/C6's own convention —
-  builds and runs real `ledgerd` and the R1 watcher as subprocesses, drives a scenario
-  mix through the harness rather than mocking C1/C2′.
-- **Acceptance criteria:** minimum scenario mix — a full successful relay, a
-  screening hold that resolves to refund, an upstream `failed` before the forward
-  transfer (refund), and an upstream `failed` after the forward transfer
-  (`UNRECOVERABLE`, alert fires). All pass against real subprocesses before this
-  chunk is called done — no C1/C2′ mocks, same rule C6.9 already enforces.
+- **Scope:** `relayd`'s own `internal/replay` + `cmd/replay`, mirroring every sibling
+  component's own identical convention (confirmed by reading dispatcher's/gateway's own
+  `cmd/replay`, not assumed from this doc's own earlier wording below): connects to a
+  real, already-running `ledgerd` over HTTP plus a raw connection to its database for
+  fixture/assertion use, exactly like every other `cmd/replay` in this repo — starting
+  that `ledgerd` is the run's own caller's job (an operator or CI script), not this
+  binary's. No component's own replay harness spawns its upstream dependency's process
+  itself, and R1 (`tronwatcher`) is no exception: this harness fixtures the
+  funded→screened step directly via HTTP+DB (`internal/replay/ledgerfixture.go`,
+  mirroring `internal/testledger`'s own identical fixture), the same way dispatcher's
+  own replay harness never spins up a real `depositwatcher` either.
+- **Acceptance criteria, as shipped (13 Sep 2026) — deviates from this doc's own
+  original wording above, recorded here rather than silently:** the original scenario
+  mix ("a screening hold that resolves to refund," "an upstream `failed` before the
+  forward transfer") assumed R5 shipped in full. Since R5 shipped only a first slice
+  (see R5's own "Shipped" note above), the actual scenario mix is: a full successful
+  relay in **both** directions (TRC20→BEP20 and BEP20→TRC20 — stronger than the
+  original "a full successful relay," singular), a leg stuck unable to broadcast its
+  forward transfer → automatically refunded (this is what R5 actually built, and
+  stands in for both of the original doc's refund-triggering scenarios — relayd has no
+  distinct code path for "upstream failed before forward" today: it only ever learns an
+  upstream order's own status by polling it *after* its own forward transfer confirms,
+  so a pre-forward vendor failure is indistinguishable from any other reason the
+  forward attempt never completes), and an upstream `failed` *after* the forward
+  transfer (`UNRECOVERABLE`, a real alert fires exactly once). All four pass against a
+  real `ledgerd` — no C1 mocks, same rule C6.9 already enforces — confirmed by two real
+  runs (`go run ./cmd/replay`, seeds `1789317414438614000` and `424242`), both `ALL
+  PASSED`. One real bug this run itself found: the first FINAL ASSERTION draft asserted
+  every relay-leg suspense account closes to zero, which is *wrong* for an
+  `UNRECOVERABLE` leg — its own `asset:relay:leg:forwarding:<id>` account is supposed
+  to sit at the full forwarded amount forever (nothing ever posts a closing entry
+  against it, by design); fixed by excluding `UNRECOVERABLE` legs from that assertion
+  and adding a positive counterpart confirming the stranded balance is exactly right,
+  not just non-zero.
 
 ## Open items
 
