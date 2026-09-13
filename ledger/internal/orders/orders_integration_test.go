@@ -774,3 +774,121 @@ func TestListByStateAfter_FiltersByStateAndPaginates(t *testing.T) {
 		require.True(t, seen[o.ID], "order %d (state=funded) was never returned by any page", o.ID)
 	}
 }
+
+// TestCreate_RelayTierBothDirectionsRoundTrip is Model F's own
+// additive-migration proof, for BOTH directions -- migration 0010 added
+// 'RELAY' to the real Postgres order_tier ENUM, migration 0011 added
+// relay_direction (and its own tier-consistency CHECK constraint), and
+// orders.Relay/allTiers plus CreateParams.validate's new branch made
+// both a Go-side and a database-side reality. This is not a redundant
+// check: an earlier version of this same change only fixed
+// CreateParams.validate and missed that scanOrder/Create's own INSERT
+// hard-coded the asset pairing with no way to record which direction a
+// RELAY order actually is -- a real bug this exact round-trip assertion
+// (not just "Create returns no error") is what would have caught, since
+// the corruption only shows up on READ BACK, not on write.
+//
+// Everything else about a RELAY order (state machine, transitions,
+// reconciliation) is intentionally untested here: orders.Transition
+// never branches on Tier (confirmed by exhaustive grep before this tier
+// was added), so the existing State-keyed coverage above already
+// exercises a RELAY order's own transitions identically to every other
+// tier's.
+func TestCreate_RelayTierBothDirectionsRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+
+	cases := []struct {
+		name              string
+		amountInAsset     money.Asset
+		amountOutAsset    money.Asset
+		wantRecipientAddr string
+	}{
+		{"TRC20 in, BEP20 out (the primary happy-flow example)", money.USDT_TRC20, money.USDT_BEP20, "0xcustomer-bep20-address"},
+		{"BEP20 in, TRC20 out (the mirror direction)", money.USDT_BEP20, money.USDT_TRC20, "Tcustomer-trc20-address"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			n := atomic.AddInt64(&extIDSeq, 1)
+			o, err := orders.Create(ctx, pool, orders.CreateParams{
+				ExternalID: fmt.Sprintf("ext:%s:%s:%d", t.Name(), runID, n),
+				CustomerID: "cust-relay-1",
+				Tier:       orders.Relay,
+				AmountIn:   money.Amount{Asset: tc.amountInAsset, Units: 100_000000},
+				AmountOut:  money.Amount{Asset: tc.amountOutAsset, Units: 99_700000},
+				// fee_units/network_fee_units are in amount_in's asset for
+				// RELAY -- relayd withholds its commission from the
+				// deposited asset before forwarding, since the upstream
+				// vendor pays the customer's destination wallet directly.
+				FeeUnits:         money.Amount{Asset: tc.amountInAsset, Units: 300000},
+				NetworkFeeUnits:  money.Amount{Asset: tc.amountInAsset, Units: 0},
+				RecipientAddress: tc.wantRecipientAddr,
+				QuotedAt:         time.Now(),
+				QuoteExpiresAt:   time.Now().Add(90 * time.Second),
+			})
+			require.NoError(t, err)
+			require.Equal(t, orders.Relay, o.Tier)
+			require.Equal(t, tc.amountInAsset, o.AmountIn.Asset, "Create's own returned order")
+			require.Equal(t, tc.amountOutAsset, o.AmountOut.Asset, "Create's own returned order")
+
+			// The real assertion: re-fetch from a FRESH query, proving the
+			// direction was actually persisted and correctly reconstructed
+			// by scanOrder, not just correct on the value Create happened
+			// to return from its own RETURNING clause in the same call.
+			fetched, err := orders.GetByExternalID(ctx, pool, o.ExternalID)
+			require.NoError(t, err)
+			require.Equal(t, orders.Relay, fetched.Tier)
+			require.Equal(t, orders.Quoted, fetched.State)
+			require.Equal(t, tc.amountInAsset, fetched.AmountIn.Asset, "re-fetched order's amount_in asset")
+			require.Equal(t, tc.amountOutAsset, fetched.AmountOut.Asset, "re-fetched order's amount_out asset")
+			require.Equal(t, tc.amountInAsset, fetched.FeeUnits.Asset, "re-fetched order's fee_units asset")
+		})
+	}
+}
+
+// TestCreate_RelayTierRejectsInvalidAssetPairing confirms
+// CreateParams.validate's new branch actually rejects a same-asset (or
+// otherwise nonsensical) pairing for RELAY, rather than only accepting
+// the two legal combinations by accident.
+func TestCreate_RelayTierRejectsInvalidAssetPairing(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	n := atomic.AddInt64(&extIDSeq, 1)
+
+	_, err := orders.Create(ctx, pool, orders.CreateParams{
+		ExternalID:       fmt.Sprintf("ext:%s:%s:%d", t.Name(), runID, n),
+		CustomerID:       "cust-relay-1",
+		Tier:             orders.Relay,
+		AmountIn:         money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
+		AmountOut:        money.Amount{Asset: money.USDT_TRC20, Units: 99_700000}, // same asset both sides -- invalid
+		FeeUnits:         money.Amount{Asset: money.USDT_TRC20, Units: 300000},
+		NetworkFeeUnits:  money.Amount{Asset: money.USDT_TRC20, Units: 0},
+		RecipientAddress: "T-some-address",
+		QuotedAt:         time.Now(),
+		QuoteExpiresAt:   time.Now().Add(90 * time.Second),
+	})
+	require.ErrorIs(t, err, orders.ErrInvalidParams)
+}
+
+// TestCreate_NonRelayTierRejectsRelayDirectionLeakage is the mirror
+// check: migration 0011's own orders_relay_direction_matches_tier CHECK
+// constraint must reject relay_direction being set for a non-RELAY
+// order at the database level, independent of the fact that Create's Go
+// code never does this on its own -- defense in depth, same posture as
+// every other cross-column invariant this schema enforces at the DB
+// layer (e.g. 0002's normal_side_matches_type).
+func TestCreate_NonRelayTierRejectsRelayDirectionLeakage(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	n := atomic.AddInt64(&extIDSeq, 1)
+
+	_, err := pool.Exec(ctx, `
+		INSERT INTO orders
+			(external_id, customer_id, tier, state, amount_in, amount_out,
+			 fee_units, network_fee_units, recipient_address, quoted_at, quote_expires_at,
+			 version, relay_direction)
+		VALUES ($1, $2, 'STANDARD', 'quoted', 100000000, 99700000, 300000, 0, $3, now(), now() + interval '90 seconds', 0, 'BEP20_TO_TRC20')
+	`, fmt.Sprintf("ext:%s:%s:%d", t.Name(), runID, n), "cust-1", "T-some-address")
+	require.Error(t, err, "a non-RELAY order with a non-NULL relay_direction must violate the CHECK constraint")
+}

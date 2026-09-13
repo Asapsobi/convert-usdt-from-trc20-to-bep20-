@@ -127,6 +127,24 @@ func (s *Store) Retire(ctx context.Context, slotID int) error {
 	return nil
 }
 
+// EVMAddress derives slotID's own EVM-format address (BSC included) --
+// the SAME secp256k1 key its TronAddress already comes from, just the
+// EIP-55 checksum encoding instead of TRON's base58check. See evm.go's
+// own doc comment for why this needs no new key, no new custody model,
+// and no new stored column: SlotKey.PublicKey already holds everything
+// this derivation needs.
+func (s *Store) EVMAddress(ctx context.Context, slotID int) (string, error) {
+	key, err := s.Get(ctx, slotID)
+	if err != nil {
+		return "", fmt.Errorf("slots: resolving EVM address for slot %d: %w", slotID, err)
+	}
+	addr, err := DeriveEVMAddress(key.PublicKey)
+	if err != nil {
+		return "", fmt.Errorf("slots: resolving EVM address for slot %d: %w", slotID, err)
+	}
+	return addr, nil
+}
+
 // Get fetches one slot key row by id.
 func (s *Store) Get(ctx context.Context, slotID int) (SlotKey, error) {
 	row := s.pool.QueryRow(ctx, `

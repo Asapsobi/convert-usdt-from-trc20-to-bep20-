@@ -131,7 +131,13 @@ func (a slotKeyGetterAdapter) Get(ctx context.Context, slotID int) (requests.Slo
 	if err != nil {
 		return requests.SlotKeyInfo{}, err
 	}
-	return requests.SlotKeyInfo{KMSKeyID: key.KMSKeyID, PublicKey: key.PublicKey, TronAddress: key.TronAddress}, nil
+	evmAddress, err := slots.DeriveEVMAddress(key.PublicKey)
+	if err != nil {
+		return requests.SlotKeyInfo{}, fmt.Errorf("deriving EVM address for slot %d: %w", slotID, err)
+	}
+	return requests.SlotKeyInfo{
+		KMSKeyID: key.KMSKeyID, PublicKey: key.PublicKey, TronAddress: key.TronAddress, EVMAddress: evmAddress,
+	}, nil
 }
 
 // kmsClientFromEnv builds the KMSClient this binary signs through.

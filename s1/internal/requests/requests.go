@@ -87,4 +87,11 @@ type SigningService interface {
 	// interface rather than something C5 has to hardcode or duplicate
 	// from wherever S1 keeps it.
 	SlotAddress(ctx context.Context, slotID int) (string, error)
+
+	// EVMAddress resolves a slot id to its EVM-format (BSC included)
+	// address -- the SAME key SlotAddress derives a TRON address from,
+	// added for Model F's own BEP20->TRC20 relay direction (see
+	// slots/evm.go's own doc comment). Public information, same posture
+	// as SlotAddress.
+	EVMAddress(ctx context.Context, slotID int) (string, error)
 }

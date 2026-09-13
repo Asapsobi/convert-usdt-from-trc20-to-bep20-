@@ -25,6 +25,16 @@ type postOrderRequest struct {
 	RecipientAddress string    `json:"recipient_address"`
 	QuotedAt         time.Time `json:"quoted_at"`
 	QuoteExpiresAt   time.Time `json:"quote_expires_at"`
+	// AmountInAsset/AmountOutAsset are only consulted for tier=RELAY --
+	// Model F's own bidirectional tier (see orders.CreateParams.validate's
+	// own doc comment on why RELAY, alone, cannot assume a fixed
+	// direction the way DIRECT/STANDARD/SWEEP always have). Every other
+	// tier keeps the original implicit convention (amount_in always
+	// USDT_BEP20, the other three always USDT_TRC20) and ignores these
+	// two fields entirely, preserving every existing caller's contract
+	// unchanged.
+	AmountInAsset  string `json:"amount_in_asset,omitempty"`
+	AmountOutAsset string `json:"amount_out_asset,omitempty"`
 }
 
 type orderResponse struct {
@@ -44,6 +54,13 @@ type orderResponse struct {
 	Version          int32     `json:"version"`
 	CreatedAt        time.Time `json:"created_at"`
 	UpdatedAt        time.Time `json:"updated_at"`
+	// AmountInAsset/AmountOutAsset are always present (unlike the
+	// request's own omitempty pair) -- a RELAY order's own direction is
+	// otherwise unrecoverable from this response alone, and a
+	// fixed-direction order's values are simply the implicit constants
+	// echoed back explicitly, never ambiguous either way.
+	AmountInAsset  string `json:"amount_in_asset"`
+	AmountOutAsset string `json:"amount_out_asset"`
 }
 
 func toOrderResponse(o orders.Order) orderResponse {
@@ -57,35 +74,66 @@ func toOrderResponse(o orders.Order) orderResponse {
 		RecipientAddress: o.RecipientAddress, SenderAddress: o.SenderAddress,
 		QuotedAt: o.QuotedAt, QuoteExpiresAt: o.QuoteExpiresAt,
 		Version: o.Version, CreatedAt: o.CreatedAt, UpdatedAt: o.UpdatedAt,
+		AmountInAsset: string(o.AmountIn.Asset), AmountOutAsset: string(o.AmountOut.Asset),
 	}
 }
 
-// postOrder is POST /v1/orders, always creating in Quoted. Amount fields
-// are parsed against the fixed assets orders.CreateParams itself
-// documents (amount_in is always USDT_BEP20, the other three always
-// USDT_TRC20) -- the request has no per-field asset to get wrong.
+// postOrder is POST /v1/orders, always creating in Quoted. For every
+// tier except RELAY, amount fields are parsed against the fixed assets
+// orders.CreateParams itself documents (amount_in is always USDT_BEP20,
+// the other three always USDT_TRC20) -- the request has no per-field
+// asset to get wrong. A RELAY order instead requires the caller to name
+// amount_in_asset/amount_out_asset explicitly (one of USDT_BEP20/
+// USDT_TRC20, the other way around from each other) -- see
+// orders.CreateParams.validate's own doc comment for why RELAY alone
+// cannot assume a fixed direction.
 func (s *Server) postOrder(w http.ResponseWriter, r *http.Request) {
 	var req postOrderRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
 
-	amountIn, err := money.ParseDecimal(req.AmountIn, money.USDT_BEP20)
+	amountInAsset, amountOutAsset := money.USDT_BEP20, money.USDT_TRC20
+	if orders.Tier(req.Tier) == orders.Relay {
+		var err error
+		amountInAsset, err = parseAssetField(req.AmountInAsset, "amount_in_asset")
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		amountOutAsset, err = parseAssetField(req.AmountOutAsset, "amount_out_asset")
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+	}
+
+	amountIn, err := money.ParseDecimal(req.AmountIn, amountInAsset)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	amountOut, err := money.ParseDecimal(req.AmountOut, money.USDT_TRC20)
+	amountOut, err := money.ParseDecimal(req.AmountOut, amountOutAsset)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	feeUnits, err := money.ParseDecimal(req.FeeUnits, money.USDT_TRC20)
+	// fee_units/network_fee_units are parsed against amount_out's asset
+	// for every tier except RELAY, which uses amount_in's instead -- see
+	// orders.CreateParams.validate's own doc comment for exactly why
+	// RELAY's fee is denominated in what relayd withholds before
+	// forwarding (the deposited asset), never in what the upstream
+	// vendor pays the customer directly.
+	feeAsset := amountOutAsset
+	if orders.Tier(req.Tier) == orders.Relay {
+		feeAsset = amountInAsset
+	}
+	feeUnits, err := money.ParseDecimal(req.FeeUnits, feeAsset)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	networkFeeUnits, err := money.ParseDecimal(req.NetworkFeeUnits, money.USDT_TRC20)
+	networkFeeUnits, err := money.ParseDecimal(req.NetworkFeeUnits, feeAsset)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -296,4 +344,19 @@ func (s *Server) postTransition(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respondJSON(w, http.StatusOK, toOrderResponse(updated))
+}
+
+// parseAssetField parses a RELAY order's required amount_in_asset/
+// amount_out_asset request field into a money.Asset -- required (unlike
+// every other tier, which never sends this field at all) because RELAY
+// is bidirectional and has no fixed convention to fall back on silently.
+func parseAssetField(raw, fieldName string) (money.Asset, error) {
+	if raw == "" {
+		return "", newAPIError(http.StatusBadRequest, errInvalidRequest.Code, fieldName+" is required for tier=RELAY")
+	}
+	asset := money.Asset(raw)
+	if !asset.Valid() {
+		return "", newAPIError(http.StatusBadRequest, errInvalidRequest.Code, fieldName+" is not a known asset")
+	}
+	return asset, nil
 }

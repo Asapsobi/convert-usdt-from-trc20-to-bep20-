@@ -1,7 +1,7 @@
 # Shared build for every Go module in this repo (ledger/, depositwatcher/,
 # screening/, energybroker/, dispatcher/, s1/, gateway/, proofrun/,
-# opsconsole/) -- one Dockerfile, parametrized by build args, rather than
-# nine near-identical copies.
+# opsconsole/, tronwatcher/, relayd/) -- one Dockerfile, parametrized by
+# build args, rather than eleven near-identical copies.
 # Written for docs/03-build/mvp-proof-run-plan.md's own stack; NOT exercised
 # against a real Docker daemon while writing it (this session's own
 # environment has no Docker installed) -- verify `docker compose build`

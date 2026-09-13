@@ -16,6 +16,17 @@
 # of the pipeline advances on its own via each service's own background
 # loop once C1's order state changes.
 #
+# tronwatcher (C2') and relayd were added for Model F, the zero-float
+# relay swap (docs/01-strategy/model-f-relay-findings.md,
+# docs/02-architecture/model-f-relay-architecture.md): tronwatcher is
+# C2's own TRON-side sibling (watches TRC20 deposits into a relay leg's
+# suspense account instead of a treasury account); relayd is the front
+# door plus driving loop for both relay directions, reusing C1/C3/C4/S1
+# as-is and depending on tronwatcher, watcher, broker, and s1 directly.
+# relayd runs against upstream.PlaceholderProvider by default -- no real
+# swap-vendor integration exists yet, see UPSTREAM_PROVIDER's own comment
+# below.
+#
 # NOT exercised against a real Docker daemon while writing it (this
 # session's own environment has no Docker installed) -- the equivalent
 # wiring (each binary run directly, against a locally-built Postgres) WAS
@@ -32,6 +43,10 @@
 # TronGrid API key, a real Tronsell/Netts/Catfee account, the real
 # funded TRON slot address(es), a TRON gRPC node, and the ops console's
 # own operator credentials/session secret (OC_OPERATORS, OC_SESSION_SECRET).
+# Model F additionally needs its own TRON xpub, TronGrid provider(s), a
+# real BSC RPC endpoint for relayd's own forward leg, and a real,
+# dedicated S1 slot ID (TRONWATCHER_XPUB, TRONWATCHER_PROVIDERS,
+# RELAYD_BSC_RPC_URL, RELAYD_SLOT_ID).
 
 services:
   # ---- C1: ledger ----
@@ -277,6 +292,118 @@ services:
       GATEWAY_WATCHER_API_TOKEN: ${WATCHER_API_TOKEN_VALUE:-watchertoken}
     ports: ["8087:8087"]
 
+  # ---- C2': TRON deposit watcher (Model F's own front door for the
+  # TRC20_TO_BEP20 relay direction) ----
+  tronwatcher-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: tronwatcher
+      POSTGRES_PASSWORD: tronwatcher
+      POSTGRES_DB: tronwatcher_dev
+    ports: ["5439:5432"]
+    volumes: ["tronwatcher_pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tronwatcher -d tronwatcher_dev"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  tronwatcher:
+    build: { context: ., dockerfile: Dockerfile, args: { MODULE_DIR: tronwatcher, SERVER_BIN: tronwatcherd } }
+    depends_on:
+      tronwatcher-db: { condition: service_healthy }
+      ledger: { condition: service_started }
+    environment:
+      TRONWATCHER_DATABASE_URL: postgres://tronwatcher:tronwatcher@tronwatcher-db:5432/tronwatcher_dev?sslmode=disable
+      TRONWATCHER_API_TOKENS: ${TRONWATCHER_API_TOKENS:-tronwatchertoken:relayd}
+      TRONWATCHER_LISTEN_ADDR: ":8092"
+      # Real BIP32 xpub for HD deposit-address derivation -- operator-
+      # supplied, no default, same posture as watcher's own WATCHER_XPUB.
+      # A SEPARATE xpub from watcher's own -- TRON and BSC addresses are
+      # derived independently (different encodings of related but
+      # distinct key material), never share one across the two watchers.
+      TRONWATCHER_XPUB: ${TRONWATCHER_XPUB:?set TRONWATCHER_XPUB in .env -- see .env.proofrun.example}
+      # name=url pairs, comma-separated -- real TronGrid endpoint(s),
+      # operator-supplied. Unset (the default) runs the HTTP boundary
+      # only, no live chain-watching engine -- see cmd/tronwatcherd's own
+      # doc comment.
+      TRONWATCHER_PROVIDERS: ${TRONWATCHER_PROVIDERS:?set TRONWATCHER_PROVIDERS in .env -- see .env.proofrun.example}
+      TRONWATCHER_API_KEY: ${TRONWATCHER_API_KEY:-}
+      TRONWATCHER_FINALITY_BASE_URL: ${TRONWATCHER_FINALITY_BASE_URL:-https://api.trongrid.io}
+      TRONWATCHER_LEDGER_BASE_URL: http://ledger:8080
+      TRONWATCHER_LEDGER_TOKEN: ${LEDGER_API_TOKEN_VALUE:-ledgertoken}
+      # Real, verified USDT-TRC20 mainnet contract -- see
+      # tronwatcher/internal/chain's own citation; override only if
+      # that's ever wrong.
+      TRONWATCHER_CONTRACT_ADDRESS: ${TRONWATCHER_CONTRACT_ADDRESS:-TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t}
+    ports: ["8092:8092"]
+
+  # ---- relayd: Model F's own zero-float relay (both directions) ----
+  relayd-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: relayd
+      POSTGRES_PASSWORD: relayd
+      POSTGRES_DB: relayd_dev
+    ports: ["5440:5432"]
+    volumes: ["relayd_pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relayd -d relayd_dev"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  relayd:
+    build: { context: ., dockerfile: Dockerfile, args: { MODULE_DIR: relayd, SERVER_BIN: relayd } }
+    depends_on:
+      relayd-db: { condition: service_healthy }
+      ledger: { condition: service_started }
+      tronwatcher: { condition: service_started }
+      watcher: { condition: service_started }
+      broker: { condition: service_started }
+      s1: { condition: service_started }
+    environment:
+      RELAYD_DATABASE_URL: postgres://relayd:relayd@relayd-db:5432/relayd_dev?sslmode=disable
+      RELAYD_LISTEN_ADDR: ":8093"
+      RELAYD_LEDGER_BASE_URL: http://ledger:8080
+      RELAYD_LEDGER_TOKEN: ${LEDGER_API_TOKEN_VALUE:-ledgertoken}
+      RELAYD_TRONWATCHER_BASE_URL: http://tronwatcher:8092
+      RELAYD_TRONWATCHER_TOKEN: ${TRONWATCHER_API_TOKEN_VALUE:-tronwatchertoken}
+      RELAYD_DEPOSITWATCHER_BASE_URL: http://watcher:8082
+      RELAYD_DEPOSITWATCHER_TOKEN: ${WATCHER_API_TOKEN_VALUE:-watchertoken}
+      RELAYD_ENERGY_BASE_URL: http://broker:8084
+      RELAYD_ENERGY_TOKEN: ${BROKER_API_TOKEN_VALUE:-brokertoken}
+      RELAYD_SIGNING_BASE_URL: http://s1:8085
+      RELAYD_SIGNING_TOKEN: ${S1_C5_API_TOKEN_VALUE:-s1c5token}
+      # The dedicated S1 slot relayd signs both directions' forward legs
+      # with -- deliberately separate from any Model D payout slot
+      # ("smaller blast radius," per docs/02-architecture/model-f-relay-architecture.md's
+      # own S1 entry). Operator-supplied, no default: a real slot number
+      # from a real S1 deployment.
+      RELAYD_SLOT_ID: ${RELAYD_SLOT_ID:?set RELAYD_SLOT_ID in .env -- see .env.proofrun.example}
+      RELAYD_ENERGY_PER_TRANSFER_UNITS: ${RELAYD_ENERGY_PER_TRANSFER_UNITS:-65000}
+      RELAYD_TRON_GRPC_ADDR: ${RELAYD_TRON_GRPC_ADDR:-grpc.trongrid.io:50051}
+      RELAYD_TRON_API_BASE_URL: ${RELAYD_TRON_API_BASE_URL:-https://api.trongrid.io}
+      # Real BSC RPC endpoint -- operator-supplied, no default (relayd's
+      # own BEP20_TO_TRC20 forward leg broadcasts a real transaction
+      # through this).
+      RELAYD_BSC_RPC_URL: ${RELAYD_BSC_RPC_URL:?set RELAYD_BSC_RPC_URL in .env -- see .env.proofrun.example}
+      # No real upstream swap-vendor integration exists yet (R2/R4 in
+      # docs/03-build/model-f-relay-build-prompts.md are still open
+      # business decisions) -- this default runs relayd against
+      # upstream.PlaceholderProvider, which always returns
+      # ErrNoVendorConfigured. Override BOTH vars together once a real
+      # vendor is chosen and wired (internal/upstream's own
+      # dependency_test.go documents the pattern to follow).
+      UPSTREAM_PROVIDER: ${UPSTREAM_PROVIDER:-placeholder}
+      UPSTREAM_ALLOW_PLACEHOLDER: ${UPSTREAM_ALLOW_PLACEHOLDER:-true}
+      # Commission basis points relayd withholds from the deposited
+      # (in-)asset -- see internal/orchestrate's own package doc comment
+      # on why the commission always comes out of amount_in, never out
+      # of the upstream vendor's own payout.
+      RELAYD_FEE_BASIS_POINTS: ${RELAYD_FEE_BASIS_POINTS:-25}
+    ports: ["8093:8093"]
+
   # ---- ops console: internal dashboard over C1-C5/S1 ----
   # No database of its own (session state is a signed cookie, not a
   # server-side table) -- see opsconsole/cmd/opsconsoled/main.go's own
@@ -347,4 +474,6 @@ volumes:
   s1_pgdata:
   dispatcher_pgdata:
   gateway_pgdata:
+  tronwatcher_pgdata:
+  relayd_pgdata:
   opsconsole_audit:

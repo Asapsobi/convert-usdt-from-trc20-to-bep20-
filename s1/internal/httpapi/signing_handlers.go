@@ -123,6 +123,24 @@ func (s *Server) getSlotAddress(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, map[string]string{"tron_address": addr})
 }
 
+// getSlotEVMAddress is GET /v1/slots/{id}/evm-address --
+// SigningService's own EVMAddress, over HTTP. Added for Model F's own
+// BEP20->TRC20 relay direction (see s1/internal/slots/evm.go's own doc
+// comment): the SAME slot key SlotAddress already reports a TRON
+// address for, in its EVM (BSC included) encoding.
+func (s *Server) getSlotEVMAddress(w http.ResponseWriter, r *http.Request) {
+	slotID, ok := urlParamInt(w, r, "id")
+	if !ok {
+		return
+	}
+	addr, err := s.Signing.EVMAddress(r.Context(), slotID)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]string{"evm_address": addr})
+}
+
 // postApprove is POST /v1/signing-requests/{id}/approve -- approver-only
 // (see auth.go). actor is resolved from the bearer token, never taken
 // from the request body, same posture every prior component's own

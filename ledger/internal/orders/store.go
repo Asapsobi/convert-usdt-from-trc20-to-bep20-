@@ -68,17 +68,58 @@ func (p CreateParams) validate() error {
 	if !p.Tier.Valid() {
 		return fmt.Errorf("%w: unknown tier %q", ErrInvalidParams, p.Tier)
 	}
-	if p.AmountIn.Asset != money.USDT_BEP20 {
-		return fmt.Errorf("%w: amount_in must be USDT_BEP20, got %q", ErrInvalidParams, p.AmountIn.Asset)
-	}
-	if p.AmountOut.Asset != money.USDT_TRC20 {
-		return fmt.Errorf("%w: amount_out must be USDT_TRC20, got %q", ErrInvalidParams, p.AmountOut.Asset)
-	}
-	if p.FeeUnits.Asset != money.USDT_TRC20 {
-		return fmt.Errorf("%w: fee_units must be USDT_TRC20, got %q", ErrInvalidParams, p.FeeUnits.Asset)
-	}
-	if p.NetworkFeeUnits.Asset != money.USDT_TRC20 {
-		return fmt.Errorf("%w: network_fee_units must be USDT_TRC20, got %q", ErrInvalidParams, p.NetworkFeeUnits.Asset)
+	// Model D (DIRECT/STANDARD/SWEEP) is a fixed-direction corridor --
+	// BEP20 in, TRC20 out, always -- so those three tiers keep the
+	// original hard-coded check unchanged. Model F (RELAY) is
+	// bidirectional by design (docs/03-build/model-f-relay-build-prompts.md's
+	// own "happy flow" covers TRC20->BEP20 as the PRIMARY example, the
+	// mirror image of Model D's own direction), so a RELAY order must
+	// accept either pairing -- rejecting TRC20-in/BEP20-out here would
+	// silently break exactly the direction that doc walks through first.
+	// FeeUnits/NetworkFeeUnits match AmountIn's asset for RELAY --
+	// unlike Model D, where C5 itself broadcasts the payout and can
+	// literally send the customer less than a pure conversion would
+	// (fee_units taken out of amount_out), a RELAY order's upstream
+	// vendor pays the customer's own destination wallet directly with
+	// 100% of its own conversion output (the whole point of the
+	// zero-float relay -- see docs/02-architecture/model-f-relay-architecture.md
+	// §1). relayd's only lever is how much of the DEPOSITED (in-asset)
+	// amount it forwards to the vendor -- it withholds the fee before
+	// forwarding, never after. Found the hard way: an earlier version of
+	// this validation matched AmountOut's asset here (copying Model D's
+	// convention by analogy without checking it against RELAY's actual
+	// money-flow mechanics), which parsed and validated fine but was
+	// silently wrong -- caught only by relayd's own real-ledgerd
+	// integration test (internal/orchestrate/orchestrate_integration_test.go's
+	// TestFullHappyPath_TRC20ToBEP20) failing with an asset mismatch
+	// computing (amount_in - fee_units), invisible to any unit test that
+	// mocks C1's response shape instead of asking a real one.
+	if p.Tier == Relay {
+		validPair := (p.AmountIn.Asset == money.USDT_BEP20 && p.AmountOut.Asset == money.USDT_TRC20) ||
+			(p.AmountIn.Asset == money.USDT_TRC20 && p.AmountOut.Asset == money.USDT_BEP20)
+		if !validPair {
+			return fmt.Errorf("%w: relay amount_in/amount_out must be USDT_BEP20/USDT_TRC20 or USDT_TRC20/USDT_BEP20, got %q/%q",
+				ErrInvalidParams, p.AmountIn.Asset, p.AmountOut.Asset)
+		}
+		if p.FeeUnits.Asset != p.AmountIn.Asset {
+			return fmt.Errorf("%w: relay fee_units must match amount_in's asset (%q), got %q", ErrInvalidParams, p.AmountIn.Asset, p.FeeUnits.Asset)
+		}
+		if p.NetworkFeeUnits.Asset != p.AmountIn.Asset {
+			return fmt.Errorf("%w: relay network_fee_units must match amount_in's asset (%q), got %q", ErrInvalidParams, p.AmountIn.Asset, p.NetworkFeeUnits.Asset)
+		}
+	} else {
+		if p.AmountIn.Asset != money.USDT_BEP20 {
+			return fmt.Errorf("%w: amount_in must be USDT_BEP20, got %q", ErrInvalidParams, p.AmountIn.Asset)
+		}
+		if p.AmountOut.Asset != money.USDT_TRC20 {
+			return fmt.Errorf("%w: amount_out must be USDT_TRC20, got %q", ErrInvalidParams, p.AmountOut.Asset)
+		}
+		if p.FeeUnits.Asset != money.USDT_TRC20 {
+			return fmt.Errorf("%w: fee_units must be USDT_TRC20, got %q", ErrInvalidParams, p.FeeUnits.Asset)
+		}
+		if p.NetworkFeeUnits.Asset != money.USDT_TRC20 {
+			return fmt.Errorf("%w: network_fee_units must be USDT_TRC20, got %q", ErrInvalidParams, p.NetworkFeeUnits.Asset)
+		}
 	}
 	if p.RecipientAddress == "" {
 		return fmt.Errorf("%w: empty recipient_address", ErrInvalidParams)
@@ -98,18 +139,33 @@ func Create(ctx context.Context, q accounts.Queryer, p CreateParams) (Order, err
 		return Order{}, err
 	}
 
+	// Only a RELAY order ever gets a non-NULL relay_direction -- every
+	// other tier relies on the fixed, implicit BEP20-in/TRC20-out
+	// convention scanOrder still hard-codes for them. p.validate() above
+	// already confirmed a RELAY order's own AmountIn/AmountOut pairing is
+	// one of the two legal combinations, so this is a plain lookup, not a
+	// second validation.
+	var relayDirection *string
+	if p.Tier == Relay {
+		direction := "BEP20_TO_TRC20"
+		if p.AmountIn.Asset == money.USDT_TRC20 {
+			direction = "TRC20_TO_BEP20"
+		}
+		relayDirection = &direction
+	}
+
 	row := q.QueryRow(ctx, `
 		INSERT INTO orders
 			(external_id, customer_id, tier, state, amount_in, amount_out,
 			 fee_units, network_fee_units, recipient_address, quoted_at, quote_expires_at,
-			 version)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 0)
+			 version, relay_direction)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 0, $12)
 		RETURNING id, external_id, customer_id, tier, state, amount_in, amount_out,
 			fee_units, network_fee_units, recipient_address, sender_address, quoted_at, quote_expires_at,
-			version, created_at, updated_at
+			version, created_at, updated_at, relay_direction
 	`, p.ExternalID, p.CustomerID, string(p.Tier), string(Quoted),
 		p.AmountIn.Units, p.AmountOut.Units, p.FeeUnits.Units, p.NetworkFeeUnits.Units,
-		p.RecipientAddress, p.QuotedAt, p.QuoteExpiresAt)
+		p.RecipientAddress, p.QuotedAt, p.QuoteExpiresAt, relayDirection)
 
 	order, err := scanOrder(row)
 	if err != nil {
@@ -324,7 +380,7 @@ func Transition(ctx context.Context, tx pgx.Tx, orderID int64, toState State, ex
 		WHERE id = $2 AND version = $3
 		RETURNING id, external_id, customer_id, tier, state, amount_in, amount_out,
 			fee_units, network_fee_units, recipient_address, sender_address, quoted_at, quote_expires_at,
-			version, created_at, updated_at
+			version, created_at, updated_at, relay_direction
 	`, string(toState), orderID, expectedVersion, p.SenderAddress)
 
 	updated, err := scanOrder(row)
@@ -389,7 +445,7 @@ func replayIfAlreadyPosted(ctx context.Context, tx pgx.Tx, current Order, entryR
 const orderSelectSQL = `
 	SELECT id, external_id, customer_id, tier, state, amount_in, amount_out,
 		fee_units, network_fee_units, recipient_address, sender_address, quoted_at, quote_expires_at,
-		version, created_at, updated_at
+		version, created_at, updated_at, relay_direction
 	FROM orders`
 
 type scanRow interface {
@@ -400,20 +456,44 @@ func scanOrder(row scanRow) (Order, error) {
 	var o Order
 	var tier, state string
 	var amountIn, amountOut, feeUnits, networkFeeUnits int64
+	var relayDirection *string
 	err := row.Scan(
 		&o.ID, &o.ExternalID, &o.CustomerID, &tier, &state, &amountIn, &amountOut,
 		&feeUnits, &networkFeeUnits, &o.RecipientAddress, &o.SenderAddress, &o.QuotedAt, &o.QuoteExpiresAt,
-		&o.Version, &o.CreatedAt, &o.UpdatedAt,
+		&o.Version, &o.CreatedAt, &o.UpdatedAt, &relayDirection,
 	)
 	if err != nil {
 		return Order{}, err
 	}
 	o.Tier = Tier(tier)
 	o.State = State(state)
-	o.AmountIn = money.Amount{Asset: money.USDT_BEP20, Units: amountIn}
-	o.AmountOut = money.Amount{Asset: money.USDT_TRC20, Units: amountOut}
-	o.FeeUnits = money.Amount{Asset: money.USDT_TRC20, Units: feeUnits}
-	o.NetworkFeeUnits = money.Amount{Asset: money.USDT_TRC20, Units: networkFeeUnits}
+
+	// Every tier except RELAY is a fixed-direction corridor -- amount_in
+	// is always USDT_BEP20, the other three always USDT_TRC20 -- so the
+	// asset is safely hard-coded for them, unchanged from before RELAY
+	// existed. RELAY orders record which direction they actually are in
+	// relay_direction (migration 0011); a RELAY row with a NULL
+	// relay_direction would violate that migration's own CHECK
+	// constraint, so amountInAsset/amountOutAsset below is never reached
+	// with an inconsistent combination.
+	amountInAsset, amountOutAsset := money.USDT_BEP20, money.USDT_TRC20
+	if o.Tier == Relay && relayDirection != nil && *relayDirection == "TRC20_TO_BEP20" {
+		amountInAsset, amountOutAsset = money.USDT_TRC20, money.USDT_BEP20
+	}
+	o.AmountIn = money.Amount{Asset: amountInAsset, Units: amountIn}
+	o.AmountOut = money.Amount{Asset: amountOutAsset, Units: amountOut}
+
+	// fee_units/network_fee_units match amount_out's asset for every
+	// tier except RELAY, which matches amount_in's instead -- see
+	// CreateParams.validate's own doc comment for exactly why RELAY's
+	// money-flow mechanics require the opposite convention from Model
+	// D's.
+	feeAsset := amountOutAsset
+	if o.Tier == Relay {
+		feeAsset = amountInAsset
+	}
+	o.FeeUnits = money.Amount{Asset: feeAsset, Units: feeUnits}
+	o.NetworkFeeUnits = money.Amount{Asset: feeAsset, Units: networkFeeUnits}
 	return o, nil
 }
 

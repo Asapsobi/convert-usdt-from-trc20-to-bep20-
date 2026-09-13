@@ -56,15 +56,26 @@ func (s State) Terminal() bool {
 
 // Tier is the closed set of service tiers, per
 // docs/02-architecture/product-operations-architecture.md decision 6.
+// RELAY is Model F's own tier (docs/02-architecture/
+// model-f-relay-architecture.md §5) -- added alongside Model D's three,
+// reusing this same state machine and reconciliation machinery rather
+// than forking it. Purely additive: nothing in this package (or,
+// confirmed by exhaustive grep across ledger/, anywhere else in this
+// module) exhaustively switches on Tier -- only orders.State drives the
+// transition table -- so RELAY needed no other production-code change
+// here. The Postgres side is not purely additive though: order_tier is
+// a real ENUM type (ledger/migrations/0006_orders.sql), so adding this
+// value also needed migration 0010's own ALTER TYPE.
 type Tier string
 
 const (
 	Direct   Tier = "DIRECT"
 	Standard Tier = "STANDARD"
 	Sweep    Tier = "SWEEP"
+	Relay    Tier = "RELAY"
 )
 
-var allTiers = []Tier{Direct, Standard, Sweep}
+var allTiers = []Tier{Direct, Standard, Sweep, Relay}
 
 var ErrUnknownTier = errors.New("orders: unknown tier")
 

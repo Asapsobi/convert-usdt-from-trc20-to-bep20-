@@ -52,6 +52,7 @@ func NewRouter(s *Server) http.Handler {
 			r.Get("/signing-requests", s.getSigningRequests)
 			r.Get("/signing-requests/{id}", s.getSigningRequest)
 			r.Get("/slots/{id}/address", s.getSlotAddress)
+			r.Get("/slots/{id}/evm-address", s.getSlotEVMAddress)
 		})
 		r.Group(func(r chi.Router) {
 			r.Use(authMiddleware(s.Approver))

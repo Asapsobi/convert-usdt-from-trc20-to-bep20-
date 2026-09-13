@@ -18,11 +18,12 @@ import (
 type FakeSigningService struct {
 	thresholdUSD float64
 
-	mu        sync.Mutex
-	seq       int64
-	byID      map[int64]*SigningRequest
-	byIdemKey map[string]int64
-	addresses map[int]string
+	mu           sync.Mutex
+	seq          int64
+	byID         map[int64]*SigningRequest
+	byIdemKey    map[string]int64
+	addresses    map[int]string
+	evmAddresses map[int]string
 }
 
 // NewFakeSigningService returns a FakeSigningService that auto-signs any
@@ -34,6 +35,7 @@ func NewFakeSigningService(thresholdUSD float64) *FakeSigningService {
 		byID:         make(map[int64]*SigningRequest),
 		byIdemKey:    make(map[string]int64),
 		addresses:    make(map[int]string),
+		evmAddresses: make(map[int]string),
 	}
 }
 
@@ -44,6 +46,15 @@ func (f *FakeSigningService) SetSlotAddress(slotID int, address string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.addresses[slotID] = address
+}
+
+// SetEVMAddress configures slotID to resolve to address for EVMAddress --
+// mirrors SetSlotAddress's own identical test-fixture-setter role, for
+// Model F's own BEP20->TRC20 relay direction.
+func (f *FakeSigningService) SetEVMAddress(slotID int, address string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.evmAddresses[slotID] = address
 }
 
 func fakeSignedTx(slotID int, digest [32]byte) [65]byte {
@@ -109,6 +120,20 @@ func (f *FakeSigningService) SlotAddress(ctx context.Context, slotID int) (strin
 	addr, ok := f.addresses[slotID]
 	if !ok {
 		return "", fmt.Errorf("requests: no address configured for slot %d", slotID)
+	}
+	return addr, nil
+}
+
+// EVMAddress implements SigningService.
+func (f *FakeSigningService) EVMAddress(ctx context.Context, slotID int) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	addr, ok := f.evmAddresses[slotID]
+	if !ok {
+		return "", fmt.Errorf("requests: no EVM address configured for slot %d", slotID)
 	}
 	return addr, nil
 }

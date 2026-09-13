@@ -27,6 +27,10 @@ type SlotKeyInfo struct {
 	KMSKeyID    string
 	PublicKey   [33]byte
 	TronAddress string
+	// EVMAddress is the SAME key's EVM-format (BSC included) address --
+	// see s1/internal/slots/evm.go's own doc comment. Added for Model
+	// F's own BEP20->TRC20 relay direction.
+	EVMAddress string
 }
 
 // SlotKeyGetter is the one call this package needs from internal/slots.
@@ -239,6 +243,15 @@ func (s *Store) SlotAddress(ctx context.Context, slotID int) (string, error) {
 		return "", fmt.Errorf("requests: resolving address for slot %d: %w", slotID, err)
 	}
 	return key.TronAddress, nil
+}
+
+// EVMAddress implements SigningService.
+func (s *Store) EVMAddress(ctx context.Context, slotID int) (string, error) {
+	key, err := s.slots.Get(ctx, slotID)
+	if err != nil {
+		return "", fmt.Errorf("requests: resolving EVM address for slot %d: %w", slotID, err)
+	}
+	return key.EVMAddress, nil
 }
 
 // requiredApprovals is the 2-of-N default s1-key-custody-architecture.md
