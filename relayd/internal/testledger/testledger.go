@@ -301,13 +301,29 @@ func (l *Ledger) AdvanceToScreenedBEP20ToTRC20(order OrderResp) OrderResp {
 // helper has no real tronwatcher/screening process to call.
 func (l *Ledger) AdvanceToScreened(order OrderResp) OrderResp {
 	l.t.Helper()
+	return l.advanceToScreened(order, "")
+}
+
+// AdvanceToScreenedWithSender is AdvanceToScreened's own sibling that
+// also records senderAddress on the funded transition (C1 only accepts
+// sender_address on a transition INTO funded -- see
+// ledger/internal/orders/store.go's own validate()) -- needed by any
+// test exercising R5's own refund path, which only ever returns funds to
+// this recorded address.
+func (l *Ledger) AdvanceToScreenedWithSender(order OrderResp, senderAddress string) OrderResp {
+	l.t.Helper()
+	return l.advanceToScreened(order, senderAddress)
+}
+
+func (l *Ledger) advanceToScreened(order OrderResp, senderAddress string) OrderResp {
+	l.t.Helper()
 	relayLegAccount := "asset:relay:leg:" + strconv.FormatInt(order.ID, 10)
 	trcLiability := "liability:customer:" + order.CustomerID + ":USDT_TRC20"
 	l.CreateAccount(relayLegAccount, "ASSET", "USDT_TRC20")
 	l.CreateAccount(trcLiability, "LIABILITY", "USDT_TRC20")
 
 	now := time.Now().UTC()
-	resp, body := l.Do(http.MethodPost, "/v1/orders/"+order.ExternalID+"/transitions", "fund:"+order.ExternalID, map[string]any{
+	fundBody := map[string]any{
 		"to_state":         "funded",
 		"expected_version": order.Version,
 		"reason":           "trc20_relay_deposit_final",
@@ -320,7 +336,11 @@ func (l *Ledger) AdvanceToScreened(order OrderResp) OrderResp {
 				{"account_code": trcLiability, "asset": "USDT_TRC20", "amount": "-100.000000"},
 			},
 		},
-	})
+	}
+	if senderAddress != "" {
+		fundBody["sender_address"] = senderAddress
+	}
+	resp, body := l.Do(http.MethodPost, "/v1/orders/"+order.ExternalID+"/transitions", "fund:"+order.ExternalID, fundBody)
 	if resp.StatusCode != http.StatusOK {
 		l.t.Fatalf("funding %s: status %d: %s", order.ExternalID, resp.StatusCode, body)
 	}

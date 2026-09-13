@@ -145,23 +145,33 @@ type Order struct {
 	FeeUnits         money.Amount
 	NetworkFeeUnits  money.Amount
 	RecipientAddress string
-	Version          int32
+	// SenderAddress is the address that actually funded this order's
+	// deposit -- C1's own record of it (set once, on the funded
+	// transition, by the watcher that detected the deposit; see
+	// ledger/internal/orders/order.go's own doc comment). nil until the
+	// order has been funded. R5's own refund path (internal/orchestrate/refund.go)
+	// is the one thing in this client that reads it: a refund only ever
+	// returns funds to this address, never to one supplied after the
+	// fact.
+	SenderAddress *string
+	Version       int32
 }
 
 type orderResponse struct {
-	ID               int64  `json:"id"`
-	ExternalID       string `json:"external_id"`
-	CustomerID       string `json:"customer_id"`
-	Tier             string `json:"tier"`
-	State            string `json:"state"`
-	AmountIn         string `json:"amount_in"`
-	AmountOut        string `json:"amount_out"`
-	FeeUnits         string `json:"fee_units"`
-	NetworkFeeUnits  string `json:"network_fee_units"`
-	RecipientAddress string `json:"recipient_address"`
-	Version          int32  `json:"version"`
-	AmountInAsset    string `json:"amount_in_asset"`
-	AmountOutAsset   string `json:"amount_out_asset"`
+	ID               int64   `json:"id"`
+	ExternalID       string  `json:"external_id"`
+	CustomerID       string  `json:"customer_id"`
+	Tier             string  `json:"tier"`
+	State            string  `json:"state"`
+	AmountIn         string  `json:"amount_in"`
+	AmountOut        string  `json:"amount_out"`
+	FeeUnits         string  `json:"fee_units"`
+	NetworkFeeUnits  string  `json:"network_fee_units"`
+	RecipientAddress string  `json:"recipient_address"`
+	SenderAddress    *string `json:"sender_address"`
+	Version          int32   `json:"version"`
+	AmountInAsset    string  `json:"amount_in_asset"`
+	AmountOutAsset   string  `json:"amount_out_asset"`
 }
 
 func (r orderResponse) toOrder() (Order, error) {
@@ -200,7 +210,7 @@ func (r orderResponse) toOrder() (Order, error) {
 	return Order{
 		ID: r.ID, ExternalID: r.ExternalID, CustomerID: r.CustomerID, Tier: r.Tier, State: r.State,
 		AmountIn: amountIn, AmountOut: amountOut, FeeUnits: feeUnits, NetworkFeeUnits: networkFeeUnits,
-		RecipientAddress: r.RecipientAddress, Version: r.Version,
+		RecipientAddress: r.RecipientAddress, SenderAddress: r.SenderAddress, Version: r.Version,
 	}, nil
 }
 

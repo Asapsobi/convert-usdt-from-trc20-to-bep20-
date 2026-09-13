@@ -249,6 +249,150 @@ func TestListByStatus(t *testing.T) {
 	}
 }
 
+func TestRefundTransitions_FromForwarding(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	l := testLeg(t)
+	created, err := store.Create(ctx, l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkForwarding(ctx, created.ExternalID, "mock", "order-refund-1", "Taddr"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.MarkRefundPending(ctx, created.ExternalID); err != nil {
+		t.Fatalf("MarkRefundPending: %v", err)
+	}
+	got, err := store.GetByExternalID(ctx, created.ExternalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != relay.StatusRefundPending {
+		t.Errorf("expected REFUND_PENDING, got %s", got.Status)
+	}
+
+	// A second call is a safe replay, not an error.
+	if err := store.MarkRefundPending(ctx, created.ExternalID); err != nil {
+		t.Fatalf("expected replayed MarkRefundPending to succeed, got %v", err)
+	}
+
+	if err := store.MarkRefunded(ctx, created.ExternalID, "refund-tx-abc"); err != nil {
+		t.Fatalf("MarkRefunded: %v", err)
+	}
+	got, err = store.GetByExternalID(ctx, created.ExternalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != relay.StatusRefunded {
+		t.Errorf("expected REFUNDED, got %s", got.Status)
+	}
+	if got.RefundTxID == nil || *got.RefundTxID != "refund-tx-abc" {
+		t.Errorf("expected refund_tx_id to be recorded, got %v", got.RefundTxID)
+	}
+}
+
+func TestMarkRefundPending_RejectedFromForwarded(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	l := testLeg(t)
+	created, err := store.Create(ctx, l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkForwarding(ctx, created.ExternalID, "mock", "order-refund-2", "Taddr"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkForwarded(ctx, created.ExternalID, "fwd-tx"); err != nil {
+		t.Fatal(err)
+	}
+	// Once FORWARDED, the forward transfer already confirmed on-chain --
+	// R5's own MarkUnrecoverable applies from here, never a refund.
+	err = store.MarkRefundPending(ctx, created.ExternalID)
+	if !errors.Is(err, relay.ErrNotInExpectedStatus) {
+		t.Fatalf("expected ErrNotInExpectedStatus, got %v", err)
+	}
+}
+
+func TestMarkUnrecoverable_FromForwarded(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	l := testLeg(t)
+	created, err := store.Create(ctx, l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkForwarding(ctx, created.ExternalID, "mock", "order-refund-3", "Taddr"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkForwarded(ctx, created.ExternalID, "fwd-tx"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.MarkUnrecoverable(ctx, created.ExternalID); err != nil {
+		t.Fatalf("MarkUnrecoverable: %v", err)
+	}
+	got, err := store.GetByExternalID(ctx, created.ExternalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != relay.StatusUnrecoverable {
+		t.Errorf("expected UNRECOVERABLE, got %s", got.Status)
+	}
+
+	// A second call is a safe replay, not an error.
+	if err := store.MarkUnrecoverable(ctx, created.ExternalID); err != nil {
+		t.Fatalf("expected replayed MarkUnrecoverable to succeed, got %v", err)
+	}
+}
+
+func TestList_NilStatusReturnsEverything_FilteredStatusNarrows(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+
+	l1 := testLeg(t)
+	created1, err := store.Create(ctx, l1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l2 := testLeg(t)
+	created2, err := store.Create(ctx, l2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkForwarding(ctx, created2.ExternalID, "mock", "order-list-1", "Taddr"); err != nil {
+		t.Fatal(err)
+	}
+
+	all, err := store.List(ctx, nil)
+	if err != nil {
+		t.Fatalf("List(nil): %v", err)
+	}
+	found1, found2 := false, false
+	for _, l := range all {
+		if l.ExternalID == created1.ExternalID {
+			found1 = true
+		}
+		if l.ExternalID == created2.ExternalID {
+			found2 = true
+		}
+	}
+	if !found1 || !found2 {
+		t.Fatalf("expected both legs in List(nil): found1=%v found2=%v", found1, found2)
+	}
+
+	awaiting := relay.StatusAwaitingDeposit
+	filtered, err := store.List(ctx, &awaiting)
+	if err != nil {
+		t.Fatalf("List(AWAITING_DEPOSIT): %v", err)
+	}
+	for _, l := range filtered {
+		if l.ExternalID == created2.ExternalID {
+			t.Error("expected the FORWARDING leg to be excluded from List(AWAITING_DEPOSIT)")
+		}
+	}
+}
+
 func TestUpstreamOrderUniqueConstraint(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()

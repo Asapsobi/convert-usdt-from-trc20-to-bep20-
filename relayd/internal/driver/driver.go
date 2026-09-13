@@ -199,3 +199,18 @@ func (d *Driver) GetStatus(ctx context.Context, externalID string) (Status, erro
 	}
 	return Status{ExternalID: externalID, Order: order, Leg: leg}, nil
 }
+
+// ListLegs returns every relay leg matching status (nil means every
+// status), this service's own local data only -- unlike GetStatus, it
+// does NOT cross-reference C1's order state per row, so a listing of
+// many legs costs one query here, not one HTTP round trip to C1 per row.
+// Backs the ops console's own relay-leg visibility view (see
+// docs/03-build/ops-console-build-prompts.md's own Model F addendum);
+// httpapi.getRelayLegs is its only caller today.
+func (d *Driver) ListLegs(ctx context.Context, status *relay.Status) ([]relay.Leg, error) {
+	legs, err := d.Store.List(ctx, status)
+	if err != nil {
+		return nil, fmt.Errorf("driver: listing relay legs: %w", err)
+	}
+	return legs, nil
+}

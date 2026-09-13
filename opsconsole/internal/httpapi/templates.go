@@ -43,12 +43,13 @@ const layout = `<!doctype html>
   .flash { padding: 10px; margin-bottom: 12px; border-radius: 4px; }
   .flash-error { background: #fde7e9; color: #b00020; }
   .flash-ok { background: #e6f4ea; color: #1e4620; }
+  .row-alert { background: #fde7e9; }
 </style>
 </head>
 <body>
 {{ if .Session }}
 <header>
-  <div><a href="/">Home</a><a href="/ledger/halt">Ledger</a><a href="/watcher/cursor">Watcher</a><a href="/broker/reservations?status=FAILED">Broker</a><a href="/screening/holds">Screening</a><a href="/dispatcher/slots">Dispatcher</a><a href="/s1/approvals">S1</a><a href="/audit">Audit</a></div>
+  <div><a href="/">Home</a><a href="/ledger/halt">Ledger</a><a href="/watcher/cursor">Watcher</a><a href="/broker/reservations?status=FAILED">Broker</a><a href="/screening/holds">Screening</a><a href="/dispatcher/slots">Dispatcher</a><a href="/s1/approvals">S1</a><a href="/relayd/legs">Relayd</a><a href="/audit">Audit</a></div>
   <div>{{ .Session.DisplayName }} &middot; <form class="inline" method="post" action="/logout"><button>Log out</button></form></div>
 </header>
 {{ if .Halted }}<div class="halt-banner">LEDGER HALTED: {{ .HaltReason }} -- <a href="/ledger/halt" style="color:#fff">manage</a></div>{{ end }}
@@ -75,6 +76,7 @@ func MustLoadTemplates() *Templates {
 		"screening_holds":     screeningHoldsContent,
 		"dispatcher_slots":    dispatcherSlotsContent,
 		"s1_approvals":        s1ApprovalsContent,
+		"relay_legs":          relayLegsContent,
 		"audit":               auditContent,
 	}
 	t := &Templates{pages: make(map[string]*template.Template, len(pages))}

@@ -46,6 +46,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/core/types"
 
+	"relayd/internal/alert"
 	"relayd/internal/energy"
 	"relayd/internal/ledgerclient"
 	"relayd/internal/money"
@@ -139,6 +140,20 @@ type Config struct {
 
 	// EVMGasLimit overrides evmtx.DefaultGasLimit if nonzero.
 	EVMGasLimit uint64
+
+	// ForwardingTimeout bounds how long a leg may sit AWAITING_DEPOSIT
+	// (its C1 order already screened, but upstream.CreateOrder has never
+	// once succeeded) or FORWARDING (CreateOrder succeeded, but the
+	// on-chain forward transfer has never once broadcast/confirmed)
+	// before internal/orchestrate/refund.go gives up and refunds the
+	// deposit back to its own sender instead of retrying forever. Money
+	// only ever moves once past this timeout: refund.go's own conditional
+	// DB updates and C1 transitions make a late success/late refund race
+	// safe either way (see refund.go's own doc comment), so this is an
+	// operational tuning knob, not a correctness-critical value -- but no
+	// default is hardcoded here regardless, matching every other
+	// real-money-shaped value in this Config.
+	ForwardingTimeout time.Duration
 }
 
 // Orchestrator bundles every dependency RunTick needs.
@@ -152,11 +167,14 @@ type Orchestrator struct {
 	Finality    TRC20FinalityChecker
 	EVMChain    EVMBroadcaster
 	EVMFinality EVMFinalityChecker
+	Alert       alert.Alerter
 	Cfg         Config
 
-	mu         sync.Mutex
-	pending    map[string]pendingForward    // externalID -> cached unsigned TRC20 tx
-	pendingEVM map[string]pendingEVMForward // externalID -> cached unsigned BEP20 tx
+	mu               sync.Mutex
+	pending          map[string]pendingForward    // externalID -> cached unsigned TRC20 forward tx
+	pendingEVM       map[string]pendingEVMForward // externalID -> cached unsigned BEP20 forward tx
+	pendingRefund    map[string]pendingForward    // externalID -> cached unsigned TRC20 refund tx
+	pendingRefundEVM map[string]pendingEVMForward // externalID -> cached unsigned BEP20 refund tx
 }
 
 // pendingForward caches a TRC20 forward leg's unsigned bytes across
@@ -186,12 +204,14 @@ type pendingEVMForward struct {
 // New wires an Orchestrator.
 func New(store *relay.Store, ledger LedgerClient, up upstream.SwapProvider, energyClient EnergyClient,
 	signer SigningService, chain TRC20Broadcaster, finality TRC20FinalityChecker,
-	evmChain EVMBroadcaster, evmFinality EVMFinalityChecker, cfg Config) *Orchestrator {
+	evmChain EVMBroadcaster, evmFinality EVMFinalityChecker, alerter alert.Alerter, cfg Config) *Orchestrator {
 	return &Orchestrator{
 		Store: store, Ledger: ledger, Upstream: up, Energy: energyClient, Signing: signer,
-		Chain: chain, Finality: finality, EVMChain: evmChain, EVMFinality: evmFinality, Cfg: cfg,
-		pending:    make(map[string]pendingForward),
-		pendingEVM: make(map[string]pendingEVMForward),
+		Chain: chain, Finality: finality, EVMChain: evmChain, EVMFinality: evmFinality, Alert: alerter, Cfg: cfg,
+		pending:          make(map[string]pendingForward),
+		pendingEVM:       make(map[string]pendingEVMForward),
+		pendingRefund:    make(map[string]pendingForward),
+		pendingRefundEVM: make(map[string]pendingEVMForward),
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"relayd/internal/alert"
 	"relayd/internal/db"
 	"relayd/internal/driver"
 	"relayd/internal/energy"
@@ -168,6 +169,19 @@ func buildDriverAndOrchestrator(ctx context.Context, pool *db.Pool) (*driver.Dri
 		quoteValidity = parsed
 	}
 
+	// Unset (zero) leaves R5's own automatic refund-by-timeout disabled --
+	// an explicit opt-in, not a default, matching this service's own
+	// no-hardcoded-real-money-defaults posture. See
+	// orchestrate.Config.ForwardingTimeout's own doc comment.
+	var forwardingTimeout time.Duration
+	if raw := os.Getenv("RELAYD_FORWARDING_TIMEOUT"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			return nil, nil, fmt.Errorf("relayd: RELAYD_FORWARDING_TIMEOUT: %w", err)
+		}
+		forwardingTimeout = parsed
+	}
+
 	store := relay.NewStore(pool)
 
 	d := &driver.Driver{
@@ -176,10 +190,10 @@ func buildDriverAndOrchestrator(ctx context.Context, pool *db.Pool) (*driver.Dri
 	}
 
 	orch := orchestrate.New(store, ledger, swapProvider, energyClient, signer, broadcastClient, finalityReader,
-		evmClient, evmClient,
+		evmClient, evmClient, alert.LogAlerter{},
 		orchestrate.Config{
 			SlotID: slotID, SlotAddress: slotAddress, SlotEVMAddress: slotEVMAddress,
-			EnergyPerTransferUnits: energyPerTransferUnits,
+			EnergyPerTransferUnits: energyPerTransferUnits, ForwardingTimeout: forwardingTimeout,
 		})
 
 	return d, orch, nil

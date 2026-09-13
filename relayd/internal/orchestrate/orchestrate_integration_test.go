@@ -24,6 +24,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
 
+	"relayd/internal/alert"
 	"relayd/internal/db"
 	"relayd/internal/energy"
 	"relayd/internal/ledgerclient"
@@ -247,7 +248,7 @@ func TestFullHappyPath_TRC20ToBEP20(t *testing.T) {
 	evmChain := &fakeEVMChain{}
 	evmFinality := newFakeEVMFinality()
 
-	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, orchestrate.Config{
+	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alert.LogAlerter{}, orchestrate.Config{
 		SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH",
 		SlotEVMAddress:         "0x4192cc99D3Cb95573dCaf8dD76921476E0c7bCAf",
 		EnergyPerTransferUnits: 65000,
@@ -346,6 +347,271 @@ func TestFullHappyPath_TRC20ToBEP20(t *testing.T) {
 	}
 }
 
+// TestRefund_StuckForwardingLegGetsRefunded drives a relay leg to
+// FORWARDING (a real upstream order created, a real relay_forward_start
+// entry posted) and then makes its own forward-transfer signature
+// permanently fail, simulating a leg that can never actually broadcast
+// -- exactly the case refund.go's own package doc comment describes.
+// Asserts the FULL R5 refund path against a real ledgerd: the
+// relay_forward_abandon reversal, the relay_refund entry, and the actual
+// on-chain refund broadcast, all within ticks driven by RunTick alone
+// (no direct Store/Ledger calls bypassing the orchestrator), ending with
+// every account closed to exactly zero -- the same discipline
+// TestFullHappyPath_TRC20ToBEP20 applies to the settle path.
+func TestRefund_StuckForwardingLegGetsRefunded(t *testing.T) {
+	ledger := startLedger(t)
+	pool := testPool(t)
+	store := relay.NewStore(pool)
+	client := ledgerclient.New(ledger.BaseURL(), ledger.Token())
+
+	externalID := uniqueExternalID(t)
+	order := ledger.CreateRelayOrder(externalID, "cust-refund-1")
+	// A real, valid, live-verified TRON address (see internal/txbuild's
+	// own tests) -- required because this test drives a REAL
+	// txbuild.BuildTransfer call for the refund, which validates the
+	// recipient's own base58check checksum.
+	senderAddress := "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj"
+	screened := ledger.AdvanceToScreenedWithSender(order, senderAddress)
+	if screened.State != "screened" {
+		t.Fatalf("fixture setup: expected screened, got %s", screened.State)
+	}
+
+	leg, err := store.Create(context.Background(), relay.Leg{
+		ExternalID: externalID, OrderID: order.ID, Direction: relay.TRC20ToBEP20,
+		CustomerID: "cust-refund-1", DestinationAddress: "0xcustomer-bep20-address",
+		DepositAddress:    "Trelayd-fixture-deposit-address",
+		AmountIn:          money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
+		AmountOutExpected: money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
+	})
+	if err != nil {
+		t.Fatalf("creating relay leg: %v", err)
+	}
+	if leg.Status != relay.StatusAwaitingDeposit {
+		t.Fatalf("expected AWAITING_DEPOSIT, got %s", leg.Status)
+	}
+
+	mockProvider := upstream.NewMockProvider("mock-refund", 1)
+	mockProvider.ForceDepositAddress("TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj")
+	signer := signing.NewFakeSigningService()
+	signer.SetSlotAddress(1, "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH")
+	// The forward leg's own signature request must never succeed -- this
+	// is what keeps the leg stuck FORWARDING instead of reaching
+	// FORWARDED, the precondition refundStuckForwardingLegs looks for.
+	signer.ForceError("relayd:sign:"+externalID, fmt.Errorf("simulated: S1 unreachable"))
+	chain := &fakeChain{}
+	finality := newFakeFinality()
+	evmChain := &fakeEVMChain{}
+	evmFinality := newFakeEVMFinality()
+
+	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alert.LogAlerter{}, orchestrate.Config{
+		SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH",
+		EnergyPerTransferUnits: 65000,
+		// A near-zero timeout so this test doesn't need to sleep for a
+		// realistic operational duration -- ForwardingTimeout is an
+		// operational tuning knob, not correctness-critical (see its own
+		// doc comment), so a tiny value here is a legitimate, not a
+		// cheating, test configuration.
+		ForwardingTimeout: time.Millisecond,
+	})
+
+	ctx := context.Background()
+
+	// One tick is enough to carry this leg all the way from
+	// AWAITING_DEPOSIT to REFUNDED: startScreenedLegs creates the
+	// upstream order and posts relay_forward_start (screened ->
+	// dispatching); advanceForwardingLegs tries and fails to sign the
+	// forward transfer; by the time refundStuckForwardingLegs runs later
+	// in this SAME tick, the leg's own MarkForwarding timestamp is
+	// already older than the 1ms ForwardingTimeout (a handful of real
+	// HTTP round trips to ledgerd take far longer than that), so it
+	// immediately posts relay_forward_abandon + relay_refund and marks
+	// REFUND_PENDING; advanceRefundPendingLegs, later still in the same
+	// tick, signs and broadcasts the actual refund and marks REFUNDED --
+	// the same one-tick-carries-multiple-phases behavior
+	// TestFullHappyPath_TRC20ToBEP20 already documents for the forward
+	// path, just carried one phase further. Asserted as one step rather
+	// than pinned to an exact tick count, for the same reason that
+	// test's own comment gives.
+	if err := orch.RunTick(ctx); err != nil {
+		t.Fatalf("RunTick 1: %v", err)
+	}
+	// Defensive: if a slower environment ever needs a second tick to
+	// finish signing/broadcasting the refund, give it one rather than
+	// pinning this test to exact tick-count timing.
+	afterTick, err := store.GetByExternalID(ctx, externalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterTick.Status == relay.StatusRefundPending {
+		if err := orch.RunTick(ctx); err != nil {
+			t.Fatalf("RunTick 2: %v", err)
+		}
+		afterTick, err = store.GetByExternalID(ctx, externalID)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if afterTick.Status != relay.StatusRefunded {
+		t.Fatalf("expected REFUNDED, got %s", afterTick.Status)
+	}
+	if afterTick.RefundTxID == nil || *afterTick.RefundTxID == "" {
+		t.Fatal("expected a refund_tx_id to be recorded")
+	}
+	if chain.broadcasts != 1 {
+		t.Errorf("expected exactly 1 TRC20 broadcast (the refund; the forward transfer never signed), got %d", chain.broadcasts)
+	}
+
+	refundedOrder := ledger.GetOrder(externalID)
+	if refundedOrder.State != "refunded" {
+		t.Fatalf("expected C1 order state refunded, got %s", refundedOrder.State)
+	}
+
+	// Every account this leg touched must close to exactly zero -- the
+	// full amount_in went back to the customer, nothing was withheld as
+	// commission (nothing was ever delivered).
+	if got := ledger.AccountBalance("liability:customer:cust-refund-1:USDT_TRC20"); got != 0 {
+		t.Errorf("expected customer liability to close to 0, got %d", got)
+	}
+	if got := ledger.AccountBalance(fmt.Sprintf("asset:relay:leg:%d", order.ID)); got != 0 {
+		t.Errorf("expected asset:relay:leg:%d to close to 0, got %d", order.ID, got)
+	}
+	if got := ledger.AccountBalance(fmt.Sprintf("asset:relay:leg:forwarding:%d", order.ID)); got != 0 {
+		t.Errorf("expected asset:relay:leg:forwarding:%d to close to 0, got %d", order.ID, got)
+	}
+
+	// Idempotency: one more tick must not re-broadcast or error -- the
+	// leg is no longer FORWARDING or REFUND_PENDING, so neither refund
+	// phase should touch it again.
+	if err := orch.RunTick(ctx); err != nil {
+		t.Fatalf("RunTick (idempotent replay): %v", err)
+	}
+	if chain.broadcasts != 1 {
+		t.Errorf("expected still exactly 1 broadcast after one more tick, got %d", chain.broadcasts)
+	}
+}
+
+// fakeAlerter captures every Alert fired, for
+// TestUnrecoverable_PostForwardedUpstreamFailure to assert against --
+// the one thing alert.LogAlerter itself cannot be asserted on directly
+// (it only writes to the process log).
+type fakeAlerter struct {
+	mu    sync.Mutex
+	fired []alert.Alert
+}
+
+func (f *fakeAlerter) Fire(ctx context.Context, a alert.Alert) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fired = append(f.fired, a)
+	return nil
+}
+
+func (f *fakeAlerter) Fired() []alert.Alert {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]alert.Alert, len(f.fired))
+	copy(out, f.fired)
+	return out
+}
+
+// TestUnrecoverable_PostForwardedUpstreamFailure drives a relay leg all
+// the way to FORWARDED (a real broadcast succeeds), then has the
+// upstream platform report FAILED -- asserting the leg lands
+// UNRECOVERABLE (never REFUND_PENDING: once the forward transfer
+// confirms on-chain, R5's refund path no longer applies, per this
+// package's own doc comment) and that a real alert fires exactly once.
+func TestUnrecoverable_PostForwardedUpstreamFailure(t *testing.T) {
+	ledger := startLedger(t)
+	pool := testPool(t)
+	store := relay.NewStore(pool)
+	client := ledgerclient.New(ledger.BaseURL(), ledger.Token())
+
+	externalID := uniqueExternalID(t)
+	order := ledger.CreateRelayOrder(externalID, "cust-unrecoverable-1")
+	screened := ledger.AdvanceToScreened(order)
+	if screened.State != "screened" {
+		t.Fatalf("fixture setup: expected screened, got %s", screened.State)
+	}
+
+	if _, err := store.Create(context.Background(), relay.Leg{
+		ExternalID: externalID, OrderID: order.ID, Direction: relay.TRC20ToBEP20,
+		CustomerID: "cust-unrecoverable-1", DestinationAddress: "0xcustomer-bep20-address",
+		DepositAddress:    "Trelayd-fixture-deposit-address",
+		AmountIn:          money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
+		AmountOutExpected: money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
+	}); err != nil {
+		t.Fatalf("creating relay leg: %v", err)
+	}
+
+	mockProvider := upstream.NewMockProvider("mock-unrecoverable", 1)
+	mockProvider.ForceDepositAddress("TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj")
+	signer := signing.NewFakeSigningService()
+	signer.SetSlotAddress(1, "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH")
+	chain := &fakeChain{}
+	finality := newFakeFinality()
+	evmChain := &fakeEVMChain{}
+	evmFinality := newFakeEVMFinality()
+	alerter := &fakeAlerter{}
+
+	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alerter, orchestrate.Config{
+		SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH",
+		EnergyPerTransferUnits: 65000,
+	})
+
+	ctx := context.Background()
+
+	// Tick 1: reaches FORWARDED, same as the happy path.
+	if err := orch.RunTick(ctx); err != nil {
+		t.Fatalf("RunTick 1: %v", err)
+	}
+	afterTick1, err := store.GetByExternalID(ctx, externalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterTick1.Status != relay.StatusForwarded {
+		t.Fatalf("after tick 1: expected FORWARDED, got %s", afterTick1.Status)
+	}
+
+	if err := mockProvider.SetOrderStatus(*afterTick1.UpstreamOrderID, upstream.StatusFailed, nil); err != nil {
+		t.Fatalf("SetOrderStatus: %v", err)
+	}
+
+	// Tick 2: the upstream order reports FAILED -- no on-chain lever left
+	// (the forward transfer already confirmed), so this must land
+	// UNRECOVERABLE and fire an alert, never REFUND_PENDING/REFUNDED.
+	if err := orch.RunTick(ctx); err != nil {
+		t.Fatalf("RunTick 2: %v", err)
+	}
+	afterTick2, err := store.GetByExternalID(ctx, externalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterTick2.Status != relay.StatusUnrecoverable {
+		t.Fatalf("after tick 2: expected UNRECOVERABLE, got %s", afterTick2.Status)
+	}
+
+	fired := alerter.Fired()
+	if len(fired) != 1 {
+		t.Fatalf("expected exactly 1 alert fired, got %d", len(fired))
+	}
+	if fired[0].Severity != alert.SeverityCritical {
+		t.Errorf("expected CRITICAL severity, got %s", fired[0].Severity)
+	}
+	if fired[0].ExternalID != externalID {
+		t.Errorf("expected alert for %s, got %s", externalID, fired[0].ExternalID)
+	}
+
+	// Idempotency: a 3rd tick must not fire a second alert -- the leg is
+	// no longer FORWARDED, so it no longer appears in that phase's own
+	// ListByStatus scan.
+	if err := orch.RunTick(ctx); err != nil {
+		t.Fatalf("RunTick 3 (idempotent replay): %v", err)
+	}
+	if len(alerter.Fired()) != 1 {
+		t.Errorf("expected still exactly 1 alert after a 3rd tick, got %d", len(alerter.Fired()))
+	}
+}
+
 // TestFullHappyPath_BEP20ToTRC20 is TestFullHappyPath_TRC20ToBEP20's own
 // mirror-direction sibling: the same real-ledgerd, real-double-entry
 // happy flow, but the customer deposits USDT_BEP20 and relayd's forward
@@ -399,7 +665,7 @@ func TestFullHappyPath_BEP20ToTRC20(t *testing.T) {
 	evmChain := &fakeEVMChain{}
 	evmFinality := newFakeEVMFinality()
 
-	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, orchestrate.Config{
+	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alert.LogAlerter{}, orchestrate.Config{
 		SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH",
 		SlotEVMAddress:         "0x1111111111111111111111111111111111abcd",
 		EnergyPerTransferUnits: 65000,

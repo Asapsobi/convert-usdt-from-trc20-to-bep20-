@@ -38,9 +38,17 @@ func (o *Orchestrator) RunLoop(ctx context.Context, interval time.Duration) erro
 
 // RunTick runs one pass: start forwarding every relay leg whose C1
 // order has just reached screened, advance every leg already
-// forwarding toward FORWARDED, then check every FORWARDED leg for
-// upstream settlement. Each phase is independent and each leg within a
-// phase is isolated from its neighbors' failures -- the same
+// forwarding toward FORWARDED, check every FORWARDED leg for upstream
+// settlement, then R5's own two refund phases -- refund any leg stuck
+// FORWARDING past Config.ForwardingTimeout, and drive every already-
+// committed refund's own on-chain transfer. refundStuckForwardingLegs
+// runs AFTER advanceForwardingLegs within the same tick so a leg that
+// successfully broadcasts its forward transfer THIS tick is naturally
+// excluded (it has already left FORWARDING by the time the refund phase
+// re-lists it) -- ordering is a wasted-attempt optimization here, not a
+// correctness requirement: relay.Store's own conditional updates make
+// the race safe either way. Each phase is independent and each leg
+// within a phase is isolated from its neighbors' failures -- the same
 // per-row-error-isolation discipline every sibling orchestrator uses.
 func (o *Orchestrator) RunTick(ctx context.Context) error {
 	if err := o.startScreenedLegs(ctx); err != nil {
@@ -51,6 +59,12 @@ func (o *Orchestrator) RunTick(ctx context.Context) error {
 	}
 	if err := o.advanceForwardedLegs(ctx); err != nil {
 		return fmt.Errorf("orchestrate: advancing forwarded legs: %w", err)
+	}
+	if err := o.refundStuckForwardingLegs(ctx); err != nil {
+		return fmt.Errorf("orchestrate: refunding stuck forwarding legs: %w", err)
+	}
+	if err := o.advanceRefundPendingLegs(ctx); err != nil {
+		return fmt.Errorf("orchestrate: advancing refund-pending legs: %w", err)
 	}
 	return nil
 }

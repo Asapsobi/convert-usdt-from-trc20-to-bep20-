@@ -68,6 +68,15 @@ func run() error {
 		AuditPath:  cfg.auditLogPath,
 		BuildInfo:  buildInfo,
 	}
+	// Model F's own two services are optional -- see httpapi.Server's own
+	// doc comment on why an unset OC_RELAYD_BASE_URL/OC_TRONWATCHER_BASE_URL
+	// leaves these nil rather than failing startup.
+	if cfg.relaydBaseURL != "" && cfg.relaydToken != "" {
+		server.Relayd = opclient.NewRelaydClient(cfg.relaydBaseURL, cfg.relaydToken)
+	}
+	if cfg.tronwatcherBaseURL != "" && cfg.tronwatcherToken != "" {
+		server.Tronwatcher = opclient.NewTronwatcherClient(cfg.tronwatcherBaseURL, cfg.tronwatcherToken)
+	}
 	router := httpapi.NewRouter(server)
 
 	httpServer := &http.Server{Addr: cfg.listenAddr, Handler: router}
@@ -108,6 +117,12 @@ type config struct {
 	brokerBaseURL, brokerToken         string
 	dispatcherBaseURL, dispatcherToken string
 	s1BaseURL, s1C5Token               string
+
+	// Model F's own two services -- optional, unlike every pair above
+	// (see httpapi.Server's own doc comment): a Model-D-only deployment
+	// of this console leaves these both empty.
+	relaydBaseURL, relaydToken           string
+	tronwatcherBaseURL, tronwatcherToken string
 }
 
 // configFromEnv reads every OC_* config value -- required, no default,
@@ -143,6 +158,19 @@ func configFromEnv() (config, error) {
 	if v := os.Getenv("OC_LISTEN_ADDR"); v != "" {
 		cfg.listenAddr = v
 	}
+
+	// Optional, unlike every pair read above -- Model F is a separate
+	// product line not every deployment of this console runs (see
+	// httpapi.Server's own doc comment). Read as a pair regardless: a
+	// base URL with no token (or vice versa) is a misconfiguration, not
+	// a considered "leave it off" choice, so it's left for main's own
+	// both-set check to silently treat as unconfigured rather than
+	// half-wiring a client that will fail every real call with a 401.
+	cfg.relaydBaseURL = os.Getenv("OC_RELAYD_BASE_URL")
+	cfg.relaydToken = os.Getenv("OC_RELAYD_TOKEN")
+	cfg.tronwatcherBaseURL = os.Getenv("OC_TRONWATCHER_BASE_URL")
+	cfg.tronwatcherToken = os.Getenv("OC_TRONWATCHER_TOKEN")
+
 	return cfg, nil
 }
 

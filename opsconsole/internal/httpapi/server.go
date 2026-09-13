@@ -23,8 +23,16 @@ type Operator struct {
 }
 
 // Server holds every dependency the console's handlers need: the six
-// downstream clients, the session signer, the operator directory, and
-// the audit log.
+// Model D downstream clients, the session signer, the operator
+// directory, and the audit log -- plus, optionally, Model F's own two
+// (Relayd, Tronwatcher). Unlike the Model D six, those two are allowed
+// to be nil: Model F is a separate, optional product line
+// (README.md's own "Model F" section), not every deployment of this
+// console runs it, and this console should still work for a Model-D-only
+// deployment rather than refusing to start over an unset OC_RELAYD_BASE_URL.
+// Every handler that reads Relayd/Tronwatcher checks for nil first and
+// degrades that one card/page, never the whole console (the same
+// invariant-4 posture every other per-service failure already gets).
 type Server struct {
 	Ledger     *opclient.LedgerClient
 	Watcher    *opclient.WatcherClient
@@ -32,6 +40,9 @@ type Server struct {
 	Broker     *opclient.BrokerClient
 	Dispatcher *opclient.DispatcherClient
 	S1         *opclient.S1Client
+
+	Relayd      *opclient.RelaydClient
+	Tronwatcher *opclient.TronwatcherClient
 
 	Operators []Operator
 	Sessions  *session.Signer
@@ -99,6 +110,8 @@ func NewRouter(s *Server) http.Handler {
 		r.Get("/s1/approvals", s.getS1Approvals)
 		r.Post("/s1/approvals/{id}/approve", s.postS1Approve)
 		r.Post("/s1/approvals/{id}/reject", s.postS1Reject)
+
+		r.Get("/relayd/legs", s.getRelayLegs)
 
 		r.Get("/audit", s.getAudit)
 	})

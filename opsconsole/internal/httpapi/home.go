@@ -131,6 +131,44 @@ func (s *Server) collectServiceCards(r *http.Request) []serviceCard {
 		}},
 	}
 
+	// Model F's own two services are optional (see Server's own doc
+	// comment) -- only added as jobs if actually configured, so an
+	// unconfigured deployment shows no card for them at all rather than
+	// one permanently stuck on "unreachable."
+	if s.Tronwatcher != nil {
+		jobs = append(jobs, job{"tronwatcher", s.Tronwatcher.Healthz, func(ctx context.Context) ([]serviceFact, error) {
+			inv, err := s.Tronwatcher.GetInvariants(ctx)
+			if err != nil {
+				return nil, err
+			}
+			facts := []serviceFact{}
+			if inv.PendingFinalityCount != nil {
+				facts = append(facts, serviceFact{"pending finality", intStr(*inv.PendingFinalityCount)})
+			}
+			return facts, nil
+		}})
+	}
+	if s.Relayd != nil {
+		jobs = append(jobs, job{"relayd", s.Relayd.Healthz, func(ctx context.Context) ([]serviceFact, error) {
+			legs, err := s.Relayd.ListRelayLegs(ctx, "")
+			if err != nil {
+				return nil, err
+			}
+			byStatus := map[string]int{}
+			for _, l := range legs {
+				byStatus[l.Status]++
+			}
+			facts := []serviceFact{{"total legs", intStr(len(legs))}}
+			if n := byStatus["UNRECOVERABLE"]; n > 0 {
+				facts = append(facts, serviceFact{"UNRECOVERABLE (needs attention)", intStr(n)})
+			}
+			if n := byStatus["REFUND_PENDING"]; n > 0 {
+				facts = append(facts, serviceFact{"refund pending", intStr(n)})
+			}
+			return facts, nil
+		}})
+	}
+
 	cards := make([]serviceCard, len(jobs))
 	var wg sync.WaitGroup
 	for i, j := range jobs {

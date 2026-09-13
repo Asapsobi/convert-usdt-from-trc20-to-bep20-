@@ -122,3 +122,77 @@ func (s *Server) getRelayLeg(w http.ResponseWriter, r *http.Request) {
 
 	respondJSON(w, http.StatusOK, resp)
 }
+
+type relayLegSummary struct {
+	ExternalID           string  `json:"external_id"`
+	OrderID              int64   `json:"order_id"`
+	Direction            string  `json:"direction"`
+	Status               string  `json:"status"`
+	CustomerID           string  `json:"customer_id"`
+	DestinationAddress   string  `json:"destination_address"`
+	AmountIn             string  `json:"amount_in"`
+	AmountOutExpected    string  `json:"amount_out_expected"`
+	AmountOutActual      *string `json:"amount_out_actual,omitempty"`
+	UpstreamProviderName *string `json:"upstream_provider_name,omitempty"`
+	UpstreamOrderID      *string `json:"upstream_order_id,omitempty"`
+	ForwardTxID          *string `json:"forward_tx_id,omitempty"`
+	RefundTxID           *string `json:"refund_tx_id,omitempty"`
+	CreatedAt            string  `json:"created_at"`
+	UpdatedAt            string  `json:"updated_at"`
+}
+
+type listRelayLegsResponse struct {
+	Legs []relayLegSummary `json:"legs"`
+}
+
+// getRelayLegs is GET /v1/relay-legs?status= -- a general listing view
+// (every leg if status is omitted), this service's own local data only,
+// the same "local rows only, no per-row cross-service fetch" scoping
+// dispatcher's own GET /v1/slots and screening's own GET /v1/holds
+// already take. Backs the ops console's own relay-leg visibility page.
+func (s *Server) getRelayLegs(w http.ResponseWriter, r *http.Request) {
+	var status *relay.Status
+	if raw := r.URL.Query().Get("status"); raw != "" {
+		st := relay.Status(raw)
+		status = &st
+	}
+
+	legs, err := s.Driver.ListLegs(r.Context(), status)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+
+	resp := listRelayLegsResponse{Legs: make([]relayLegSummary, 0, len(legs))}
+	for _, leg := range legs {
+		amountIn, err := formatAmount(leg.AmountIn)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		amountOutExpected, err := formatAmount(leg.AmountOutExpected)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		summary := relayLegSummary{
+			ExternalID: leg.ExternalID, OrderID: leg.OrderID, Direction: string(leg.Direction), Status: string(leg.Status),
+			CustomerID: leg.CustomerID, DestinationAddress: leg.DestinationAddress,
+			AmountIn: amountIn, AmountOutExpected: amountOutExpected,
+			UpstreamProviderName: leg.UpstreamProviderName, UpstreamOrderID: leg.UpstreamOrderID,
+			ForwardTxID: leg.ForwardTxID, RefundTxID: leg.RefundTxID,
+			CreatedAt: leg.CreatedAt.Format("2006-01-02T15:04:05Z07:00"), UpdatedAt: leg.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		}
+		if leg.AmountOutActual != nil {
+			actual, err := formatAmount(*leg.AmountOutActual)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			summary.AmountOutActual = &actual
+		}
+		resp.Legs = append(resp.Legs, summary)
+	}
+
+	respondJSON(w, http.StatusOK, resp)
+}

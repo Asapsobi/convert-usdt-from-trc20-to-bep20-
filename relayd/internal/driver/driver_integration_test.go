@@ -171,6 +171,78 @@ func TestCreateRelayLeg_TRC20ToBEP20(t *testing.T) {
 	}
 }
 
+// TestListLegs covers the ops console's own read path
+// (opsconsole/internal/opclient.RelaydClient.ListRelayLegs, over HTTP,
+// against httpapi.getRelayLegs, which calls this same driver method) --
+// creates two legs, confirms List(nil) returns (at least) both and
+// List(&StatusAwaitingDeposit) filters correctly.
+func TestListLegs(t *testing.T) {
+	ledger := startLedger(t)
+	pool := testPool(t)
+	store := relay.NewStore(pool)
+	client := ledgerclient.New(ledger.BaseURL(), ledger.Token())
+
+	tronSrv := fakeWatcherServer(t, "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj")
+	defer tronSrv.Close()
+
+	d := &driver.Driver{
+		Ledger: client, Upstream: upstream.NewMockProvider("mock", 1),
+		TronWatcher: watcherclient.New(tronSrv.URL, "tok"), BEP20Watcher: watcherclient.New(tronSrv.URL, "tok"),
+		Store: store, Cfg: driver.Config{FeeBasisPoints: 30, QuoteValidity: 10 * time.Minute},
+	}
+
+	ext1 := uniqueExternalID(t)
+	if _, err := d.CreateRelayLeg(context.Background(), driver.CreateRelayLegRequest{
+		ExternalID: ext1, CustomerID: "cust-list-1", Direction: relay.TRC20ToBEP20,
+		DestinationAddress: "0xdest1", AmountIn: "50.000000",
+	}); err != nil {
+		t.Fatalf("CreateRelayLeg 1: %v", err)
+	}
+	ext2 := uniqueExternalID(t)
+	if _, err := d.CreateRelayLeg(context.Background(), driver.CreateRelayLegRequest{
+		ExternalID: ext2, CustomerID: "cust-list-2", Direction: relay.TRC20ToBEP20,
+		DestinationAddress: "0xdest2", AmountIn: "75.000000",
+	}); err != nil {
+		t.Fatalf("CreateRelayLeg 2: %v", err)
+	}
+
+	all, err := d.ListLegs(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListLegs(nil): %v", err)
+	}
+	foundBoth := 0
+	for _, l := range all {
+		if l.ExternalID == ext1 || l.ExternalID == ext2 {
+			foundBoth++
+		}
+	}
+	if foundBoth != 2 {
+		t.Fatalf("expected both newly created legs in ListLegs(nil), found %d", foundBoth)
+	}
+
+	awaiting := relay.StatusAwaitingDeposit
+	filtered, err := d.ListLegs(context.Background(), &awaiting)
+	if err != nil {
+		t.Fatalf("ListLegs(AWAITING_DEPOSIT): %v", err)
+	}
+	for _, l := range filtered {
+		if l.Status != relay.StatusAwaitingDeposit {
+			t.Errorf("ListLegs(AWAITING_DEPOSIT) returned a leg with status %s", l.Status)
+		}
+	}
+
+	settled := relay.StatusSettled
+	none, err := d.ListLegs(context.Background(), &settled)
+	if err != nil {
+		t.Fatalf("ListLegs(SETTLED): %v", err)
+	}
+	for _, l := range none {
+		if l.ExternalID == ext1 || l.ExternalID == ext2 {
+			t.Errorf("expected neither fresh leg to appear under SETTLED, found %s", l.ExternalID)
+		}
+	}
+}
+
 func TestCreateRelayLeg_RejectsNonPositiveAmount(t *testing.T) {
 	ledger := startLedger(t)
 	pool := testPool(t)

@@ -50,6 +50,19 @@ const (
 	StatusForwarded       Status = "FORWARDED"
 	StatusSettled         Status = "SETTLED"
 	StatusFailed          Status = "FAILED"
+
+	// StatusRefundPending/StatusRefunded/StatusUnrecoverable are R5's own
+	// addition (docs/02-architecture/model-f-relay-architecture.md §4's
+	// state diagram). REFUND_PENDING means C1's own ledger entries
+	// committing to a refund have posted but the on-chain refund transfer
+	// has not yet confirmed; REFUNDED means it has. UNRECOVERABLE is a
+	// FORWARDED leg whose upstream swap failed after this system's own
+	// forward transfer already confirmed on-chain -- see
+	// internal/orchestrate/settle.go's own doc comment for why no on-chain
+	// lever is left to pull once that happens.
+	StatusRefundPending Status = "REFUND_PENDING"
+	StatusRefunded      Status = "REFUNDED"
+	StatusUnrecoverable Status = "UNRECOVERABLE"
 )
 
 // Leg is a relay_legs row.
@@ -69,6 +82,7 @@ type Leg struct {
 	UpstreamOrderID        *string
 	UpstreamDepositAddress *string
 	ForwardTxID            *string
+	RefundTxID             *string
 	CreatedAt              time.Time
 	UpdatedAt              time.Time
 }
@@ -95,7 +109,7 @@ const selectSQL = `
 	SELECT id, external_id, order_id, direction, status, customer_id, destination_address,
 		deposit_address, amount_in, amount_in_asset, amount_out_expected, amount_out_expected_asset,
 		amount_out_actual, upstream_provider_name, upstream_order_id, upstream_deposit_address,
-		forward_tx_id, created_at, updated_at
+		forward_tx_id, refund_tx_id, created_at, updated_at
 	FROM relay_legs`
 
 // Create inserts a new leg in AWAITING_DEPOSIT, idempotent on
@@ -113,7 +127,7 @@ func (s *Store) Create(ctx context.Context, l Leg) (Leg, error) {
 		RETURNING id, external_id, order_id, direction, status, customer_id, destination_address,
 			deposit_address, amount_in, amount_in_asset, amount_out_expected, amount_out_expected_asset,
 			amount_out_actual, upstream_provider_name, upstream_order_id, upstream_deposit_address,
-			forward_tx_id, created_at, updated_at
+			forward_tx_id, refund_tx_id, created_at, updated_at
 	`, l.ExternalID, l.OrderID, string(l.Direction), string(StatusAwaitingDeposit), l.CustomerID, l.DestinationAddress, l.DepositAddress,
 		l.AmountIn.Units, string(l.AmountIn.Asset), l.AmountOutExpected.Units, string(l.AmountOutExpected.Asset))
 
@@ -154,6 +168,37 @@ func (s *Store) ListByStatus(ctx context.Context, status Status) ([]Leg, error) 
 		l, err := scanLeg(rows)
 		if err != nil {
 			return nil, fmt.Errorf("relay: listing legs in %s: %w", status, err)
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+// List returns every leg matching status, or every leg (any status) if
+// status is nil, most-recently-updated first -- the ops console's own
+// general listing view. Mirrors
+// screening/internal/holds.List's identical "status *Status, nil means
+// everything" convention (that package's own List, not its
+// oldest-first ListOpen review-queue variant, since this is a general
+// visibility view, not a work queue).
+func (s *Store) List(ctx context.Context, status *Status) ([]Leg, error) {
+	var rows pgx.Rows
+	var err error
+	if status != nil {
+		rows, err = s.pool.Query(ctx, selectSQL+` WHERE status = $1 ORDER BY updated_at DESC`, string(*status))
+	} else {
+		rows, err = s.pool.Query(ctx, selectSQL+` ORDER BY updated_at DESC`)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("relay: listing legs: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Leg
+	for rows.Next() {
+		l, err := scanLeg(rows)
+		if err != nil {
+			return nil, fmt.Errorf("relay: listing legs: %w", err)
 		}
 		out = append(out, l)
 	}
@@ -236,6 +281,68 @@ func (s *Store) MarkFailed(ctx context.Context, externalID string) error {
 	return nil
 }
 
+// MarkRefundPending transitions externalID to REFUND_PENDING from either
+// AWAITING_DEPOSIT or FORWARDING -- the two pre-FORWARDED statuses R5's
+// own automatic timeout-refund path (internal/orchestrate/refund.go) can
+// reach: a leg whose upstream order was never successfully created
+// (still AWAITING_DEPOSIT), or one stuck unable to broadcast its own
+// forward transfer (still FORWARDING) past a configured deadline. Never
+// reachable from FORWARDED -- once the forward transfer itself confirms
+// on-chain, R5's own UNRECOVERABLE path applies instead (see
+// MarkUnrecoverable), not a refund.
+func (s *Store) MarkRefundPending(ctx context.Context, externalID string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE relay_legs
+		SET status = $1, updated_at = now()
+		WHERE external_id = $2 AND status IN ($3, $4)
+	`, string(StatusRefundPending), externalID, string(StatusAwaitingDeposit), string(StatusForwarding))
+	if err != nil {
+		return fmt.Errorf("relay: marking %s refund pending: %w", externalID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return s.checkAlreadyAt(ctx, externalID, StatusRefundPending)
+	}
+	return nil
+}
+
+// MarkRefunded transitions externalID from REFUND_PENDING to REFUNDED,
+// recording the broadcast refund transaction id.
+func (s *Store) MarkRefunded(ctx context.Context, externalID, refundTxID string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE relay_legs
+		SET status = $1, refund_tx_id = $2, updated_at = now()
+		WHERE external_id = $3 AND status = $4
+	`, string(StatusRefunded), refundTxID, externalID, string(StatusRefundPending))
+	if err != nil {
+		return fmt.Errorf("relay: marking %s refunded: %w", externalID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return s.checkAlreadyAt(ctx, externalID, StatusRefunded)
+	}
+	return nil
+}
+
+// MarkUnrecoverable transitions externalID from FORWARDED to
+// UNRECOVERABLE -- the upstream platform's own swap failed after this
+// system's own forward transfer already confirmed on-chain, so no
+// on-chain lever is left to pull (see internal/orchestrate/settle.go's
+// own doc comment). A human decision is required from here; reaching
+// this state fires an alert (internal/alert), never just a log line.
+func (s *Store) MarkUnrecoverable(ctx context.Context, externalID string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE relay_legs
+		SET status = $1, updated_at = now()
+		WHERE external_id = $2 AND status = $3
+	`, string(StatusUnrecoverable), externalID, string(StatusForwarded))
+	if err != nil {
+		return fmt.Errorf("relay: marking %s unrecoverable: %w", externalID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return s.checkAlreadyAt(ctx, externalID, StatusUnrecoverable)
+	}
+	return nil
+}
+
 // checkAlreadyAt distinguishes "this call is a safe replay of a
 // transition that already happened" (success) from "the leg is in some
 // OTHER status this transition never expected" (a real error) --
@@ -266,7 +373,7 @@ func scanLeg(row scanRow) (Leg, error) {
 		&l.ID, &l.ExternalID, &l.OrderID, &direction, &status, &l.CustomerID, &l.DestinationAddress,
 		&l.DepositAddress, &amountInUnits, &amountInAsset, &amountOutExpectedUnits, &amountOutExpectedAsset,
 		&amountOutActualUnits, &l.UpstreamProviderName, &l.UpstreamOrderID, &l.UpstreamDepositAddress,
-		&l.ForwardTxID, &l.CreatedAt, &l.UpdatedAt,
+		&l.ForwardTxID, &l.RefundTxID, &l.CreatedAt, &l.UpdatedAt,
 	)
 	if err != nil {
 		return Leg{}, err

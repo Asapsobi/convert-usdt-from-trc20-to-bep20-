@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"relayd/internal/alert"
 	"relayd/internal/ledgerclient"
 	"relayd/internal/relay"
 	"relayd/internal/upstream"
@@ -47,13 +48,21 @@ func (o *Orchestrator) advanceForwardedOne(ctx context.Context, leg relay.Leg) e
 	case upstream.StatusComplete:
 		// fall through to settlement below
 	case upstream.StatusFailed, upstream.StatusExpired:
-		// R5's own refund/UNRECOVERABLE path, deliberately deferred --
-		// see this function's own doc comment. Logged loudly so this
-		// never silently vanishes even though nothing automatic happens
-		// yet.
-		slog.Error("orchestrate: upstream order did not complete -- R5's refund path is not yet built, this leg needs manual handling",
-			"external_id", leg.ExternalID, "upstream_status", upstreamOrder.Status)
-		return nil
+		// Once a leg reaches FORWARDED, this system's own forward
+		// transfer has already confirmed on-chain -- there is no on-chain
+		// lever left to pull, regardless of which of the two upstream
+		// statuses comes back (see this package's own doc comment and
+		// docs/02-architecture/model-f-relay-architecture.md §4's own
+		// note on UNRECOVERABLE). A real vendor might, for EXPIRED
+		// specifically, refund its OWN receipt back to relayd's sending
+		// slot rather than delivering it -- but that is vendor-specific
+		// behavior this pass has no real vendor to build or verify
+		// against (R2/R4 are still open), so both statuses are treated
+		// identically here: UNRECOVERABLE, loudly alerted, a human
+		// decision from here per the build-prompts doc's own "Open
+		// items". Revisit once a real vendor's actual EXPIRED behavior is
+		// known.
+		return o.handleUnrecoverable(ctx, leg, upstreamOrder.Status)
 	default:
 		return nil // still in flight upstream -- check again next tick
 	}
@@ -133,4 +142,39 @@ func (o *Orchestrator) advanceForwardedOne(ctx context.Context, leg relay.Leg) e
 	}
 	slog.Info("orchestrate: relay leg settled", "external_id", leg.ExternalID)
 	return nil
+}
+
+// handleUnrecoverable marks leg UNRECOVERABLE and fires a real alert --
+// idempotent: MarkUnrecoverable's own conditional UPDATE (WHERE
+// status=FORWARDED) only succeeds once, so a leg already UNRECOVERABLE
+// no longer appears in ListByStatus(FORWARDED) on a later tick and this
+// function is never re-entered for it, and the alert fires exactly once
+// (at the moment of transition), not every tick.
+func (o *Orchestrator) handleUnrecoverable(ctx context.Context, leg relay.Leg, upstreamStatus upstream.SwapStatus) error {
+	if err := o.Store.MarkUnrecoverable(ctx, leg.ExternalID); err != nil {
+		return fmt.Errorf("marking unrecoverable: %w", err)
+	}
+	firedErr := o.Alert.Fire(ctx, alert.Alert{
+		Severity:   alert.SeverityCritical,
+		ExternalID: leg.ExternalID,
+		Reason:     "relay_leg_unrecoverable",
+		Detail: fmt.Sprintf("relay leg %s's own forward transfer already confirmed on-chain; "+
+			"upstream order %s reported status %s afterward. No automatic recovery exists -- "+
+			"see docs/03-build/model-f-relay-build-prompts.md's own Open items for the operational runbook.",
+			leg.ExternalID, valueOrEmpty(leg.UpstreamOrderID), upstreamStatus),
+	})
+	if firedErr != nil {
+		// The alert channel being down must never re-block this leg's own
+		// terminal transition, which already committed above -- but it
+		// must not be silent either.
+		slog.Error("orchestrate: firing the UNRECOVERABLE alert itself failed", "external_id", leg.ExternalID, "error", firedErr)
+	}
+	return nil
+}
+
+func valueOrEmpty(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }

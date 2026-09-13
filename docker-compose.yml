@@ -402,6 +402,10 @@ services:
       # on why the commission always comes out of amount_in, never out
       # of the upstream vendor's own payout.
       RELAYD_FEE_BASIS_POINTS: ${RELAYD_FEE_BASIS_POINTS:-25}
+      # R5's own automatic refund-by-timeout path -- an explicit opt-in,
+      # left unset (disabled) by default here; see
+      # .env.proofrun.example's own optional-overrides list.
+      RELAYD_FORWARDING_TIMEOUT: ${RELAYD_FORWARDING_TIMEOUT:-}
     ports: ["8093:8093"]
 
   # ---- ops console: internal dashboard over C1-C5/S1 ----
@@ -417,6 +421,8 @@ services:
       broker: { condition: service_started }
       dispatcher: { condition: service_started }
       s1: { condition: service_started }
+      tronwatcher: { condition: service_started }
+      relayd: { condition: service_started }
     environment:
       OC_LISTEN_ADDR: ":8091"
       OC_LEDGER_BASE_URL: http://ledger:8080
@@ -431,6 +437,21 @@ services:
       OC_DISPATCHER_TOKEN: ${DISPATCHER_API_TOKEN_VALUE:-dispatchertoken}
       OC_S1_BASE_URL: http://s1:8085
       OC_S1_C5_TOKEN: ${S1_C5_API_TOKEN_VALUE:-s1c5token}
+      # Model F's own two services -- optional (see
+      # opsconsole/internal/httpapi.Server's own doc comment): unlike
+      # every OC_* pair above, leaving these two unset is a legitimate
+      # "not running Model F" configuration, not a startup failure. Wired
+      # by default here since this compose file runs both services.
+      OC_TRONWATCHER_BASE_URL: http://tronwatcher:8092
+      OC_TRONWATCHER_TOKEN: ${TRONWATCHER_API_TOKEN_VALUE:-tronwatchertoken}
+      OC_RELAYD_BASE_URL: http://relayd:8093
+      # relayd's own HTTP API has no auth at all yet (see relayd/internal/httpapi's
+      # own doc comment -- it mirrors proofrun's identical "minimal
+      # front door" posture); this token is sent but not currently
+      # checked on that side. Kept as a real-looking value, not blank, so
+      # this pair's shape matches every other OC_*_TOKEN and needs no
+      # special-casing here if relayd ever grows real auth.
+      OC_RELAYD_TOKEN: ${RELAYD_API_TOKEN_VALUE:-relaydtoken}
       # Signs the operator session cookie -- operator-supplied, no
       # default (a placeholder here would sign every session with a
       # publicly-known secret). See .env.proofrun.example.

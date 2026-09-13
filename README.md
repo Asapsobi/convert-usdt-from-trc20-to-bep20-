@@ -53,7 +53,7 @@ never holds a net position and needs no capital ladder._
 | Pricing mechanism | **Commission** (pass the upstream rate through, earn a referral fee — no visible markup to the customer). Decided; `RELAYD_FEE_BASIS_POINTS`. |
 | Reuses from Model D | C1 (ledger, new `RELAY` tier + relay-leg suspense accounts), C3 (screening, unchanged — discovers `RELAY` orders via its own existing tier-agnostic polling loop), C4 (energy broker, TRC20-direction forward leg only), S1 (key management — same secp256k1 slot key, both a TRON and an EVM address derived from it) |
 | New | `tronwatcher/` (C2′ — TRON-side deposit watcher, mirrors C2 against TRC20 via TronGrid's REST API instead of `eth_getLogs`), `relayd/` (the front door + driving state machine for **both** relay directions), `internal/upstream` (a vendor-agnostic swap-provider interface), `internal/evmtx`/`internal/evmbroadcast` (relayd's own BEP20 forward-leg construction/broadcast — genuinely new code, no service in this repo had ever sent a BEP20 transaction before) |
-| Build status | **Happy flow built and tested for both directions, against fakes/placeholders — no real upstream vendor chosen yet.** `tronwatcher` (C2′): full service, unit + integration tested against real Postgres. `relayd`: full state machine (`AWAITING_DEPOSIT → FORWARDING → FORWARDED → SETTLED`) for TRC20→BEP20 *and* BEP20→TRC20, driven end-to-end against a real `ledgerd` + real Postgres in both directions (`TestFullHappyPath_TRC20ToBEP20`, `TestFullHappyPath_BEP20ToTRC20` in `relayd/internal/orchestrate`), real double-entry ledger postings verified to net to zero on every suspense account. Runs against `upstream.PlaceholderProvider` (`UPSTREAM_PROVIDER=placeholder`) — every quote/swap call returns `ErrNoVendorConfigured` unless `UPSTREAM_ALLOW_PLACEHOLDER=true` is also set, the same double-gate convention `screening` uses for its own non-production placeholder. Wired into the root `docker-compose.yml` in this pass. Not yet built: R2 (real vendor choice), R4 (real vendor wiring), R5 (refund path for a `HELD`/`FAILED`/`EXPIRED` upstream order — currently logged loudly with no automatic recovery), R6 (relayd's own replay ship-gate harness). |
+| Build status | **Happy flow, a first slice of the refund path, and ops-console visibility all built and tested, against fakes/placeholders — no real upstream vendor chosen yet.** `tronwatcher` (C2′): full service, unit + integration tested against real Postgres. `relayd`: full state machine (`AWAITING_DEPOSIT → FORWARDING → FORWARDED → SETTLED`) for TRC20→BEP20 *and* BEP20→TRC20, driven end-to-end against a real `ledgerd` + real Postgres in both directions (`TestFullHappyPath_TRC20ToBEP20`, `TestFullHappyPath_BEP20ToTRC20` in `relayd/internal/orchestrate`), real double-entry ledger postings verified to net to zero on every suspense account. **R5 (refund path), first slice:** a leg stuck unable to broadcast its own forward transfer past `RELAYD_FORWARDING_TIMEOUT` is now automatically refunded on-chain to whoever actually sent the deposit (reusing C1's *existing* `Dispatching→Held→Refunded` transitions — zero `ledger/` changes needed), and a leg whose forward transfer already confirmed but whose upstream swap then failed lands `UNRECOVERABLE` with a real alert (`internal/alert`) instead of a silent log line. Still open: the manual `HELD→REFUNDED` path via C3's own hold-review queue (cross-module, C3's `RefundEntryBuilder` is still a stub repo-wide), a leg stuck in `AWAITING_DEPOSIT` because `upstream.CreateOrder` itself never succeeds, and real per-vendor `EXPIRED` semantics (gated on R2/R4). **Ops console:** a read-only relay-leg listing page plus home-page cards for both new services (`opsconsole/internal/httpapi/relayd.go`) — see `opsconsole/`'s own entry below. Runs against `upstream.PlaceholderProvider` (`UPSTREAM_PROVIDER=placeholder`) — every quote/swap call returns `ErrNoVendorConfigured` unless `UPSTREAM_ALLOW_PLACEHOLDER=true` is also set, the same double-gate convention `screening` uses for its own non-production placeholder. Wired into the root `docker-compose.yml`. Not yet built: R2 (real vendor choice), R4 (real vendor wiring), R6 (relayd's own replay ship-gate harness). |
 | Next action | R2 in the build-prompts doc: get a real quote/create-order/status API and a partner/affiliate terms sheet from a candidate upstream platform, then R4 to wire it in behind `internal/upstream`'s own `SwapProvider` interface (no `relayd` code elsewhere needs to change — see that package's own `dependency_test.go`). |
 
 Documents, in reading order: `docs/01-strategy/model-f-relay-findings.md` →
@@ -367,6 +367,26 @@ above; the origin-side doc was renamed to
 `operations-control-center-build-prompts.md` rather than discarded. Not
 wired into the root `docker-compose.yml` at merge time; now wired as its own
 `opsconsole` service with an `opsconsole_audit` volume for its log file.
+
+**Model F visibility (added 13 Sep 2026):** a read-only relay-leg listing
+page (`internal/httpapi/relayd.go`, `/relayd/legs?status=`) plus home-page
+cards for `tronwatcher` and `relayd`, calling two new narrow clients
+(`internal/opclient/{relayd,tronwatcher}.go`) against a new
+`GET /v1/relay-legs?status=` relayd added for exactly this (relayd's own
+local rows only, no per-row cross-service fetch to C1 — see that
+handler's own doc comment). Deliberately read-only, unlike the
+holds/slots pages: R5's own automatic refund path already handles the
+one leg-level failure an operator could safely act on from here, and an
+`UNRECOVERABLE` leg's resolution is an off-system operational decision
+(a vendor support ticket, a compensation reserve), not a button this
+console could correctly offer — its job is to make that state visible
+(a highlighted row, a home-page count), not to act on it. Unlike every
+other upstream client here, `Relayd`/`Tronwatcher` are allowed to be
+`nil` — Model F is a separate, optional product line, so an unset
+`OC_RELAYD_BASE_URL`/`OC_TRONWATCHER_BASE_URL` degrades that one
+card/page rather than refusing to start (`internal/httpapi.Server`'s own
+doc comment explains why this one pair breaks the "every dependency
+required" posture every other upstream client in this package takes).
 
 ### `tronwatcher/`
 

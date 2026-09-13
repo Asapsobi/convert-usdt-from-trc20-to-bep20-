@@ -27,6 +27,7 @@ func NewRouter(s *Server) http.Handler {
 	r.Get("/healthz", s.healthz)
 	r.Route("/v1", func(r chi.Router) {
 		r.Post("/relay-legs", s.postRelayLeg)
+		r.Get("/relay-legs", s.getRelayLegs)
 		r.Get("/relay-legs/{external_id}", s.getRelayLeg)
 	})
 	return r
