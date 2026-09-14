@@ -14,7 +14,7 @@ Defined in `internal/verdict/verdict.go`.
 | `screening_hold_ambiguous` | Risk score falls in the configured grey band: at or above `Thresholds.PassBelow` but below `Thresholds.FlaggedAtOrAbove`, and the vendor did not explicitly flag it. | `verdict.Classify` |
 | `screening_hold_unavailable` | Every `provider.ScreenWithPolicy` retry was exhausted and `OutagePolicy` is `FailClosed` (the default). There is no real `Verdict` to classify and no backing `screening_results` row. | `verdict.Unavailable` |
 | `screening_pass_vendor_unavailable` | Every `provider.ScreenWithPolicy` retry was exhausted and `OutagePolicy` is `FailOpen` -- the order is passed through anyway, but never as a plain `screening_pass`, so the vendor-outage origin stays auditable. No backing `screening_results` row, same as the `FailClosed` case above. | `verdict.PassVendorUnavailable` |
-| `screening_hold_stale_cache_invalidated` | An operator invalidated a prior cached pass (`internal/cache.Invalidate`) and the order is re-held pending a fresh screen. | C3.7 (not yet built) |
+| `screening_hold_stale_cache_invalidated` | An operator invalidated a prior cached pass (`internal/cache.Invalidate`) and the order is re-held pending a fresh screen. | `internal/cache.Invalidate` + `verdict.ReasonHoldStaleCacheInvalidated` (C3.7, built) |
 
 ## Threshold boundary semantics
 

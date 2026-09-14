@@ -104,9 +104,10 @@ below for the built services themselves.
   C1.8 hadn't exposed it — see `ledger/` and `ledger/docs/errors.md`.
 - **[c1-scenario-catalog.md](docs/03-build/c1-scenario-catalog.md)** —
   the full scenario / risk catalog for the corridor: what's engineered and gated in
-  C1 today, what cross-component failure modes are still open (C3–C6, not yet built),
-  and what's irreducible risk that has to be priced or insured rather than fixed.
-  Audited against the real test suite on 1 Sep 2026.
+  C1 today, the cross-component failure modes each of C2–C6's own replay harness now
+  covers (Part 2 — all five components are built, unlike when this doc's Part 2 was
+  first written), and what's irreducible risk that has to be priced or insured rather
+  than fixed. Audited against the real test suite on 1 Sep 2026.
 - **[c2-deposit-watcher-build-prompts.md](docs/03-build/c2-deposit-watcher-build-prompts.md)** —
   the deposit watcher, specified the same way C1 was: sequenced build chunks
   (C2.0 → C2.10) with acceptance criteria, written for an AI coding agent. Opened

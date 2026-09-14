@@ -109,11 +109,15 @@ Not in the original catalog at all — found by building and driving `ledger/doc
 
 ---
 
-## Part 2 — Cross-component corridor scenarios (not yet built, not yet gated)
+## Part 2 — Cross-component corridor scenarios (built, per-component)
 
-These come from the "hard parts" called out per component in `component-map.md`. C1 will receive whatever these components report and behave correctly *given* a correct report (Part 1 covers that). What's listed here is what can go wrong *before* it reaches C1, and none of it has a replay harness yet because C2–C6 don't exist yet.
+These come from the "hard parts" called out per component in `component-map.md`. C1 will receive whatever these components report and behave correctly *given* a correct report (Part 1 covers that). What's listed here is what can go wrong *before* it reaches C1.
+
+**Update:** this was originally written when C2–C6 didn't exist yet, hence "not yet built, not yet gated" in this section's own original heading. All five now exist, and each has shipped its own replay ship-gate harness (`internal/replay`, per that component's own `cmd/replay`) covering most or all of the scenarios below — not one unified cross-component harness, but each component's own gate proves its own slice against a real upstream/downstream dependency, the same posture C1's own Part 1 harness uses. See each component's own `internal/replay/scenarios.go` for the exact, named scenario list and its own acceptance criteria — the bullets below are kept as the original hazard list, not rewritten line-by-line against that harness, so treat this section as "what to worry about," and each component's own replay package as "what's actually proven."
 
 ### C2 — Deposit watcher (BSC)
+
+Covered by `depositwatcher/internal/replay/scenarios.go` (wired via that package's own `run.go`): reorg beyond the tracked window, RPC provider disagreement, a dark/unresponsive provider, duplicate log delivery, deposit to a retired address, wrong-token/zero-value log matching, and deposit-after-quote-expiry.
 
 - Reorg deeper than the tracked block-hash window — the one case C1.6 scenario B exists for, but only if C2 correctly detects and reports it. An undetected deep reorg is a silent loss, not a halted one.
 - RPC provider divergence — two providers disagree on finality. Needs ≥2-provider hash agreement before declaring `deposit.final`, or a false-final gets recorded and is indistinguishable from scenario B after the fact.
@@ -124,11 +128,15 @@ These come from the "hard parts" called out per component in `component-map.md`.
 
 ### C3 — Screening
 
+Covered by `screening/internal/replay/scenarios.go`: vendor timeout under both fail-closed and fail-open configurations, a re-screen after an order already passed once, and a cache-hit false-positive/negative case.
+
 - Vendor (Chainalysis/TRM/Elliptic) outage or timeout at the moment a decision is needed — does the order sit in `funded` indefinitely, or is there a hold-and-retry policy? Not yet specified.
 - Verdict changes between initial screen and eventual release — a sender address gets flagged *after* an order already passed. No re-screen path exists yet.
 - Cache-by-sender false positive/negative — a shared cache means one wrong verdict can propagate across multiple orders from the same sender.
 
 ### C4 — Energy broker
+
+Covered by `energybroker/internal/replay/scenarios.go`: a single provider going unhealthy (routing re-normalizes), all providers unhealthy (manual fallback), a price spike above ceiling across every provider, and a delegation that never lands on-chain.
 
 - Energy delegation lands *after* broadcast instead of before — the payout burns TRX at market rate instead of the wholesale blend, silently destroying the margin on that one payout without triggering any ledger-level error.
 - Provider outage mid-flight, mid-routing (60/35/5 across Tronsell/Netts/CatFee) — fallback ladder exists in principle, not yet tested under a live outage.
@@ -137,6 +145,8 @@ These come from the "hard parts" called out per component in `component-map.md`.
 
 ### C5 — Payout dispatcher (TRON)
 
+Covered by `dispatcher/internal/replay/scenarios.go`: partial settlement within a Sweep batch, a duplicate-broadcast retry storm, a slot freeze both pre- and post-broadcast, and an energy-reservation failure/timeout with zero ledger impact. Still genuinely open, not covered by any replay harness (an environment constraint, not a missed scenario): real on-chain timing/energy behavior has never been measured against an actual TRON node, and no component has signed/broadcast through a real (non-fake) S1 KMS adapter — see `c5-payout-dispatcher-build-prompts.md`'s own notes on both.
+
 - Energy exhausted exactly at broadcast time (race with C4).
 - A slot gets frozen (Tether action) mid-flight, between selection and confirmation — different from the freeze scenario in Part 3 in that this one is caught pre-settlement and should be recoverable without a loss entry.
 - Duplicate broadcast on retry — exactly-once semantics under retry is listed as a hard part and needs its own proof, analogous to C1.3's concurrent-Post test but at the chain-broadcast layer.
@@ -144,6 +154,8 @@ These come from the "hard parts" called out per component in `component-map.md`.
 - Slot rotation stranding a small balance below the dust threshold in a retiring slot.
 
 ### C6 — API gateway
+
+Covered by `gateway/internal/replay/scenarios.go`: a quote expiring before order creation, webhook delivery exhausting all retries with the pull-based backstop confirmed to agree, and all four deterministic sandbox failure triggers exercised in isolation.
 
 - Webhook delivery exhausts all 8 retries — customer never learns the order settled. Needs a pull-based reconciliation path (`GET /orders/{id}`) as the backstop, and a test that the backstop actually agrees with what the webhook would have said.
 - Quote lock (90s) expires between quote and order creation, order created anyway with a stale price.

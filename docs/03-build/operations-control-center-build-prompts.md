@@ -38,7 +38,7 @@ including this one, if they ever disagree**).
 | C4 Energy broker | `energybroker/` | `brokerd` | 8084 | `broker_dev` | TRON energy rental/reservation |
 | S1 Key mgmt | `s1/` | `s1d` | 8085 | `s1_dev` | signing requests, human approval queue |
 | C5 Payout dispatcher | `dispatcher/` | `dispatchd` | 8086 | `dispatcher_dev` | slots, dispatch, broadcast, finality |
-| C6 API gateway | `gateway/` | `gatewayd` | 8087 | *(own DB, not yet wired into root `docker-compose.yml`)* | customer-facing quote/order/status/sandbox |
+| C6 API gateway | `gateway/` | `gatewayd` | 8087 | *(own DB, wired into root `docker-compose.yml`)* | customer-facing quote/order/status/sandbox |
 | proofrun | `proofrun/` | `proofrund` | 8090 | none (reads through) | throwaway 2-route driver for the mainnet proof run — **not** C6, has no auth, do not build on it |
 
 Each service: Go, `chi` router, `pgx/v5`, `goose` migrations, no ORM, its own
@@ -251,10 +251,10 @@ to detect:
   order can ever actually complete via the batched path today. Show Sweep-tier
   orders' batching step as blocked-by-design, not stalled.
 - Screening's `reject` action (`held → refunded`) always 501s — see §0.
-- The `gateway` (C6) service is **not part of the root `docker-compose.yml`
-  proof-run stack at all** — if you stand up the real backend for this UI to
-  talk to, you must add it yourself (own DB, own migration, own env block,
-  following the exact pattern the other six services already use).
+- The `gateway` (C6) service is now wired into the root `docker-compose.yml`
+  (own DB, own migration, own env block, the same pattern every other service
+  here uses) — this bullet originally flagged it as missing; that's since
+  been closed.
 
 ---
 
@@ -313,10 +313,9 @@ what's needed to make the spec in §5 true:
      blocker for original §14 in its entirety. Build it on `gateway/` itself
      (it already owns the `customers` table), not on the new Ops service,
      and have Ops call it with its own service identity.
-   - **Wiring `gateway` into `docker-compose.yml`** so there's a real backend
-     to develop the UI against at all — copy the existing pattern (its own
-     `gateway-db` service, `GATEWAY_DATABASE_URL`, `GATEWAY_API_TOKENS`,
-     `GATEWAY_LISTEN_ADDR=:8087`) from any of the six services already there.
+   - **Wiring `gateway` into `docker-compose.yml`** — done: `gateway`/
+     `gateway-db` are both in the root `docker-compose.yml`, the same pattern
+     every other service here uses.
 
 2. **Configuration Center — scope this down honestly for v1.** Every tunable
    parameter in this system today (`BROKER_ROUTING_WEIGHTS`,
