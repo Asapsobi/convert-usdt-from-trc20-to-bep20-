@@ -405,30 +405,48 @@ services:
       # through this).
       RELAYD_BSC_RPC_URL: ${RELAYD_BSC_RPC_URL:?set RELAYD_BSC_RPC_URL in .env -- see .env.proofrun.example}
       # R2's decision record (docs/01-strategy/model-f-relay-findings.md)
-      # names FixedFloat as the real vendor; R4 wired it in
-      # (internal/upstream/fixedfloat.go). Still defaults to
-      # PlaceholderProvider here, though -- a fresh clone/deploy should
-      # never silently start routing real orders through a real vendor
-      # just because an operator's own shell happened to have
-      # UPSTREAM_PROVIDER set from a different project. Set
-      # UPSTREAM_PROVIDER=fixedfloat explicitly (in .env, not here) to
-      # switch this deployment to the real vendor.
+      # names FixedFloat and ChangeNOW as the two real vendors behind
+      # UPSTREAM_PROVIDER=best_rate's own MultiProvider routing
+      # (internal/upstream/router.go) -- every order is quoted against
+      # both and routed to whichever offers the better rate at the
+      # moment it's actually created, and a single vendor's outage never
+      # blocks an order. Still defaults to PlaceholderProvider here,
+      # though -- a fresh clone/deploy should never silently start
+      # routing real orders through a real vendor just because an
+      # operator's own shell happened to have UPSTREAM_PROVIDER set from
+      # a different project. Set UPSTREAM_PROVIDER=best_rate (or
+      # =fixedfloat / =changenow for a single vendor) explicitly (in
+      # .env, not here) to switch this deployment to real vendors.
       UPSTREAM_PROVIDER: ${UPSTREAM_PROVIDER:-placeholder}
       UPSTREAM_ALLOW_PLACEHOLDER: ${UPSTREAM_ALLOW_PLACEHOLDER:-true}
+      # Required only when UPSTREAM_PROVIDER=best_rate -- comma-separated
+      # vendor names to route across, e.g. "fixedfloat,changenow". No
+      # default: a deployment must explicitly opt every vendor in.
+      UPSTREAM_BEST_RATE_PROVIDERS: ${UPSTREAM_BEST_RATE_PROVIDERS:-}
       # FixedFloat's own credentials and currency-code mapping --
-      # required only when UPSTREAM_PROVIDER=fixedfloat, but always
-      # passed through so that switching the provider var alone is
-      # enough. No defaults for any of these: an empty value fails loud
-      # inside NewFixedFloatProvider rather than silently signing
-      # requests with an empty secret. FIXEDFLOAT_CCY_USDT_TRC20/BEP20
-      # must be verified against a real GET /api/v2/ccies response
-      # before going live -- see internal/upstream/fixedfloat.go's own
-      # top-of-file doc comment on why this file doesn't guess a ticker.
+      # required whenever UPSTREAM_PROVIDER is fixedfloat or best_rate
+      # (and best_rate names fixedfloat), but always passed through so
+      # switching the provider var alone is enough. No defaults for any
+      # of these: an empty value fails loud inside NewFixedFloatProvider
+      # rather than silently signing requests with an empty secret.
+      # FIXEDFLOAT_CCY_USDT_TRC20/BEP20 must be verified against a real
+      # GET /api/v2/ccies response before going live -- see
+      # internal/upstream/fixedfloat.go's own top-of-file doc comment on
+      # why this file doesn't guess a ticker.
       FIXEDFLOAT_API_KEY: ${FIXEDFLOAT_API_KEY:-}
       FIXEDFLOAT_API_SECRET: ${FIXEDFLOAT_API_SECRET:-}
       FIXEDFLOAT_REFCODE: ${FIXEDFLOAT_REFCODE:-}
       FIXEDFLOAT_CCY_USDT_TRC20: ${FIXEDFLOAT_CCY_USDT_TRC20:-}
       FIXEDFLOAT_CCY_USDT_BEP20: ${FIXEDFLOAT_CCY_USDT_BEP20:-}
+      # ChangeNOW's own credentials and currency-code mapping -- same
+      # "required only if this vendor is actually selected, no defaults"
+      # posture as FixedFloat's own block above.
+      # CHANGENOW_CCY_USDT_TRC20/BEP20 must be verified against a real
+      # GET /v1/currencies response before going live -- see
+      # internal/upstream/changenow.go's own top-of-file doc comment.
+      CHANGENOW_API_KEY: ${CHANGENOW_API_KEY:-}
+      CHANGENOW_CCY_USDT_TRC20: ${CHANGENOW_CCY_USDT_TRC20:-}
+      CHANGENOW_CCY_USDT_BEP20: ${CHANGENOW_CCY_USDT_BEP20:-}
       # Commission basis points relayd withholds from the deposited
       # (in-)asset -- see internal/orchestrate's own package doc comment
       # on why the commission always comes out of amount_in, never out

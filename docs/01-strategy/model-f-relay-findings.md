@@ -101,3 +101,69 @@ against FixedFloat's real v2 API, gated behind `UPSTREAM_PROVIDER=fixedfloat` (s
 `cmd/relayd/upstream_provider.go`). Not yet proven against FixedFloat's own live API or
 a real R6 replay run — this repo's own "prove it against something real, not just unit
 tests" discipline still applies before this is considered shipped, not just wired.
+
+**Update (14 Sep 2026): a real order placed against FixedFloat surfaced a real problem**
+(reported by the operator, not yet root-caused) — the specific symptom hasn't been
+captured in this doc yet, pending more detail. Until it's resolved, FixedFloat should
+not be treated as a proven, production-ready vendor on its own.
+
+## R2 addendum: second vendor + best-rate routing (14 Sep 2026)
+
+**Decision: don't wait on debugging FixedFloat alone — add a second real vendor and
+route each order to whichever offers the best rate at the moment it's created,** rather
+than staying committed to a single vendor. This also directly serves the "best rate for
+the customer" goal mechanism 1 (commission) doesn't otherwise optimize for on its own:
+a single-vendor integration only ever offers that one vendor's own rate, whatever it is.
+
+**Chosen second vendor: ChangeNOW (changenow.io).** Evaluated against the same four R2
+criteria FixedFloat was: (a)/(b) confirmed directly against their real v1 API
+(`GET /exchange-amount/...`, `POST /transactions/{api_key}`, `GET
+/transactions/{id}/{api_key}` — arbitrary destination `address` param on transaction
+creation, reconstructed from a real third-party Go client's own documented endpoint
+list, since the official Postman docs are JS-rendered and could not be fetched directly
+while building this — needs live verification before production, same caveat as (d)
+being independently confirmed rather than inferred: **API Terms of Use §2.1/§3.3**
+(https://changenow.io/terms-of-use/changenow-api) explicitly grant "a ... license to
+use and make calls to our API solely in connection with developing, implementing, and
+distributing your application that interoperates or integrates with the Service" —
+exactly relayd's own model (integrate their API into this system, never resell API
+access itself, which the same clause's own non-sublicensable restriction rules out
+regardless). (c): 0.4% default commission via their own affiliate program, adjustable,
+paid per completed order.
+
+A third real candidate, Changelly, was also checked: real documented endpoints
+(`createTransaction`/`getStatus`/`getExchangeAmount`) and both USDT TRC20/BEP20 pairs
+confirmed (`usdtrx`/`usdtbsc`), and overwhelming circumstantial evidence of a mature
+commercial API business (350+ white-label API partners) — but no equivalent dedicated
+ToS clause could be found confirming criterion (d) the way FixedFloat's §6 and
+ChangeNOW's §2.1/§3.3 both do; their own public terms only surfaced generic
+content-IP boilerplate, and a real commercial integration appears to need a negotiated
+quote (affiliate@changelly.com) rather than a self-service confirmation. Not chosen for
+now on that basis — a real candidate to revisit if either FixedFloat or ChangeNOW
+becomes untenable, but not preferred over ChangeNOW today.
+
+**Not independently re-verified**, same posture as FixedFloat's own currency-code
+caveat above: ChangeNOW's exact currency ticker codes for USDT TRC20/BEP20 (working
+assumptions `usdttrc20`/`usdtbsc`, inferred from public ChangeNOW pages) and its exact
+transaction-status string values (reconstructed from ChangeNOW's own public help-center
+articles, not the API docs directly). R4's own config
+(`CHANGENOW_CCY_USDT_TRC20`/`CHANGENOW_CCY_USDT_BEP20`) has no default, so this can't be
+skipped silently, matching FixedFloat's own posture exactly.
+
+**R4 (routing):** `relayd/internal/upstream/router.go`'s `MultiProvider` implements
+`SwapProvider` by querying every configured vendor in parallel and routing to whichever
+offers the best rate — `Quote` for the customer-facing preview, and a **fresh re-quote**
+at `CreateOrder` time (folded into architecture doc §6's own existing
+re-quote-at-forward-time step, not a separate mechanism) so the vendor actually used is
+whichever is best *at the moment of commitment*, not whichever won a possibly-stale
+earlier quote. A single vendor's error never blocks an order — only failing when every
+configured vendor fails, mirroring `energybroker`'s own fallback-ladder posture.
+`GetOrder` routes back to the originating vendor via a `"<vendor>:<real id>"` prefix
+`CreateOrder` adds to whatever opaque id the winning vendor itself returned (composes
+cleanly with FixedFloat's own `"id|token"` packing — proven by a dedicated test).
+Gated behind `UPSTREAM_PROVIDER=best_rate` plus `UPSTREAM_BEST_RATE_PROVIDERS`
+(comma-separated vendor names, no default). Unit-tested (best-rate selection, fallback
+on a single vendor's error, all-fail case, re-quote-not-stale-quote at CreateOrder,
+order-id prefix round-tripping) — **not yet proven against either vendor's live API or
+a real R6 replay run**, same "wired, not yet shipped" distinction as FixedFloat's own
+R4 entry above.

@@ -126,6 +126,31 @@ the customer's own TRC20 address.
   record) before that proof run can mean anything. Until both happen, treat this as
   code-complete but unproven, the same distinction R6's own replay-vs-real-run posture
   already draws elsewhere in this doc.
+- **Shipped (14 Sep 2026), a second vendor + best-rate routing:** a real order against
+  FixedFloat surfaced a real problem (still being root-caused), and R2's own findings
+  doc records the decision not to stay committed to one vendor while that's worked
+  out — `relayd/internal/upstream/changenow.go` implements `SwapProvider` against
+  ChangeNOW's real v1 API (no request signing needed, simpler than FixedFloat's own
+  HMAC scheme — the API key travels as a path segment), gated behind
+  `UPSTREAM_PROVIDER=changenow` with `CHANGENOW_API_KEY`/`CHANGENOW_CCY_USDT_TRC20`/
+  `CHANGENOW_CCY_USDT_BEP20` all required, no defaults. `relayd/internal/upstream/router.go`'s
+  `MultiProvider` then wraps 2+ configured vendors behind the *same* `SwapProvider`
+  interface, so nothing else in `relayd` needs to know routing happens at all:
+  `Quote` asks every vendor in parallel and returns whichever offers the best rate;
+  `CreateOrder` **re-quotes fresh** rather than reusing an earlier `Quote`'s winner
+  (folded into architecture doc §6's own existing re-quote-at-forward-time step, since
+  a leg's deposit-wait gap already made an early quote unreliable regardless of
+  routing); `GetOrder` routes back to the originating vendor via a
+  `"<vendor>:<real id>"` prefix `CreateOrder` adds, which composes cleanly with
+  FixedFloat's own `"id|token"` packing (proven by a dedicated test, not just asserted).
+  A single vendor's error never blocks a call — only every configured vendor failing
+  does, mirroring `energybroker`'s own fallback-ladder posture. Gated behind
+  `UPSTREAM_PROVIDER=best_rate` plus `UPSTREAM_BEST_RATE_PROVIDERS` (comma-separated
+  vendor names, no default). Unit-tested thoroughly (best-rate selection, single-vendor
+  fallback, all-fail case, re-quote-not-stale-quote, order-id prefix round-tripping
+  including the FixedFloat nested-separator case) — **not yet proven against either
+  vendor's live API or a real R6 replay run**, the same "wired, not shipped" distinction
+  FixedFloat's own entry above already draws.
 
 ### R5 — refund path
 - **Scope:** `HELD`→`REFUNDED`, `EXPIRED`→`REFUND_PENDING`→`REFUNDED`, and the
