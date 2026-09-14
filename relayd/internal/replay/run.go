@@ -36,6 +36,7 @@ func Run(ctx context.Context, pool *db.Pool, ledgerPool *pgxpool.Pool, cfg Confi
 		{"StuckForwardingLegAutomaticallyRefunded", h.scenarioStuckForwardingTimeoutRefund},
 		{"ManuallyRejectedHoldGetsRefunded", h.scenarioManuallyRejectedHoldGetsRefunded},
 		{"PostForwardUpstreamFailureLandsUnrecoverableAndAlerts", h.scenarioPostForwardUnrecoverable},
+		{"StaleLegAlarmFiresOnceForLegLeftForwardedTooLong", h.scenarioStaleLegAlarmFires},
 	}
 	for _, s := range scenarios {
 		report.Scenarios = append(report.Scenarios, runGuarded(s.name, s.run))

@@ -154,6 +154,16 @@ type Config struct {
 	// default is hardcoded here regardless, matching every other
 	// real-money-shaped value in this Config.
 	ForwardingTimeout time.Duration
+
+	// StaleLegAlertAfter is the stale-relay-leg reconciliation alarm's own
+	// threshold (docs/02-architecture/model-f-relay-architecture.md §5's
+	// own "an account open after an hour is an operational alarm") --
+	// zero (the default if unset) disables the alarm entirely, an
+	// explicit opt-in like ForwardingTimeout. Purely observational: it
+	// fires an alert (internal/alert), once per leg, and takes no
+	// automatic action -- see reconcile.go's own doc comment for exactly
+	// which statuses and why.
+	StaleLegAlertAfter time.Duration
 }
 
 // Orchestrator bundles every dependency RunTick needs.

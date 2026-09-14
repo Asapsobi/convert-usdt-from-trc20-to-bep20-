@@ -421,3 +421,42 @@ func TestUpstreamOrderUniqueConstraint(t *testing.T) {
 		t.Fatal("expected a unique-constraint violation for a duplicate (provider_name, upstream_order_id)")
 	}
 }
+
+func TestMarkStaleAlerted_FiresOnceReturnsFalseOnReplay(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	l := testLeg(t)
+	created, err := store.Create(ctx, l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkForwarding(ctx, created.ExternalID, "mock", "order-stale-1", "Taddr"); err != nil {
+		t.Fatal(err)
+	}
+
+	fired, err := store.MarkStaleAlerted(ctx, created.ExternalID)
+	if err != nil {
+		t.Fatalf("MarkStaleAlerted (first): %v", err)
+	}
+	if !fired {
+		t.Fatal("expected fired=true on the first call")
+	}
+	got, err := store.GetByExternalID(ctx, created.ExternalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.StaleAlertedAt == nil {
+		t.Fatal("expected stale_alerted_at to be recorded")
+	}
+	if got.Status != relay.StatusForwarding {
+		t.Errorf("expected MarkStaleAlerted to leave status unchanged (FORWARDING), got %s", got.Status)
+	}
+
+	fired, err = store.MarkStaleAlerted(ctx, created.ExternalID)
+	if err != nil {
+		t.Fatalf("MarkStaleAlerted (second): %v", err)
+	}
+	if fired {
+		t.Fatal("expected fired=false on a replayed call -- the alarm must fire at most once per leg")
+	}
+}

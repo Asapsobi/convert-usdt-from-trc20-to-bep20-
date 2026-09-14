@@ -182,6 +182,19 @@ func buildDriverAndOrchestrator(ctx context.Context, pool *db.Pool) (*driver.Dri
 		forwardingTimeout = parsed
 	}
 
+	// Unset (zero) leaves the stale-relay-leg reconciliation alarm
+	// disabled -- an explicit opt-in, not a default, matching
+	// forwardingTimeout's own identical posture. See
+	// orchestrate.Config.StaleLegAlertAfter's own doc comment.
+	var staleLegAlertAfter time.Duration
+	if raw := os.Getenv("RELAYD_STALE_LEG_ALERT_AFTER"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			return nil, nil, fmt.Errorf("relayd: RELAYD_STALE_LEG_ALERT_AFTER: %w", err)
+		}
+		staleLegAlertAfter = parsed
+	}
+
 	store := relay.NewStore(pool)
 
 	d := &driver.Driver{
@@ -194,6 +207,7 @@ func buildDriverAndOrchestrator(ctx context.Context, pool *db.Pool) (*driver.Dri
 		orchestrate.Config{
 			SlotID: slotID, SlotAddress: slotAddress, SlotEVMAddress: slotEVMAddress,
 			EnergyPerTransferUnits: energyPerTransferUnits, ForwardingTimeout: forwardingTimeout,
+			StaleLegAlertAfter: staleLegAlertAfter,
 		})
 
 	return d, orch, nil

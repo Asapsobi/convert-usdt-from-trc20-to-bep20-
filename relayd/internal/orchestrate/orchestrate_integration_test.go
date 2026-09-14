@@ -881,3 +881,110 @@ func TestExternalRefund_ManuallyRejectedHoldGetsRefunded(t *testing.T) {
 		t.Errorf("expected still exactly 1 broadcast after one more tick, got %d", chain.broadcasts)
 	}
 }
+
+// TestStaleLegAlarm_FiresOnceThenNeverAgain drives a leg to FORWARDED
+// (a real broadcast succeeds, matching TestUnrecoverable_PostForwardedUpstreamFailure's
+// own setup), then enables the stale-leg reconciliation alarm and waits
+// past its threshold -- asserting a SeverityWarning alert fires exactly
+// once (never again on a later tick) with the leg's own status recorded,
+// and that stale_alerted_at is persisted so a process restart could not
+// re-fire it either.
+func TestStaleLegAlarm_FiresOnceThenNeverAgain(t *testing.T) {
+	ledger := startLedger(t)
+	pool := testPool(t)
+	store := relay.NewStore(pool)
+	client := ledgerclient.New(ledger.BaseURL(), ledger.Token())
+
+	externalID := uniqueExternalID(t)
+	order := ledger.CreateRelayOrder(externalID, "cust-stale-1")
+	screened := ledger.AdvanceToScreened(order)
+	if screened.State != "screened" {
+		t.Fatalf("fixture setup: expected screened, got %s", screened.State)
+	}
+
+	if _, err := store.Create(context.Background(), relay.Leg{
+		ExternalID: externalID, OrderID: order.ID, Direction: relay.TRC20ToBEP20,
+		CustomerID: "cust-stale-1", DestinationAddress: "0xcustomer-bep20-address",
+		DepositAddress:    "Trelayd-fixture-deposit-address",
+		AmountIn:          money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
+		AmountOutExpected: money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
+	}); err != nil {
+		t.Fatalf("creating relay leg: %v", err)
+	}
+
+	mockProvider := upstream.NewMockProvider("mock-stale", 1)
+	mockProvider.ForceDepositAddress("TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj")
+	signer := signing.NewFakeSigningService()
+	signer.SetSlotAddress(1, "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH")
+	chain := &fakeChain{}
+	finality := newFakeFinality()
+	evmChain := &fakeEVMChain{}
+	evmFinality := newFakeEVMFinality()
+	alerter := &fakeAlerter{}
+
+	// StaleLegAlertAfter starts at 0 (disabled) so driving to FORWARDED
+	// below is deterministic and produces no alarm noise of its own.
+	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alerter, orchestrate.Config{
+		SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH",
+		EnergyPerTransferUnits: 65000,
+	})
+
+	ctx := context.Background()
+	if err := orch.RunTick(ctx); err != nil {
+		t.Fatalf("RunTick 1: %v", err)
+	}
+	afterTick1, err := store.GetByExternalID(ctx, externalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterTick1.Status != relay.StatusForwarded {
+		t.Fatalf("after tick 1: expected FORWARDED, got %s", afterTick1.Status)
+	}
+	if len(alerter.Fired()) != 0 {
+		t.Fatalf("expected no alerts yet (StaleLegAlertAfter was disabled), got %d", len(alerter.Fired()))
+	}
+
+	// Now enable the alarm with a near-zero threshold and wait past it --
+	// Orchestrator.Cfg is an exported field precisely so a test can do
+	// this without needing a second Orchestrator sharing the same store.
+	orch.Cfg.StaleLegAlertAfter = time.Millisecond
+	time.Sleep(5 * time.Millisecond)
+
+	if err := orch.RunTick(ctx); err != nil {
+		t.Fatalf("RunTick 2: %v", err)
+	}
+	fired := alerter.Fired()
+	if len(fired) != 1 {
+		t.Fatalf("expected exactly 1 alert fired, got %d", len(fired))
+	}
+	if fired[0].Severity != alert.SeverityWarning {
+		t.Errorf("expected WARNING severity, got %s", fired[0].Severity)
+	}
+	if fired[0].Reason != "relay_leg_stale" {
+		t.Errorf("expected reason relay_leg_stale, got %s", fired[0].Reason)
+	}
+	if fired[0].ExternalID != externalID {
+		t.Errorf("expected alert for %s, got %s", externalID, fired[0].ExternalID)
+	}
+
+	afterTick2, err := store.GetByExternalID(ctx, externalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterTick2.StaleAlertedAt == nil {
+		t.Fatal("expected stale_alerted_at to be recorded")
+	}
+	// Still FORWARDED -- the alarm is purely observational, it never
+	// changes the leg's own status.
+	if afterTick2.Status != relay.StatusForwarded {
+		t.Errorf("expected the alarm to leave status unchanged (FORWARDED), got %s", afterTick2.Status)
+	}
+
+	// Idempotency: further ticks must never fire a second alert.
+	if err := orch.RunTick(ctx); err != nil {
+		t.Fatalf("RunTick 3: %v", err)
+	}
+	if len(alerter.Fired()) != 1 {
+		t.Errorf("expected still exactly 1 alert after a 3rd tick, got %d", len(alerter.Fired()))
+	}
+}

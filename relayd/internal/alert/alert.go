@@ -1,8 +1,9 @@
 // Package alert is relayd's own narrow path to paging a human -- today,
 // a single real, working implementation (LogAlerter) that makes an
-// UNRECOVERABLE leg loudly, structurally visible in the process log
-// rather than indistinguishable from every other slog.Error call in this
-// service. It is deliberately NOT a real PagerDuty/Opsgenie/Slack
+// UNRECOVERABLE leg, or a leg the stale-relay-leg reconciliation alarm
+// flags, loudly and structurally visible in the process log rather than
+// indistinguishable from every other slog.Error call in this service.
+// It is deliberately NOT a real PagerDuty/Opsgenie/Slack
 // integration: no such vendor has been chosen (the same open item
 // docs/03-build/model-f-relay-build-prompts.md's own "Open items" names
 // for the UNRECOVERABLE case -- "a support-ticket runbook with the
@@ -28,6 +29,13 @@ const (
 	// affected customer notices on their own -- real money is stuck with
 	// no automatic recovery path left.
 	SeverityCritical Severity = "CRITICAL"
+
+	// SeverityWarning means something is taking unusually long but may
+	// still resolve on its own (the stale-relay-leg reconciliation
+	// alarm's own severity, internal/orchestrate/reconcile.go) --
+	// investigate soon, not immediately: unlike SeverityCritical, no
+	// automatic-recovery path has necessarily been exhausted yet.
+	SeverityWarning Severity = "WARNING"
 )
 
 // Alert is one page-worthy event.

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"time"
 
+	"relayd/internal/alert"
 	"relayd/internal/money"
 	"relayd/internal/relay"
 	"relayd/internal/upstream"
@@ -220,6 +221,91 @@ func (h *harness) scenarioStuckForwardingTimeoutRefund() Result {
 		return fail(name, err)
 	}
 	h.track(trackedLeg{externalID: externalID, orderID: screened.ID, wantTerminal: relay.StatusRefunded})
+	return pass(name)
+}
+
+// scenarioStaleLegAlarmFires drives a leg to FORWARDED (a real broadcast
+// succeeds) and deliberately leaves it there -- the "legitimately still
+// in flight, but taking unusually long" case the stale-relay-leg
+// reconciliation alarm exists for (reconcile.go's own doc comment;
+// docs/02-architecture/model-f-relay-architecture.md §5's own "an
+// account open after an hour is an operational alarm"). Not tracked via
+// h.track: this leg is deliberately left FORWARDED, not settled or
+// refunded, so it would fail the shared FINAL ASSERTIONS' own
+// close-to-zero check (which correctly expects that for every OTHER
+// scenario's own tracked legs) -- asserted entirely inline instead.
+func (h *harness) scenarioStaleLegAlarmFires() Result {
+	const name = "StaleLegAlarmFiresOnceForLegLeftForwardedTooLong"
+	externalID := h.nextID("stale")
+	customerID := h.nextID("cust")
+
+	order, err := h.ledger.createRelayOrder(h.ctx, externalID, customerID, true)
+	if err != nil {
+		return fail(name, err)
+	}
+	screened, err := h.ledger.advanceToScreened(h.ctx, order, "USDT_TRC20", "")
+	if err != nil {
+		return fail(name, err)
+	}
+	if _, err := h.store.Create(h.ctx, relay.Leg{
+		ExternalID: externalID, OrderID: screened.ID, Direction: relay.TRC20ToBEP20,
+		CustomerID: customerID, DestinationAddress: "0xcustomer-bep20-address", DepositAddress: "Trelayd-fixture-deposit-address",
+		AmountIn: money.Amount{Asset: money.USDT_TRC20, Units: 100_000000}, AmountOutExpected: money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
+	}); err != nil {
+		return fail(name, err)
+	}
+
+	// StaleLegAlertAfter starts disabled (0) so driving to FORWARDED is
+	// deterministic, matching every other scenario's own construction.
+	so := h.newOrchestrator(h.nextID("provider"), 0)
+	so.upstream.ForceDepositAddress("TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj")
+
+	if err := h.runTicksUntil(so.orch, 3, func() (bool, error) {
+		st, err := h.legStatus(externalID)
+		return st == relay.StatusForwarded, err
+	}); err != nil {
+		return fail(name, err)
+	}
+
+	// Now enable the alarm with a near-zero threshold and wait past it --
+	// Orchestrator.Cfg is exported precisely so a caller can do this.
+	so.orch.Cfg.StaleLegAlertAfter = time.Millisecond
+	time.Sleep(5 * time.Millisecond)
+
+	if err := so.orch.RunTick(h.ctx); err != nil {
+		return fail(name, err)
+	}
+
+	fired := so.alerter.Fired()
+	if len(fired) != 1 {
+		return fail(name, fmt.Errorf("expected exactly 1 alert fired, got %d", len(fired)))
+	}
+	if fired[0].Severity != alert.SeverityWarning {
+		return fail(name, fmt.Errorf("expected WARNING severity, got %s", fired[0].Severity))
+	}
+	if fired[0].ExternalID != externalID {
+		return fail(name, fmt.Errorf("alert fired for %q, want %q", fired[0].ExternalID, externalID))
+	}
+
+	leg, err := h.store.GetByExternalID(h.ctx, externalID)
+	if err != nil {
+		return fail(name, err)
+	}
+	if leg.StaleAlertedAt == nil {
+		return fail(name, errors.New("expected stale_alerted_at to be recorded"))
+	}
+	if leg.Status != relay.StatusForwarded {
+		return fail(name, fmt.Errorf("expected the alarm to leave status unchanged (FORWARDED), got %s", leg.Status))
+	}
+
+	// Idempotency: one more tick must not fire a second alert.
+	if err := so.orch.RunTick(h.ctx); err != nil {
+		return fail(name, err)
+	}
+	if len(so.alerter.Fired()) != 1 {
+		return fail(name, fmt.Errorf("expected still exactly 1 alert after one more tick, got %d", len(so.alerter.Fired())))
+	}
+
 	return pass(name)
 }
 

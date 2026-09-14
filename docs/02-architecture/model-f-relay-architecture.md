@@ -182,6 +182,15 @@ loss doesn't matter) — see `model-f-relay-build-prompts.md`'s open items.
   confirmed, closed when the forward transfer confirms or a refund posts. A
   reconciliation check that finds one of these accounts still open after, say, one
   hour is an operational alarm — nothing in a working relay should sit here that long.
+  **Built (14 Sep 2026):** `relayd/internal/orchestrate/reconcile.go`, checked against
+  `relayd`'s own local `relay_legs.updated_at` (a precise proxy for this account's own
+  state, since each non-terminal status this check covers is set by a real state
+  transition) rather than querying C1's journal directly — fires a `SeverityWarning`
+  alert (`internal/alert`) once per leg via `RELAYD_STALE_LEG_ALERT_AFTER` (an explicit
+  opt-in, no default), purely observational, no automatic action. Deliberately excludes
+  `AWAITING_DEPOSIT` — see that file's own doc comment for why (the same gap
+  `internal/orchestrate/refund.go`'s own R5 refund-by-timeout already flags for that
+  one status).
 - New fee-revenue accounts, kept separate even if only one is used at launch:
   `revenue:relay_commission` (mechanism 1) and `revenue:relay_margin` (mechanism 2) —
   see `model-f-relay-findings.md` §"two open pricing mechanisms."

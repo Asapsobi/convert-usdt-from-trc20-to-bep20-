@@ -42,7 +42,10 @@ func (o *Orchestrator) RunLoop(ctx context.Context, interval time.Duration) erro
 // settlement, then R5's own three refund phases -- refund any leg stuck
 // FORWARDING past Config.ForwardingTimeout, notice any leg a human
 // externally refunded via C3's own hold-review queue, and drive every
-// already-committed refund's own on-chain transfer.
+// already-committed refund's own on-chain transfer -- and finally the
+// stale-relay-leg reconciliation alarm (reconcile.go), purely
+// observational and run last since it never changes anything the phases
+// above would need to re-check this same tick.
 // refundStuckForwardingLegs runs AFTER advanceForwardingLegs within the
 // same tick so a leg that successfully broadcasts its forward transfer
 // THIS tick is naturally excluded (it has already left FORWARDING by the
@@ -70,6 +73,9 @@ func (o *Orchestrator) RunTick(ctx context.Context) error {
 	}
 	if err := o.advanceRefundPendingLegs(ctx); err != nil {
 		return fmt.Errorf("orchestrate: advancing refund-pending legs: %w", err)
+	}
+	if err := o.checkStaleLegs(ctx); err != nil {
+		return fmt.Errorf("orchestrate: checking for stale legs: %w", err)
 	}
 	return nil
 }

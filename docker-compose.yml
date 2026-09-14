@@ -415,6 +415,10 @@ services:
       # left unset (disabled) by default here; see
       # .env.proofrun.example's own optional-overrides list.
       RELAYD_FORWARDING_TIMEOUT: ${RELAYD_FORWARDING_TIMEOUT:-}
+      # The stale-relay-leg reconciliation alarm -- also an explicit
+      # opt-in, left unset (disabled) by default here; see
+      # .env.proofrun.example's own optional-overrides list.
+      RELAYD_STALE_LEG_ALERT_AFTER: ${RELAYD_STALE_LEG_ALERT_AFTER:-}
     ports: ["8093:8093"]
 
   # ---- ops console: internal dashboard over C1-C5/S1 ----

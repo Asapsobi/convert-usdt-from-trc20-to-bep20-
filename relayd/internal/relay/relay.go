@@ -15,10 +15,10 @@
 // internal/orchestrate's own doc comment for exactly when each
 // transition fires.
 //
-// REFUND_PENDING/REFUNDED/UNRECOVERABLE (architecture doc §4) are
-// deliberately NOT modeled here -- R5, this session's own explicitly
-// deferred follow-up. FAILED is this pass's only terminal failure state,
-// covering what R5 will later split into REFUNDED vs UNRECOVERABLE.
+// REFUND_PENDING/REFUNDED/UNRECOVERABLE (architecture doc §4) are R5's
+// own addition -- see those consts' own doc comment. FAILED predates
+// them and is now otherwise unused by any real transition (kept, not
+// removed, since nothing in this pass required deleting it).
 package relay
 
 import (
@@ -83,6 +83,7 @@ type Leg struct {
 	UpstreamDepositAddress *string
 	ForwardTxID            *string
 	RefundTxID             *string
+	StaleAlertedAt         *time.Time
 	CreatedAt              time.Time
 	UpdatedAt              time.Time
 }
@@ -109,7 +110,7 @@ const selectSQL = `
 	SELECT id, external_id, order_id, direction, status, customer_id, destination_address,
 		deposit_address, amount_in, amount_in_asset, amount_out_expected, amount_out_expected_asset,
 		amount_out_actual, upstream_provider_name, upstream_order_id, upstream_deposit_address,
-		forward_tx_id, refund_tx_id, created_at, updated_at
+		forward_tx_id, refund_tx_id, stale_alerted_at, created_at, updated_at
 	FROM relay_legs`
 
 // Create inserts a new leg in AWAITING_DEPOSIT, idempotent on
@@ -127,7 +128,7 @@ func (s *Store) Create(ctx context.Context, l Leg) (Leg, error) {
 		RETURNING id, external_id, order_id, direction, status, customer_id, destination_address,
 			deposit_address, amount_in, amount_in_asset, amount_out_expected, amount_out_expected_asset,
 			amount_out_actual, upstream_provider_name, upstream_order_id, upstream_deposit_address,
-			forward_tx_id, refund_tx_id, created_at, updated_at
+			forward_tx_id, refund_tx_id, stale_alerted_at, created_at, updated_at
 	`, l.ExternalID, l.OrderID, string(l.Direction), string(StatusAwaitingDeposit), l.CustomerID, l.DestinationAddress, l.DepositAddress,
 		l.AmountIn.Units, string(l.AmountIn.Asset), l.AmountOutExpected.Units, string(l.AmountOutExpected.Asset))
 
@@ -343,6 +344,28 @@ func (s *Store) MarkUnrecoverable(ctx context.Context, externalID string) error 
 	return nil
 }
 
+// MarkStaleAlerted records that externalID has been alerted on for the
+// stale-relay-leg reconciliation alarm
+// (docs/02-architecture/model-f-relay-architecture.md §5's own "an
+// account open after an hour is an operational alarm") -- idempotent by
+// construction (WHERE stale_alerted_at IS NULL), not a state-machine
+// transition the way every other Mark<State> in this file is: a leg can
+// be marked stale from ANY non-terminal status, and this never changes
+// Status itself. Returns (fired, nil) -- fired is true only the first
+// time this succeeds for externalID, so a caller knows whether to
+// actually fire the alert or whether a previous tick already did.
+func (s *Store) MarkStaleAlerted(ctx context.Context, externalID string) (fired bool, err error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE relay_legs
+		SET stale_alerted_at = now()
+		WHERE external_id = $1 AND stale_alerted_at IS NULL
+	`, externalID)
+	if err != nil {
+		return false, fmt.Errorf("relay: marking %s stale-alerted: %w", externalID, err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // checkAlreadyAt distinguishes "this call is a safe replay of a
 // transition that already happened" (success) from "the leg is in some
 // OTHER status this transition never expected" (a real error) --
@@ -373,7 +396,7 @@ func scanLeg(row scanRow) (Leg, error) {
 		&l.ID, &l.ExternalID, &l.OrderID, &direction, &status, &l.CustomerID, &l.DestinationAddress,
 		&l.DepositAddress, &amountInUnits, &amountInAsset, &amountOutExpectedUnits, &amountOutExpectedAsset,
 		&amountOutActualUnits, &l.UpstreamProviderName, &l.UpstreamOrderID, &l.UpstreamDepositAddress,
-		&l.ForwardTxID, &l.RefundTxID, &l.CreatedAt, &l.UpdatedAt,
+		&l.ForwardTxID, &l.RefundTxID, &l.StaleAlertedAt, &l.CreatedAt, &l.UpdatedAt,
 	)
 	if err != nil {
 		return Leg{}, err
