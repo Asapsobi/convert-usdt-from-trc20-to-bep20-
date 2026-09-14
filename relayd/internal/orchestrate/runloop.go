@@ -39,22 +39,24 @@ func (o *Orchestrator) RunLoop(ctx context.Context, interval time.Duration) erro
 // RunTick runs one pass: start forwarding every relay leg whose C1
 // order has just reached screened, advance every leg already
 // forwarding toward FORWARDED, check every FORWARDED leg for upstream
-// settlement, then R5's own three refund phases -- refund any leg stuck
-// FORWARDING past Config.ForwardingTimeout, notice any leg a human
-// externally refunded via C3's own hold-review queue, and drive every
-// already-committed refund's own on-chain transfer -- and finally the
-// stale-relay-leg reconciliation alarm (reconcile.go), purely
-// observational and run last since it never changes anything the phases
-// above would need to re-check this same tick.
-// refundStuckForwardingLegs runs AFTER advanceForwardingLegs within the
-// same tick so a leg that successfully broadcasts its forward transfer
-// THIS tick is naturally excluded (it has already left FORWARDING by the
-// time the refund phase re-lists it) -- ordering is a wasted-attempt
-// optimization here, not a correctness requirement: relay.Store's own
-// conditional updates make the race safe either way. Each phase is
-// independent and each leg within a phase is isolated from its
-// neighbors' failures -- the same per-row-error-isolation discipline
-// every sibling orchestrator uses.
+// settlement, then R5's own four refund phases -- refund any leg stuck
+// AWAITING_DEPOSIT (screened, but its own upstream.CreateOrder attempt
+// never succeeded) or FORWARDING past Config.ForwardingTimeout, notice
+// any leg a human externally refunded via C3's own hold-review queue,
+// and drive every already-committed refund's own on-chain transfer --
+// and finally the stale-relay-leg reconciliation alarm (reconcile.go),
+// purely observational and run last since it never changes anything the
+// phases above would need to re-check this same tick.
+// refundStuckForwardingLegs runs AFTER advanceForwardingLegs (and
+// refundStuckAwaitingDepositLegs AFTER startScreenedLegs) within the
+// same tick so a leg that successfully advances THIS tick is naturally
+// excluded (it has already left the status the refund phase re-lists by
+// the time that phase runs) -- ordering is a wasted-attempt optimization
+// here, not a correctness requirement: relay.Store's own conditional
+// updates make the race safe either way. Each phase is independent and
+// each leg within a phase is isolated from its neighbors' failures --
+// the same per-row-error-isolation discipline every sibling orchestrator
+// uses.
 func (o *Orchestrator) RunTick(ctx context.Context) error {
 	if err := o.startScreenedLegs(ctx); err != nil {
 		return fmt.Errorf("orchestrate: starting screened legs: %w", err)
@@ -64,6 +66,9 @@ func (o *Orchestrator) RunTick(ctx context.Context) error {
 	}
 	if err := o.advanceForwardedLegs(ctx); err != nil {
 		return fmt.Errorf("orchestrate: advancing forwarded legs: %w", err)
+	}
+	if err := o.refundStuckAwaitingDepositLegs(ctx); err != nil {
+		return fmt.Errorf("orchestrate: refunding stuck awaiting-deposit legs: %w", err)
 	}
 	if err := o.refundStuckForwardingLegs(ctx); err != nil {
 		return fmt.Errorf("orchestrate: refunding stuck forwarding legs: %w", err)
@@ -128,6 +133,15 @@ func (o *Orchestrator) startOne(ctx context.Context, externalID string) error {
 	}
 
 	if leg.Status == relay.StatusAwaitingDeposit {
+		// Recorded before the CreateOrder attempt below, whether or not
+		// it succeeds -- this is refundStuckAwaitingDepositLegs's own
+		// "since when has relayd known this leg needs forwarding" clock
+		// (refund.go's own doc comment), and needs to start ticking even
+		// on a CreateOrder failure, not just a success.
+		if err := o.Store.MarkForwardAttemptStarted(ctx, leg.ExternalID); err != nil {
+			return fmt.Errorf("marking forward attempt started: %w", err)
+		}
+
 		pair := upstreamPairFor(leg.Direction)
 		order, err := o.Upstream.CreateOrder(ctx, pair, leg.AmountIn, leg.DestinationAddress)
 		if err != nil {

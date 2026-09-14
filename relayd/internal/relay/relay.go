@@ -67,25 +67,26 @@ const (
 
 // Leg is a relay_legs row.
 type Leg struct {
-	ID                     int64
-	ExternalID             string
-	OrderID                int64
-	Direction              Direction
-	Status                 Status
-	CustomerID             string
-	DestinationAddress     string
-	DepositAddress         string
-	AmountIn               money.Amount
-	AmountOutExpected      money.Amount
-	AmountOutActual        *money.Amount
-	UpstreamProviderName   *string
-	UpstreamOrderID        *string
-	UpstreamDepositAddress *string
-	ForwardTxID            *string
-	RefundTxID             *string
-	StaleAlertedAt         *time.Time
-	CreatedAt              time.Time
-	UpdatedAt              time.Time
+	ID                      int64
+	ExternalID              string
+	OrderID                 int64
+	Direction               Direction
+	Status                  Status
+	CustomerID              string
+	DestinationAddress      string
+	DepositAddress          string
+	AmountIn                money.Amount
+	AmountOutExpected       money.Amount
+	AmountOutActual         *money.Amount
+	UpstreamProviderName    *string
+	UpstreamOrderID         *string
+	UpstreamDepositAddress  *string
+	ForwardTxID             *string
+	RefundTxID              *string
+	StaleAlertedAt          *time.Time
+	ForwardAttemptStartedAt *time.Time
+	CreatedAt               time.Time
+	UpdatedAt               time.Time
 }
 
 // ErrLegNotFound means no relay_legs row exists for the given key.
@@ -110,7 +111,7 @@ const selectSQL = `
 	SELECT id, external_id, order_id, direction, status, customer_id, destination_address,
 		deposit_address, amount_in, amount_in_asset, amount_out_expected, amount_out_expected_asset,
 		amount_out_actual, upstream_provider_name, upstream_order_id, upstream_deposit_address,
-		forward_tx_id, refund_tx_id, stale_alerted_at, created_at, updated_at
+		forward_tx_id, refund_tx_id, stale_alerted_at, forward_attempt_started_at, created_at, updated_at
 	FROM relay_legs`
 
 // Create inserts a new leg in AWAITING_DEPOSIT, idempotent on
@@ -128,7 +129,7 @@ func (s *Store) Create(ctx context.Context, l Leg) (Leg, error) {
 		RETURNING id, external_id, order_id, direction, status, customer_id, destination_address,
 			deposit_address, amount_in, amount_in_asset, amount_out_expected, amount_out_expected_asset,
 			amount_out_actual, upstream_provider_name, upstream_order_id, upstream_deposit_address,
-			forward_tx_id, refund_tx_id, stale_alerted_at, created_at, updated_at
+			forward_tx_id, refund_tx_id, stale_alerted_at, forward_attempt_started_at, created_at, updated_at
 	`, l.ExternalID, l.OrderID, string(l.Direction), string(StatusAwaitingDeposit), l.CustomerID, l.DestinationAddress, l.DepositAddress,
 		l.AmountIn.Units, string(l.AmountIn.Asset), l.AmountOutExpected.Units, string(l.AmountOutExpected.Asset))
 
@@ -366,6 +367,29 @@ func (s *Store) MarkStaleAlerted(ctx context.Context, externalID string) (fired 
 	return tag.RowsAffected() > 0, nil
 }
 
+// MarkForwardAttemptStarted records the first time relayd ever notices
+// externalID's own leg needs forwarding (its C1 order reached screened)
+// -- idempotent by construction (WHERE forward_attempt_started_at IS
+// NULL), the same first-write-wins shape as MarkStaleAlerted, and for
+// the identical reason: not a state-machine transition, a side
+// annotation relay.Status itself never reflects. Gives
+// refundStuckAwaitingDepositLegs (internal/orchestrate/refund.go) a
+// reliable "how long has this leg actually needed attention" clock for
+// a leg still AWAITING_DEPOSIT, which its own CreatedAt (quote time) and
+// UpdatedAt (untouched while still AWAITING_DEPOSIT) cannot provide --
+// see that function's own doc comment.
+func (s *Store) MarkForwardAttemptStarted(ctx context.Context, externalID string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE relay_legs
+		SET forward_attempt_started_at = now()
+		WHERE external_id = $1 AND forward_attempt_started_at IS NULL
+	`, externalID)
+	if err != nil {
+		return fmt.Errorf("relay: marking %s forward-attempt-started: %w", externalID, err)
+	}
+	return nil
+}
+
 // checkAlreadyAt distinguishes "this call is a safe replay of a
 // transition that already happened" (success) from "the leg is in some
 // OTHER status this transition never expected" (a real error) --
@@ -396,7 +420,7 @@ func scanLeg(row scanRow) (Leg, error) {
 		&l.ID, &l.ExternalID, &l.OrderID, &direction, &status, &l.CustomerID, &l.DestinationAddress,
 		&l.DepositAddress, &amountInUnits, &amountInAsset, &amountOutExpectedUnits, &amountOutExpectedAsset,
 		&amountOutActualUnits, &l.UpstreamProviderName, &l.UpstreamOrderID, &l.UpstreamDepositAddress,
-		&l.ForwardTxID, &l.RefundTxID, &l.StaleAlertedAt, &l.CreatedAt, &l.UpdatedAt,
+		&l.ForwardTxID, &l.RefundTxID, &l.StaleAlertedAt, &l.ForwardAttemptStartedAt, &l.CreatedAt, &l.UpdatedAt,
 	)
 	if err != nil {
 		return Leg{}, err

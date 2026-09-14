@@ -4,18 +4,22 @@
 // forward transfer has never once successfully broadcast/confirmed --
 // for longer than Config.ForwardingTimeout, rather than retrying forever.
 //
+// A leg stuck AWAITING_DEPOSIT whose underlying C1 order is already
+// screened (upstream.CreateOrder itself has never once succeeded) is now
+// also covered (refundStuckAwaitingDepositLegs, below): distinguishing
+// "no deposit has arrived yet" (nothing to refund, AWAITING_DEPOSIT's
+// own CreatedAt legitimately can be old) from "a deposit arrived and
+// CreateOrder keeps failing" needed a new relay_legs timestamp
+// (forward_attempt_started_at, set by runloop.go's own startOne the
+// first time it ever notices a leg needs forwarding, whether or not that
+// attempt succeeds) and a new C1 transition ({Screened, Refunded},
+// ledger/internal/orders/transitions.go) that did not exist before this
+// -- refunding from `screened` is simpler than the FORWARDING case above
+// in one respect: the deposit is still sitting untouched in
+// asset:relay:leg:<id> (relay_forward_start never ran), so no reversal
+// entry is needed first, just the refund entry directly.
+//
 // Deliberately NOT covered by this file (flagged, not silently skipped):
-//   - A leg stuck AWAITING_DEPOSIT whose underlying C1 order is already
-//     screened (upstream.CreateOrder itself has never once succeeded).
-//     Distinguishing "no deposit has arrived yet" (nothing to refund,
-//     AWAITING_DEPOSIT's own CreatedAt legitimately can be old) from
-//     "a deposit arrived and CreateOrder keeps failing" needs either a
-//     new relay_legs timestamp this pass does not add, or a C1-exposed
-//     per-state timestamp that does not exist today -- and refunding
-//     from `screened` needs a new C1 transition ({Screened, Refunded})
-//     that also does not exist today (only {Funded, Refunded} and
-//     {Held, Refunded} do). Left as a known follow-up rather than
-//     building a shortcut around either gap.
 //   - The manual HELD->REFUNDED path via C3's own hold-review queue is
 //     now wired (startExternallyRefundedLegs, below): screening's own
 //     holds.Reject calls relayd's GET .../refund-entry
@@ -144,6 +148,99 @@ func (o *Orchestrator) startRefund(ctx context.Context, leg relay.Leg) error {
 		return fmt.Errorf("marking refund pending: %w", err)
 	}
 	slog.Info("orchestrate: relay leg's forward attempt timed out, refund committed on C1", "external_id", leg.ExternalID)
+	return nil
+}
+
+// refundStuckAwaitingDepositLegs scans every AWAITING_DEPOSIT leg and
+// starts a refund for any whose ForwardAttemptStartedAt (set once, by
+// runloop.go's own startOne, the first time it ever notices this leg
+// needs forwarding -- see relay.Store.MarkForwardAttemptStarted's own
+// doc comment) is older than Config.ForwardingTimeout. A leg
+// ForwardAttemptStartedAt is still nil for is skipped outright: relayd
+// has never yet seen this leg's own C1 order reach screened, so there is
+// nothing stuck here to refund -- it is either still genuinely
+// AWAITING_DEPOSIT (no customer deposit has landed yet, legitimately
+// open-ended) or the order has not been screened yet, C3's own job, not
+// this phase's. Shares Config.ForwardingTimeout with
+// refundStuckForwardingLegs rather than a separate config value -- the
+// two are the same underlying question ("how long will relayd wait on
+// itself before giving up and refunding"), just checked against a
+// different clock for a leg that never made it past this phase's own
+// FIRST step.
+func (o *Orchestrator) refundStuckAwaitingDepositLegs(ctx context.Context) error {
+	if o.Cfg.ForwardingTimeout <= 0 {
+		return nil
+	}
+	legs, err := o.Store.ListByStatus(ctx, relay.StatusAwaitingDeposit)
+	if err != nil {
+		return fmt.Errorf("listing awaiting-deposit legs for refund-timeout check: %w", err)
+	}
+	for _, leg := range legs {
+		if leg.ForwardAttemptStartedAt == nil {
+			continue
+		}
+		if time.Since(*leg.ForwardAttemptStartedAt) < o.Cfg.ForwardingTimeout {
+			continue
+		}
+		if err := o.startAwaitingDepositRefund(ctx, leg); err != nil {
+			slog.Error("orchestrate: starting refund for stuck-awaiting-deposit leg failed, will retry next tick",
+				"external_id", leg.ExternalID, "error", err)
+		}
+	}
+	return nil
+}
+
+// startAwaitingDepositRefund commits the refund on C1 directly from
+// screened (no reversal step needed first -- see this file's own
+// top-of-file doc comment) and marks the leg REFUND_PENDING locally.
+func (o *Orchestrator) startAwaitingDepositRefund(ctx context.Context, leg relay.Leg) error {
+	if err := o.postScreenedRefundEntry(ctx, leg); err != nil {
+		return err
+	}
+	if err := o.Store.MarkRefundPending(ctx, leg.ExternalID); err != nil {
+		return fmt.Errorf("marking refund pending: %w", err)
+	}
+	slog.Info("orchestrate: relay leg's forward attempt never got past screened, refund committed on C1", "external_id", leg.ExternalID)
+	return nil
+}
+
+// postScreenedRefundEntry posts "relay_refund" directly from screened,
+// closing the customer's own liability and the relay-leg suspense
+// account by the full amount_in -- postRefundEntry's own sibling, one
+// step earlier in the leg's lifecycle (screened, never dispatching, so
+// no forwarding-suspense account was ever opened for it). Reuses C1's
+// own {Screened, Refunded} transition (ledger/internal/orders/transitions.go).
+// A no-op if already posted (idempotent replay); an error if the order
+// is in neither screened nor refunded (a real bug, not a replay).
+func (o *Orchestrator) postScreenedRefundEntry(ctx context.Context, leg relay.Leg) error {
+	order, err := o.Ledger.GetOrder(ctx, leg.ExternalID)
+	if err != nil {
+		return fmt.Errorf("fetching order: %w", err)
+	}
+	if order.State == "refunded" {
+		return nil // already posted -- safe replay
+	}
+	if order.State != "screened" {
+		return fmt.Errorf("order is in state %q, not screened -- cannot post the refund entry", order.State)
+	}
+
+	customerAccount := customerAccountCode(order.CustomerID, order.AmountIn.Asset)
+	legAccount := relayLegAccountCode(leg.OrderID)
+	asset := string(order.AmountIn.Asset)
+
+	negAmountIn, err := order.AmountIn.Neg()
+	if err != nil {
+		return fmt.Errorf("negating amount_in: %w", err)
+	}
+	idemKey := "relayd:refund_awaiting:" + leg.ExternalID
+	lines := []ledgerclient.EntryLine{
+		{AccountCode: customerAccount, Asset: asset, Amount: order.AmountIn},
+		{AccountCode: legAccount, Asset: asset, Amount: negAmountIn},
+	}
+	if _, err := o.Ledger.TransitionWithEntry(ctx, leg.ExternalID, "refunded", order.Version,
+		"relay_refund", "relay_refund", time.Now().UTC(), lines, idemKey); err != nil {
+		return fmt.Errorf("posting relay_refund entry: %w", err)
+	}
 	return nil
 }
 

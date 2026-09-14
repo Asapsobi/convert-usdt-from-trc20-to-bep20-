@@ -2,20 +2,26 @@
 // docs/03-build/model-f-relay-build-prompts.md's own R6 wording ("a
 // screening hold that resolves to refund, an upstream failed before the
 // forward transfer") because R5 initially shipped only a first slice
-// (automatic refund-by-timeout, no manual HELD->REFUNDED path). The
-// manual path is now wired too (screening/internal/holds.go's own
-// RelayAwareRefundEntryBuilder, calling relayd's GET .../refund-entry) --
-// scenarioManuallyRejectedHoldGetsRefunded below exercises it for real,
-// restoring the build-prompts doc's own original scenario. "Upstream
-// failed before the forward transfer" still has no distinct code path in
-// this implementation, though: relayd only ever learns an upstream
-// order's status by polling it AFTER its own forward transfer confirms
+// (automatic refund-by-timeout for a stuck FORWARDING leg only). Two
+// more pieces have since landed, each restoring a piece of R5's own full
+// scope: scenarioStuckAwaitingDepositRefund covers a leg whose own
+// upstream.CreateOrder call never once succeeds (refund.go's own
+// refundStuckAwaitingDepositLegs, gated on ledger's new
+// {Screened, Refunded} transition), and
+// scenarioManuallyRejectedHoldGetsRefunded covers the manual
+// HELD->REFUNDED path via C3's own hold-review queue
+// (screening/internal/holds.go's own RelayAwareRefundEntryBuilder,
+// calling relayd's GET .../refund-entry). "Upstream failed before the
+// forward transfer" still has no distinct code path in this
+// implementation: relayd only ever learns an upstream order's status by
+// polling it AFTER its own forward transfer confirms
 // (advanceForwardedOne), so a pre-forward vendor failure is,
 // today, indistinguishable from any other reason the forward attempt
 // never completes, and is covered by the SAME stuck-forwarding-timeout
 // mechanism scenarioStuckForwardingTimeoutRefund exercises. That one
-// remaining gap is also recorded in README.md's own Model F status
-// table.
+// remaining gap is real-vendor-shaped (gated on R2/R4) and is recorded
+// in README.md's own Model F status table, not something this pass can
+// close without one.
 package replay
 
 import (
@@ -217,6 +223,70 @@ func (h *harness) scenarioStuckForwardingTimeoutRefund() Result {
 	if err := h.assertZero(relayLegAccountCode(screened.ID)); err != nil {
 		return fail(name, err)
 	}
+	if err := h.assertZero(relayForwardingAccountCode(screened.ID)); err != nil {
+		return fail(name, err)
+	}
+	h.track(trackedLeg{externalID: externalID, orderID: screened.ID, wantTerminal: relay.StatusRefunded})
+	return pass(name)
+}
+
+// scenarioStuckAwaitingDepositRefund forces upstream.CreateOrder to fail
+// permanently (a real, permanent vendor rejection, not a transient one)
+// -- the last self-contained R5 gap: a leg whose own C1 order reached
+// screened but never got past this phase's own first step is refunded
+// directly from screened, no forwarding-suspense reversal needed (unlike
+// scenarioStuckForwardingTimeoutRefund above, relay_forward_start never
+// ran for this leg -- see refund.go's own top-of-file doc comment).
+func (h *harness) scenarioStuckAwaitingDepositRefund() Result {
+	const name = "StuckAwaitingDepositLegAutomaticallyRefunded"
+	externalID := h.nextID("awaiting-refund")
+	customerID := h.nextID("cust")
+	senderAddress := "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj"
+
+	order, err := h.ledger.createRelayOrder(h.ctx, externalID, customerID, true)
+	if err != nil {
+		return fail(name, err)
+	}
+	screened, err := h.ledger.advanceToScreened(h.ctx, order, "USDT_TRC20", senderAddress)
+	if err != nil {
+		return fail(name, err)
+	}
+	if _, err := h.store.Create(h.ctx, relay.Leg{
+		ExternalID: externalID, OrderID: screened.ID, Direction: relay.TRC20ToBEP20,
+		CustomerID: customerID, DestinationAddress: "0xcustomer-bep20-address", DepositAddress: "Trelayd-fixture-deposit-address",
+		AmountIn: money.Amount{Asset: money.USDT_TRC20, Units: 100_000000}, AmountOutExpected: money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
+	}); err != nil {
+		return fail(name, err)
+	}
+
+	so := h.newOrchestrator(h.nextID("provider"), time.Millisecond)
+	so.upstream.ForceCreateOrderError(errors.New("replay: simulated permanent vendor rejection"))
+
+	if err := h.runTicksUntil(so.orch, 4, func() (bool, error) {
+		st, err := h.legStatus(externalID)
+		return st == relay.StatusRefunded, err
+	}); err != nil {
+		return fail(name, err)
+	}
+
+	leg, err := h.store.GetByExternalID(h.ctx, externalID)
+	if err != nil {
+		return fail(name, err)
+	}
+	if leg.RefundTxID == nil || *leg.RefundTxID == "" {
+		return fail(name, errors.New("expected a refund_tx_id to be recorded"))
+	}
+	if so.chain.broadcasts != 1 {
+		return fail(name, fmt.Errorf("expected exactly 1 TRC20 broadcast (the refund), got %d", so.chain.broadcasts))
+	}
+
+	if err := h.assertZero(customerLiabilityCode(customerID, "USDT_TRC20")); err != nil {
+		return fail(name, err)
+	}
+	if err := h.assertZero(relayLegAccountCode(screened.ID)); err != nil {
+		return fail(name, err)
+	}
+	// Never opened for this leg -- relay_forward_start never ran.
 	if err := h.assertZero(relayForwardingAccountCode(screened.ID)); err != nil {
 		return fail(name, err)
 	}

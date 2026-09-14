@@ -291,6 +291,7 @@ var expectedTransitions = map[orders.State]map[orders.State]expectedRule{
 	},
 	orders.Screened: {
 		orders.Dispatching: {RequiresEntry: true, HaltBlocked: true},
+		orders.Refunded:    {RequiresEntry: true, HaltBlocked: true},
 	},
 	orders.Dispatching: {
 		orders.Settled: {RequiresEntry: true, HaltBlocked: true},
@@ -354,12 +355,14 @@ func advanceToState(t *testing.T, ctx context.Context, pool *pgxpool.Pool, targe
 }
 
 // TestFullStateCrossProduct is C1.5's headline acceptance criterion: over
-// the full 8x8 state cross product, exactly the 11 pairs in
-// expectedTransitions succeed and the other 53 return ErrIllegalTransition
+// the full 8x8 state cross product, exactly the 12 pairs in
+// expectedTransitions succeed and the other 52 return ErrIllegalTransition
 // while writing nothing -- no order_transitions row, no change to the
 // order's own state or version. A settled order rejecting every further
 // transition is a special case of this: Settled has zero legal outgoing
 // pairs, so all 8 of its targets are exercised here as illegal.
+// {Screened, Refunded} (Model F's own addition -- see
+// transitions.go's own doc comment on that pair) is the 12th.
 func TestFullStateCrossProduct(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
@@ -396,8 +399,8 @@ func TestFullStateCrossProduct(t *testing.T) {
 		}
 	}
 
-	require.Equal(t, 11, legalCount, "expected exactly 11 legal pairs in the 8x8 cross product")
-	require.Equal(t, 53, illegalCount, "expected exactly 53 illegal pairs in the 8x8 cross product")
+	require.Equal(t, 12, legalCount, "expected exactly 12 legal pairs in the 8x8 cross product")
+	require.Equal(t, 52, illegalCount, "expected exactly 52 illegal pairs in the 8x8 cross product")
 
 	for from, targets := range expectedTransitions {
 		for to, rule := range targets {

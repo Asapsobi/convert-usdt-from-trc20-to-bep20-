@@ -2,15 +2,15 @@ package orders
 
 import "testing"
 
-// TestTransitionTableHasExactlyElevenPairs is a cheap, DB-free sanity
+// TestTransitionTableHasExactlyTwelvePairs is a cheap, DB-free sanity
 // check on the production table's own shape. It is not the acceptance
 // test -- that is TestFullStateCrossProduct in the integration suite,
 // which drives real Transition calls against an independently
 // hand-copied version of the spec's table, and is what actually proves
 // this map matches the spec rather than just itself.
-func TestTransitionTableHasExactlyElevenPairs(t *testing.T) {
-	if len(transitionTable) != 11 {
-		t.Fatalf("transitionTable has %d entries, want 11", len(transitionTable))
+func TestTransitionTableHasExactlyTwelvePairs(t *testing.T) {
+	if len(transitionTable) != 12 {
+		t.Fatalf("transitionTable has %d entries, want 12", len(transitionTable))
 	}
 	for p := range transitionTable {
 		if !p.From.Valid() {

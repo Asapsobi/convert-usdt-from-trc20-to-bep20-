@@ -188,9 +188,10 @@ loss doesn't matter) — see `model-f-relay-build-prompts.md`'s open items.
   transition) rather than querying C1's journal directly — fires a `SeverityWarning`
   alert (`internal/alert`) once per leg via `RELAYD_STALE_LEG_ALERT_AFTER` (an explicit
   opt-in, no default), purely observational, no automatic action. Deliberately excludes
-  `AWAITING_DEPOSIT` — see that file's own doc comment for why (the same gap
-  `internal/orchestrate/refund.go`'s own R5 refund-by-timeout already flags for that
-  one status).
+  `AWAITING_DEPOSIT` — a leg still in that status has its own separate, *active* recovery
+  mechanism instead of a passive alarm: `refundStuckAwaitingDepositLegs` (same file, R5's
+  own last self-contained slice, built the same day) actually refunds it once
+  `relay_legs.forward_attempt_started_at` is stale, rather than just warning about it.
 - New fee-revenue accounts, kept separate even if only one is used at launch:
   `revenue:relay_commission` (mechanism 1) and `revenue:relay_margin` (mechanism 2) —
   see `model-f-relay-findings.md` §"two open pricing mechanisms."

@@ -460,3 +460,43 @@ func TestMarkStaleAlerted_FiresOnceReturnsFalseOnReplay(t *testing.T) {
 		t.Fatal("expected fired=false on a replayed call -- the alarm must fire at most once per leg")
 	}
 }
+
+func TestMarkForwardAttemptStarted_SetsOnceLeavesStatusUnchanged(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	l := testLeg(t)
+	created, err := store.Create(ctx, l)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.MarkForwardAttemptStarted(ctx, created.ExternalID); err != nil {
+		t.Fatalf("MarkForwardAttemptStarted (first): %v", err)
+	}
+	first, err := store.GetByExternalID(ctx, created.ExternalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ForwardAttemptStartedAt == nil {
+		t.Fatal("expected forward_attempt_started_at to be recorded")
+	}
+	if first.Status != relay.StatusAwaitingDeposit {
+		t.Errorf("expected MarkForwardAttemptStarted to leave status unchanged (AWAITING_DEPOSIT), got %s", first.Status)
+	}
+
+	firstTimestamp := *first.ForwardAttemptStartedAt
+	time.Sleep(5 * time.Millisecond)
+
+	// A second call must not move the timestamp -- first-write-wins,
+	// same as MarkStaleAlerted.
+	if err := store.MarkForwardAttemptStarted(ctx, created.ExternalID); err != nil {
+		t.Fatalf("MarkForwardAttemptStarted (second): %v", err)
+	}
+	second, err := store.GetByExternalID(ctx, created.ExternalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ForwardAttemptStartedAt == nil || !second.ForwardAttemptStartedAt.Equal(firstTimestamp) {
+		t.Fatalf("expected forward_attempt_started_at to stay %v, got %v", firstTimestamp, second.ForwardAttemptStartedAt)
+	}
+}

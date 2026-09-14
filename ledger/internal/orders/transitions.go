@@ -45,6 +45,17 @@ type pair struct {
 // transition table requires it to -- constructing a reversal-shaped
 // entry, once C1.6 provides a way to, is the caller's responsibility, not
 // something Transition special-cases by (from, to) pair.
+// {Screened, Refunded} (added for Model F): RELAY tier only in practice
+// -- relayd gave up on a stuck screened order (its own
+// upstream.CreateOrder call never once succeeded) and refunded it
+// directly, per docs/02-architecture/model-f-relay-architecture.md §5's
+// own reconciliation posture -- see
+// relayd/internal/orchestrate/refund.go's own doc comment. Model D's own
+// DIRECT/STANDARD/SWEEP tiers never sit in `screened` long enough in
+// practice for this to matter (C5 picks a screened order up virtually
+// immediately), but this transition is not itself tier-gated -- C1
+// reuses its own existing state machine rather than forking it for
+// RELAY, per that same architecture doc's own §5.
 var transitionTable = map[pair]rule{
 	{Quoted, Funded}:        {RequiresEntry: true, HaltBlocked: false},  // deposit reached 15 conf
 	{Quoted, Expired}:       {RequiresEntry: false, HaltBlocked: false}, // quote_expires_at passed, nothing received
@@ -55,6 +66,7 @@ var transitionTable = map[pair]rule{
 	{Held, Screened}:        {RequiresEntry: false, HaltBlocked: false}, // manual release
 	{Held, Refunded}:        {RequiresEntry: true, HaltBlocked: true},   // manual reject
 	{Screened, Dispatching}: {RequiresEntry: true, HaltBlocked: true},   // posts the conversion entry (§B)
+	{Screened, Refunded}:    {RequiresEntry: true, HaltBlocked: true},   // stuck screened order, gave up (see above)
 	{Dispatching, Settled}:  {RequiresEntry: true, HaltBlocked: true},   // payout SR-final
 	{Dispatching, Held}:     {RequiresEntry: true, HaltBlocked: false},  // non-retryable failure (reversal)
 }

@@ -988,3 +988,125 @@ func TestStaleLegAlarm_FiresOnceThenNeverAgain(t *testing.T) {
 		t.Errorf("expected still exactly 1 alert after a 3rd tick, got %d", len(alerter.Fired()))
 	}
 }
+
+// TestRefund_StuckAwaitingDepositLegGetsRefunded proves the last
+// remaining self-contained R5 gap: a leg whose own C1 order reached
+// screened but whose upstream.CreateOrder call never once succeeds
+// (a real, permanent vendor rejection, not a transient one) is
+// automatically refunded on-chain, directly from screened -- no
+// forwarding-suspense reversal needed, since relay_forward_start never
+// ran for this leg.
+func TestRefund_StuckAwaitingDepositLegGetsRefunded(t *testing.T) {
+	ledger := startLedger(t)
+	pool := testPool(t)
+	store := relay.NewStore(pool)
+	client := ledgerclient.New(ledger.BaseURL(), ledger.Token())
+
+	externalID := uniqueExternalID(t)
+	order := ledger.CreateRelayOrder(externalID, "cust-awaiting-refund-1")
+	senderAddress := "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj"
+	screened := ledger.AdvanceToScreenedWithSender(order, senderAddress)
+	if screened.State != "screened" {
+		t.Fatalf("fixture setup: expected screened, got %s", screened.State)
+	}
+
+	if _, err := store.Create(context.Background(), relay.Leg{
+		ExternalID: externalID, OrderID: screened.ID, Direction: relay.TRC20ToBEP20,
+		CustomerID: "cust-awaiting-refund-1", DestinationAddress: "0xcustomer-bep20-address",
+		DepositAddress:    "Trelayd-fixture-deposit-address",
+		AmountIn:          money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
+		AmountOutExpected: money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
+	}); err != nil {
+		t.Fatalf("creating relay leg: %v", err)
+	}
+
+	mockProvider := upstream.NewMockProvider("mock-awaiting-refund", 1)
+	mockProvider.ForceCreateOrderError(fmt.Errorf("replay: simulated permanent vendor rejection"))
+	signer := signing.NewFakeSigningService()
+	signer.SetSlotAddress(1, "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH")
+	chain := &fakeChain{}
+	finality := newFakeFinality()
+	evmChain := &fakeEVMChain{}
+	evmFinality := newFakeEVMFinality()
+	alerter := &fakeAlerter{}
+
+	// ForwardingTimeout starts at 0 (disabled) so tick 1 -- which
+	// records forward_attempt_started_at and fails CreateOrder -- is
+	// deterministic, matching TestStaleLegAlarm_FiresOnceThenNeverAgain's
+	// own construction.
+	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alerter, orchestrate.Config{
+		SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH",
+		EnergyPerTransferUnits: 65000,
+	})
+
+	ctx := context.Background()
+	if err := orch.RunTick(ctx); err != nil {
+		t.Fatalf("RunTick 1: %v", err)
+	}
+	afterTick1, err := store.GetByExternalID(ctx, externalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterTick1.Status != relay.StatusAwaitingDeposit {
+		t.Fatalf("after tick 1: expected AWAITING_DEPOSIT (CreateOrder should have failed), got %s", afterTick1.Status)
+	}
+	if afterTick1.ForwardAttemptStartedAt == nil {
+		t.Fatal("expected forward_attempt_started_at to be recorded even though CreateOrder failed")
+	}
+	stillScreened := ledger.GetOrder(externalID)
+	if stillScreened.State != "screened" {
+		t.Fatalf("expected C1 order to still be screened, got %s", stillScreened.State)
+	}
+
+	// Now enable the timeout and wait past it.
+	orch.Cfg.ForwardingTimeout = time.Millisecond
+	time.Sleep(5 * time.Millisecond)
+
+	if err := orch.RunTick(ctx); err != nil {
+		t.Fatalf("RunTick 2: %v", err)
+	}
+	afterTick2, err := store.GetByExternalID(ctx, externalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterTick2.Status != relay.StatusRefunded {
+		t.Fatalf("after tick 2: expected REFUNDED, got %s", afterTick2.Status)
+	}
+	if afterTick2.RefundTxID == nil || *afterTick2.RefundTxID == "" {
+		t.Fatal("expected a refund_tx_id to be recorded")
+	}
+	if chain.broadcasts != 1 {
+		t.Errorf("expected exactly 1 TRC20 broadcast (the refund), got %d", chain.broadcasts)
+	}
+
+	refundedOrder := ledger.GetOrder(externalID)
+	if refundedOrder.State != "refunded" {
+		t.Fatalf("expected C1 order state refunded, got %s", refundedOrder.State)
+	}
+
+	if got := ledger.AccountBalance("liability:customer:cust-awaiting-refund-1:USDT_TRC20"); got != 0 {
+		t.Errorf("expected customer liability to close to 0, got %d", got)
+	}
+	if got := ledger.AccountBalance(fmt.Sprintf("asset:relay:leg:%d", order.ID)); got != 0 {
+		t.Errorf("expected asset:relay:leg:%d to close to 0, got %d", order.ID, got)
+	}
+	// The forwarding-suspense account was never opened for this leg --
+	// relay_forward_start never ran, unlike the stuck-FORWARDING case.
+	if got := ledger.AccountBalance(fmt.Sprintf("asset:relay:leg:forwarding:%d", order.ID)); got != 0 {
+		t.Errorf("expected asset:relay:leg:forwarding:%d to stay 0 (never opened), got %d", order.ID, got)
+	}
+
+	// Idempotency: one more tick must not re-broadcast or error, and
+	// must not try CreateOrder again either.
+	createOrderCallsBefore := mockProvider.CreateOrderCallCount()
+	if err := orch.RunTick(ctx); err != nil {
+		t.Fatalf("RunTick 3 (idempotent replay): %v", err)
+	}
+	if chain.broadcasts != 1 {
+		t.Errorf("expected still exactly 1 broadcast after one more tick, got %d", chain.broadcasts)
+	}
+	if mockProvider.CreateOrderCallCount() != createOrderCallsBefore {
+		t.Errorf("expected no further CreateOrder calls once refunded, got %d more",
+			mockProvider.CreateOrderCallCount()-createOrderCallsBefore)
+	}
+}
