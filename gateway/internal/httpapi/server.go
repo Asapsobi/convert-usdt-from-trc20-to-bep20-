@@ -21,6 +21,8 @@ import (
 	"gateway/internal/orders"
 	"gateway/internal/quotes"
 	"gateway/internal/ratelimit"
+	"gateway/internal/retailcustomers"
+	"gateway/internal/retailsessions"
 	"gateway/internal/sandbox"
 )
 
@@ -37,6 +39,14 @@ type Server struct {
 	Ledger      *c1client.Client
 	Watcher     *c2client.Client
 	Sandbox     *sandbox.Store
+	// RetailCustomers/RetailSessions back Model D's own B2C channel
+	// (docs/01-strategy/model-d-model-f-product-separation.md). Both nil
+	// means the /v1/retail/... routes are simply not registered -- see
+	// NewRouter -- so a deployment that hasn't opted into this channel
+	// yet is unaffected, the same "optional, degrades cleanly if unset"
+	// posture every other cross-cutting capability in this repo uses.
+	RetailCustomers *retailcustomers.Store
+	RetailSessions  *retailsessions.Store
 	// PendingAddress backs the orders_address_pending gauge (C6.8) --
 	// typically the same *reconcile.Reconciler main.go already runs;
 	// kept as this narrow interface so this package doesn't need to
@@ -95,6 +105,30 @@ func NewRouter(s *Server) http.Handler {
 		r.With(requireSandboxCustomer).Get("/sandbox/orders/{external_id}", s.getSandboxOrderStatus)
 		// C6.8 onward add routes here.
 	})
+
+	// Model D's own B2C channel (docs/01-strategy/model-d-model-f-product-separation.md,
+	// 14 Sep 2026 decision) -- a fully separate auth scope from the B2B
+	// /v1/... routes above (session tokens, never API keys), only
+	// registered when a deployment has actually opted in (both stores
+	// non-nil). An unconfigured deployment gets 404 on these routes, not
+	// a panic -- see retailCustomerFromContext's own doc comment for why
+	// the alternative (an unauthenticated handler silently running) would
+	// be worse.
+	if s.RetailCustomers != nil && s.RetailSessions != nil {
+		router.Route("/v1/retail", func(r chi.Router) {
+			r.Post("/register", s.postRetailRegister)
+			r.Post("/login", s.postRetailLogin)
+
+			r.Group(func(r chi.Router) {
+				r.Use(retailAuthMiddleware(s.RetailSessions, s.RetailCustomers))
+				r.Post("/logout", s.postRetailLogout)
+				r.Get("/me", s.getRetailMe)
+				r.Post("/quotes", s.postRetailQuote)
+				r.Post("/orders", s.postRetailOrder)
+				r.Get("/orders/{external_id}", s.getRetailOrderStatus)
+			})
+		})
+	}
 
 	return router
 }

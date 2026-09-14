@@ -18,10 +18,15 @@ import (
 	"gateway/internal/pricing"
 )
 
-// Quote is one row of the quotes table.
+// Quote is one row of the quotes table. Exactly one of CustomerID
+// (B2B partner) / RetailCustomerID (B2C end-user) is ever set -- mirrors
+// the quotes table's own CHECK constraint (migration 0009). See
+// docs/01-strategy/model-d-model-f-product-separation.md's own 14 Sep
+// 2026 decision for why this table serves both owner kinds.
 type Quote struct {
 	ID                        int64
-	CustomerID                int64
+	CustomerID                *int64
+	RetailCustomerID          *int64
 	Tier                      pricing.Tier
 	AmountIn                  money.Amount
 	AmountOut                 money.Amount
@@ -68,17 +73,28 @@ func NewStore(pool *db.Pool) *Store {
 // different ids and independent expiry, per C6.2's own acceptance
 // criterion: no caching or reuse across requests.
 func (s *Store) Create(ctx context.Context, customerID int64, priced pricing.Quote, recipientAddress string, now time.Time, validity time.Duration) (Quote, error) {
+	return s.create(ctx, &customerID, nil, priced, recipientAddress, now, validity)
+}
+
+// CreateForRetail is Create's own counterpart for a B2C end-user
+// (internal/retailcustomers), writing retail_customer_id instead of
+// customer_id -- otherwise identical.
+func (s *Store) CreateForRetail(ctx context.Context, retailCustomerID int64, priced pricing.Quote, recipientAddress string, now time.Time, validity time.Duration) (Quote, error) {
+	return s.create(ctx, nil, &retailCustomerID, priced, recipientAddress, now, validity)
+}
+
+func (s *Store) create(ctx context.Context, customerID, retailCustomerID *int64, priced pricing.Quote, recipientAddress string, now time.Time, validity time.Duration) (Quote, error) {
 	expiresAt := now.Add(validity)
 	row := s.pool.QueryRow(ctx, `
-		INSERT INTO quotes (customer_id, tier, amount_in, amount_out, fee_units, network_fee_units, recipient_address, created_at, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-		RETURNING id, customer_id, tier, amount_in, amount_out, fee_units, network_fee_units, recipient_address,
+		INSERT INTO quotes (customer_id, retail_customer_id, tier, amount_in, amount_out, fee_units, network_fee_units, recipient_address, created_at, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		RETURNING id, customer_id, retail_customer_id, tier, amount_in, amount_out, fee_units, network_fee_units, recipient_address,
 			created_at, expires_at, consumed_at, consumed_by_order_external_id
-	`, customerID, string(priced.Tier), int64(priced.AmountIn), int64(priced.AmountOut), int64(priced.FeeUnits), int64(priced.NetworkFeeUnits),
+	`, customerID, retailCustomerID, string(priced.Tier), int64(priced.AmountIn), int64(priced.AmountOut), int64(priced.FeeUnits), int64(priced.NetworkFeeUnits),
 		recipientAddress, now, expiresAt)
 	q, err := scanQuote(row)
 	if err != nil {
-		return Quote{}, fmt.Errorf("quotes: creating for customer %d: %w", customerID, err)
+		return Quote{}, fmt.Errorf("quotes: creating: %w", err)
 	}
 	return q, nil
 }
@@ -88,11 +104,26 @@ func (s *Store) Create(ctx context.Context, customerID int64, priced pricing.Quo
 // isn't yours," the same ownership-not-just-existence discipline C6.5's
 // own acceptance criterion applies to order status.
 func (s *Store) Get(ctx context.Context, id, customerID int64) (Quote, error) {
+	return s.getScoped(ctx, id, "customer_id", customerID)
+}
+
+// GetForRetail is Get's own counterpart, scoped to retail_customer_id
+// instead -- same "belongs to someone else is ErrNotFound, not a
+// permission error" discipline.
+func (s *Store) GetForRetail(ctx context.Context, id, retailCustomerID int64) (Quote, error) {
+	return s.getScoped(ctx, id, "retail_customer_id", retailCustomerID)
+}
+
+func (s *Store) getScoped(ctx context.Context, id int64, ownerColumn string, ownerID int64) (Quote, error) {
+	// ownerColumn is one of exactly two compile-time-known literals
+	// (never caller/request-supplied), so building the query string with
+	// it is safe -- the same posture as any other internal, fixed-choice
+	// SQL fragment in this codebase.
 	row := s.pool.QueryRow(ctx, `
-		SELECT id, customer_id, tier, amount_in, amount_out, fee_units, network_fee_units, recipient_address,
+		SELECT id, customer_id, retail_customer_id, tier, amount_in, amount_out, fee_units, network_fee_units, recipient_address,
 			created_at, expires_at, consumed_at, consumed_by_order_external_id
-		FROM quotes WHERE id = $1 AND customer_id = $2
-	`, id, customerID)
+		FROM quotes WHERE id = $1 AND `+ownerColumn+` = $2
+	`, id, ownerID)
 	q, err := scanQuote(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -121,7 +152,7 @@ func (s *Store) MarkConsumed(ctx context.Context, id int64, orderExternalID stri
 	row := s.pool.QueryRow(ctx, `
 		UPDATE quotes SET consumed_at = now(), consumed_by_order_external_id = $1
 		WHERE id = $2 AND consumed_at IS NULL
-		RETURNING id, customer_id, tier, amount_in, amount_out, fee_units, network_fee_units, recipient_address,
+		RETURNING id, customer_id, retail_customer_id, tier, amount_in, amount_out, fee_units, network_fee_units, recipient_address,
 			created_at, expires_at, consumed_at, consumed_by_order_external_id
 	`, orderExternalID, id)
 	q, err := scanQuote(row)
@@ -142,9 +173,18 @@ func (s *Store) MarkConsumed(ctx context.Context, id int64, orderExternalID stri
 	return Quote{}, ErrAlreadyConsumed
 }
 
+// GetByID fetches quote id unscoped by owner -- for internal callers
+// that already hold a trusted row referencing this quote (e.g.
+// internal/reconcile, iterating its own gateway_orders rows) rather
+// than an untrusted customer-supplied id needing ownership enforcement.
+// Customer-facing callers must use Get/GetForRetail instead.
+func (s *Store) GetByID(ctx context.Context, id int64) (Quote, error) {
+	return s.getByID(ctx, id)
+}
+
 func (s *Store) getByID(ctx context.Context, id int64) (Quote, error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT id, customer_id, tier, amount_in, amount_out, fee_units, network_fee_units, recipient_address,
+		SELECT id, customer_id, retail_customer_id, tier, amount_in, amount_out, fee_units, network_fee_units, recipient_address,
 			created_at, expires_at, consumed_at, consumed_by_order_external_id
 		FROM quotes WHERE id = $1
 	`, id)
@@ -166,7 +206,7 @@ func scanQuote(row scanRow) (Quote, error) {
 	var q Quote
 	var tier string
 	var amountIn, amountOut, feeUnits, networkFeeUnits int64
-	if err := row.Scan(&q.ID, &q.CustomerID, &tier, &amountIn, &amountOut, &feeUnits, &networkFeeUnits, &q.RecipientAddress,
+	if err := row.Scan(&q.ID, &q.CustomerID, &q.RetailCustomerID, &tier, &amountIn, &amountOut, &feeUnits, &networkFeeUnits, &q.RecipientAddress,
 		&q.CreatedAt, &q.ExpiresAt, &q.ConsumedAt, &q.ConsumedByOrderExternalID); err != nil {
 		return Quote{}, err
 	}

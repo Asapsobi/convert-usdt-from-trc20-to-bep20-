@@ -341,6 +341,28 @@ system-halt refusal, and all five FINAL ASSERTIONS; C3/C4/C5/S1 are never
 started — an order's own path to `settled` is produced by a harness-only
 fixture posting the same C1 transition calls those real components would).
 
+**B2C channel** (added 14 Sep 2026, per
+`docs/01-strategy/model-d-model-f-product-separation.md`'s own decision that
+Model D is infrastructure distributed through multiple channels, not a B2B-
+only product): `internal/retailcustomers` (email/password accounts, bcrypt-
+hashed, entirely separate from `customers`' own API-key identity space) and
+`internal/retailsessions` (bearer session tokens, `rs_`-prefixed, SHA-256
+hashed at rest — 256 bits of real randomness, the same "fast hash is the
+right tool" reasoning `customers.HashAPIKey` already uses, unlike the
+password itself). `quotes`/`orders` both moved from "owned by exactly one
+customer" to "owned by exactly one of a customer OR a retail_customer" (a
+new nullable column + a CHECK constraint per table, migration 0009) — one
+unified table/pipeline serving both owner kinds, not a forked copy. New
+routes under `/v1/retail/...` (register/login/logout/me/quotes/orders),
+registered only when `GATEWAY_ENABLE_RETAIL=true` — unset, this deployment
+is unchanged from before this channel existed. Backend only: no frontend
+exists yet (deliberately — the architecture had to be sound first). A
+dedicated integration test proves the security-critical property this
+whole design rests on: a B2B customer and a retail customer can share the
+same numeric id by coincidence (separate sequences, separate tables) and
+still never see each other's orders, on either the B2B or the B2C status
+endpoint.
+
 ### `proofrun/`
 
 The MVP proof run's own minimal order-origination driver

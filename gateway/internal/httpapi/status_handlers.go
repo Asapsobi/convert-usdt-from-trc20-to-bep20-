@@ -59,7 +59,7 @@ func (s *Server) getOrderStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	// Ownership, not just existence -- another customer's external_id
 	// must 404, never leak that the id exists at all.
-	if gatewayOrder.CustomerID != customer.ID {
+	if gatewayOrder.CustomerID == nil || *gatewayOrder.CustomerID != customer.ID {
 		writeAPIError(w, errNotFound)
 		return
 	}

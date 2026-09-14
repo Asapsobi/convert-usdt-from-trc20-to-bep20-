@@ -47,6 +47,15 @@ var (
 	// service broke on its own." Never leaks which upstream, or any
 	// internal id -- C6.8's own acceptance criterion.
 	errUpstreamError = newAPIError(http.StatusBadGateway, "upstream_error", "a downstream service returned an unexpected error")
+
+	// Model D's own B2C channel (docs/01-strategy/model-d-model-f-product-separation.md).
+	// errInvalidCredentials deliberately covers both "no such email" and
+	// "wrong password" -- see retailcustomers.ErrInvalidCredentials's own
+	// doc comment for why they're never distinguished at any layer.
+	errEmailTaken         = newAPIError(http.StatusConflict, "email_taken", "an account with this email already exists")
+	errInvalidCredentials = newAPIError(http.StatusUnauthorized, "invalid_credentials", "invalid email or password")
+	errRetailUnauthorized = newAPIError(http.StatusUnauthorized, "unauthorized", "missing or invalid session token")
+	errRetailSuspended    = newAPIError(http.StatusForbidden, "account_suspended", "this account is suspended")
 )
 
 type errorEnvelope struct {

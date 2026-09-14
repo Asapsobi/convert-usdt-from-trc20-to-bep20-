@@ -31,7 +31,13 @@ Positioning: *"Reliable TRC20 payouts, funded from any chain."* Lead with the pa
 
 Pricing: **max(flat floor, declining bp tier)** — never a pure percentage. Floor never below $1.80. Tiers: 40 bp under $1k · 25 bp to $10k · 12 bp to $100k · 6 bp to $1M · 3.5 bp above.
 
-MVP: 6–8 weeks, two engineers, ~$50k float. REST API (quote/order/status/webhook), HD deposit addresses on BSC, 15-confirmation finality with block-hash reorg tracking, double-entry ledger with continuous reconciliation and auto-halt on drift, energy rental routed across two providers, deposit screening before payout release. **No public swap page.** A status page publishing real settlement-time percentiles is the sales asset.
+MVP: 6–8 weeks, two engineers, ~$50k float. REST API (quote/order/status/webhook), HD deposit addresses on BSC, 15-confirmation finality with block-hash reorg tracking, double-entry ledger with continuous reconciliation and auto-halt on drift, energy rental routed across two providers, deposit screening before payout release. ~~No public swap page.~~ **Update, 14 Sep 2026 — superseded, see "B2C update" below: this MVP-scope line no longer holds.** A status page publishing real settlement-time percentiles was the sales asset at MVP; it remains valid but is no longer the *only* customer-facing surface.
+
+## Update, 14 Sep 2026 — B2C reconsidered
+
+**The "no public swap page" line above is reversed for Model D, deliberately, not as a correction of a mistake.** This was Model D's own original MVP-scope decision, made on the reasoning that a public conversion page competes on a visible spread against a $1.00 CEX reference price (the "Model A" positioning this doc's own Verdict rejected) rather than on the structural cost advantage (wholesale energy, batch multisend) that findings #1 and the Recommendation above actually describe. That reasoning is not wrong — it is still why Model D's *pricing* stays cost-advantage-driven rather than becoming a race-to-the-bottom spread. What changed is the *channel* decision, not the economics: Model D is now treated as conversion/settlement **infrastructure**, distributed through multiple channels — the existing B2B partner API (built), a new B2C public website (planned, not yet built), and potentially future channels (Telegram, bots, embedded widgets) — rather than assuming B2B is the only legitimate distribution path. The same wholesale-energy/batch-multisend cost advantage this doc identifies applies to volume from any channel; nothing about it depends on a customer being a business rather than an individual.
+
+This does **not** reopen Model F's own identical ban (`model-f-relay-findings.md`) — Model F's version of this constraint now stands on its own reasoning, independent of Model D's, and is unaffected by this update. See `docs/01-strategy/model-d-model-f-product-separation.md` for the full, permanent decision record.
 
 ## Expected outcome
 

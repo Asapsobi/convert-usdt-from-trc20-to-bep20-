@@ -31,10 +31,24 @@ reaches a venture outcome."*
    customer to shop against — margin comes from volume, not from being cheaper than
    the $1.00 reference.
 2. **Margin.** Quote the customer your own rate (upstream rate plus your spread). Only
-   defensible if paired with the same move Model D already makes: sell it as embedded
-   settlement infra behind someone else's product, not a public "convert my USDT"
-   page — `docs/02-architecture/product-operations-architecture.md`'s existing ban on a
-   public swap page for Model D applies with equal force here.
+   defensible if paired with a public-page ban: sell it as embedded settlement infra
+   behind someone else's product, not a public "convert my USDT" page.
+
+**Update, 14 Sep 2026 — this ban now stands on Model F's own reasoning, not Model D's.**
+Originally written as inheriting "the same move Model D already makes" (citing
+`docs/02-architecture/product-operations-architecture.md`'s own ban on a public swap
+page for Model D, "applies with equal force here") — that citation was also imprecise:
+the literal ban lived in `findings-and-recommendation.md` and `component-map.md`, not
+in the architecture doc. Both points are now moot regardless: Model D's own ban has
+since been reversed (see `findings-and-recommendation.md`'s own "Update, 14 Sep 2026"),
+deliberately, as a channel decision separate from its cost-advantage-driven pricing.
+Model F's ban is **not** reversed by that — it holds on its own, arguably *stronger*
+footing: Model F's margin (mechanism 2 above) is a spread on top of a third-party
+vendor's own rate, not a structural cost advantage the way Model D's wholesale-energy/
+batch-multisend margin is, so it has even less room than Model D's original analysis to
+survive a customer shopping the visible price against a $1.00 reference. See
+`docs/01-strategy/model-d-model-f-product-separation.md` for the full, permanent record
+of why these two models' decisions don't propagate to each other.
 
 Neither requires different engineering (`docs/02-architecture/model-f-relay-architecture.md`
 §0/§6 cover both), so this doesn't block starting the build — it blocks going live with

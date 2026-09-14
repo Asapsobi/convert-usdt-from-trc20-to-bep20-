@@ -20,6 +20,8 @@ import (
 	"gateway/internal/quotes"
 	"gateway/internal/ratelimit"
 	"gateway/internal/reconcile"
+	"gateway/internal/retailcustomers"
+	"gateway/internal/retailsessions"
 	"gateway/internal/sandbox"
 	"gateway/internal/webhooks"
 )
@@ -85,6 +87,17 @@ func run() error {
 		Sandbox:        sandbox.NewStore(pool),
 		PendingAddress: reconciler,
 		BuildInfo:      func() (string, string) { return "dev", "dev" },
+	}
+	// Model D's own B2C channel (docs/01-strategy/model-d-model-f-product-separation.md,
+	// 14 Sep 2026 decision) -- opt-in, not on by default: GATEWAY_ENABLE_RETAIL=true
+	// registers /v1/retail/... (see NewRouter); unset leaves this
+	// deployment exactly as it was before this channel existed, the same
+	// "optional, degrades cleanly if unset" posture every other
+	// cross-cutting capability in this repo uses.
+	if os.Getenv("GATEWAY_ENABLE_RETAIL") == "true" {
+		server.RetailCustomers = retailcustomers.NewStore(pool)
+		server.RetailSessions = retailsessions.NewStore(pool)
+		slog.Info("gatewayd: Model D's own B2C channel enabled (/v1/retail/...)")
 	}
 	router := httpapi.NewRouter(server) // fills in server.Metrics if left nil
 

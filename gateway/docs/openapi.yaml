@@ -184,6 +184,171 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /v1/retail/register:
+    post:
+      summary: Register a new end-user account (Model D's own B2C channel)
+      description: >
+        docs/01-strategy/model-d-model-f-product-separation.md's own 14
+        Sep 2026 decision: a fully separate identity space from the B2B
+        customers/API-key model above -- session tokens, never API
+        keys. Only registered when a deployment sets
+        GATEWAY_ENABLE_RETAIL=true; otherwise these routes 404.
+        Auto-issues a session on success (auto-login on register).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RetailCredentials" }
+      responses:
+        "201":
+          description: Account created, session issued.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RetailSession" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409":
+          description: email_taken.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/retail/login:
+    post:
+      summary: Log in, issuing a fresh session
+      description: >
+        invalid_credentials deliberately covers both "no such email"
+        and "wrong password" -- never distinguished, closing the
+        obvious account-enumeration side channel.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RetailCredentials" }
+      responses:
+        "200":
+          description: Session issued.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RetailSession" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401":
+          description: invalid_credentials.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          description: account_suspended.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/retail/logout:
+    post:
+      summary: Revoke the current session
+      description: Idempotent -- logging out an already-revoked session still succeeds.
+      security: [{ retailBearerAuth: [] }]
+      responses:
+        "204": { description: Session revoked. }
+        "401": { $ref: "#/components/responses/RetailUnauthorized" }
+
+  /v1/retail/me:
+    get:
+      summary: Confirm the current session's own identity
+      security: [{ retailBearerAuth: [] }]
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RetailMe" }
+        "401": { $ref: "#/components/responses/RetailUnauthorized" }
+
+  /v1/retail/quotes:
+    post:
+      summary: Issue a time-locked price quote (B2C)
+      description: >
+        Same quote-then-order discipline as POST /v1/quotes above,
+        scoped to the authenticated end-user's own session instead of a
+        B2B API key.
+      security: [{ retailBearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PostQuoteRequest" }
+      responses:
+        "201":
+          description: Quote issued.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Quote" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/RetailUnauthorized" }
+        "423":
+          description: system_halted -- C1 is currently halted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/retail/orders:
+    post:
+      summary: Create an order against a live, unexpired quote (B2C)
+      description: >
+        Same C1+C2 choreography as POST /v1/orders above, scoped to the
+        authenticated end-user's own session.
+      security: [{ retailBearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PostOrderRequest" }
+      responses:
+        "201":
+          description: Order created (status created or address_pending).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/RetailUnauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: quote_expired or quote_already_consumed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "423":
+          description: system_halted -- C1 is currently halted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/retail/orders/{external_id}:
+    get:
+      summary: Pull-based order status (B2C)
+      description: >
+        Reads through to C1's own live state, exactly like GET
+        /v1/orders/{external_id} above. Ownership is checked, not just
+        existence -- another end-user's external_id 404s, never leaks
+        that the id exists. A B2B customer's order is equally invisible
+        here, and vice versa -- the two identity spaces never leak into
+        each other despite sharing the same underlying tables.
+      security: [{ retailBearerAuth: [] }]
+      parameters:
+        - name: external_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "401": { $ref: "#/components/responses/RetailUnauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -192,6 +357,15 @@ components:
       description: >
         A customer's own sk_live_ (production) or sk_test_ (sandbox)
         API key -- the two are never interchangeable (invariant 4).
+    retailBearerAuth:
+      type: http
+      scheme: bearer
+      description: >
+        An end-user's own rs_-prefixed session token, issued by
+        POST /v1/retail/register or /login -- a fully separate
+        credential space from bearerAuth's own B2B API keys. Never
+        interchangeable with one; see
+        docs/01-strategy/model-d-model-f-product-separation.md.
 
   responses:
     BadRequest:
@@ -206,6 +380,11 @@ components:
           schema: { $ref: "#/components/schemas/Error" }
     NotFound:
       description: The named resource does not exist (or belongs to a different customer -- ownership is checked, not just existence).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RetailUnauthorized:
+      description: Missing, invalid, expired, or revoked session token.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -303,3 +482,23 @@ components:
         hold_reason: { type: string, nullable: true }
         webhook_attempts: { type: integer }
         webhook_exhausted: { type: boolean }
+
+    RetailCredentials:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, description: At least 8 characters. }
+
+    RetailSession:
+      type: object
+      properties:
+        session_token: { type: string, description: "rs_-prefixed; present the exact string as a Bearer token on subsequent calls." }
+        retail_customer_id: { type: integer, format: int64 }
+        expires_at: { type: string, format: date-time }
+
+    RetailMe:
+      type: object
+      properties:
+        retail_customer_id: { type: integer, format: int64 }
+        email: { type: string, format: email }

@@ -299,6 +299,13 @@ services:
       GATEWAY_LEDGER_API_TOKEN: ${LEDGER_API_TOKEN_VALUE:-ledgertoken}
       GATEWAY_WATCHER_BASE_URL: http://watcher:8082
       GATEWAY_WATCHER_API_TOKEN: ${WATCHER_API_TOKEN_VALUE:-watchertoken}
+      # Model D's own B2C channel (docs/01-strategy/model-d-model-f-product-separation.md,
+      # 14 Sep 2026 decision) -- opt-in: registers /v1/retail/... (register/
+      # login/logout/quotes/orders for an individual end-user, entirely
+      # separate from the B2B API-key routes above). Defaults to off so a
+      # fresh clone/deploy never silently exposes a new public-facing auth
+      # surface.
+      GATEWAY_ENABLE_RETAIL: ${GATEWAY_ENABLE_RETAIL:-false}
     ports: ["8087:8087"]
 
   # ---- C2': TRON deposit watcher (Model F's own front door for the

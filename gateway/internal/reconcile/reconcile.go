@@ -175,12 +175,12 @@ func (r *Reconciler) resolve(ctx context.Context, o orders.GatewayOrder) error {
 		// Re-derive the original quote window from the quote row itself
 		// -- never fabricated from gateway_orders' own created_at, which
 		// carries no relation to the quote's own quoted_at/expires_at.
-		q, err := r.quotes.Get(ctx, o.QuoteID, o.CustomerID)
+		q, err := r.quotes.GetByID(ctx, o.QuoteID)
 		if err != nil {
 			return fmt.Errorf("loading quote %d for %q: %w", o.QuoteID, o.ExternalID, err)
 		}
 
-		addr, err = r.watcher.AssignAddress(ctx, o.C1OrderID, o.ExternalID, fmt.Sprintf("%d", o.CustomerID),
+		addr, err = r.watcher.AssignAddress(ctx, o.C1OrderID, o.ExternalID, o.OwnerLabel(),
 			q.CreatedAt, q.ExpiresAt, "gateway:reconcile:"+o.ExternalID)
 		if err != nil {
 			return fmt.Errorf("assigning C2 address: %w", err)

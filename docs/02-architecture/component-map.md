@@ -86,5 +86,5 @@ C6 and C4 can be built in parallel with C2 once C1's journal-entry contract is f
 
 - Treasury rebalancing as a service — a runbook plus a balance dashboard is correct until the 4-hour loop is proven sustainable (month 3 test).
 - Any smart contract on either chain.
-- A public swap page.
+- ~~A public swap page.~~ **Update, 14 Sep 2026: reversed for Model D** — see `findings-and-recommendation.md`'s own "Update, 14 Sep 2026" section and `docs/01-strategy/model-d-model-f-product-separation.md`. Still not built (no frontend code exists anywhere in this repo yet), but no longer excluded by policy. Model F's own identical constraint (`model-f-relay-findings.md`) is unaffected by this.
 - Reverse flow (TRC20 → BEP20) — it arrives with the capital ladder, not before.

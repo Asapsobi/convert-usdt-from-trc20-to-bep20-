@@ -63,7 +63,7 @@ func (s *Server) postOrder(w http.ResponseWriter, r *http.Request) {
 	// from local state, no C1/C2 call at all -- C6.3's own acceptance
 	// criterion ("C1 and C2 each called exactly once").
 	if existing, err := s.Orders.Get(r.Context(), req.ExternalID); err == nil {
-		if existing.CustomerID != customer.ID {
+		if existing.CustomerID == nil || *existing.CustomerID != customer.ID {
 			writeAPIError(w, errNotFound) // not this customer's order -- ownership, not just existence
 			return
 		}
