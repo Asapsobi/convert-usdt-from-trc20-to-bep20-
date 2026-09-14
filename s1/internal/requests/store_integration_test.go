@@ -15,8 +15,11 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/decred/dcrd/dcrec/secp256k1/v4"
+	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
+	bip32 "github.com/tyler-smith/go-bip32"
 
 	"s1/internal/db"
 	"s1/internal/kmssign"
@@ -99,9 +102,35 @@ func (c *countingSigner) Sign(ctx context.Context, keyID string, digest [32]byte
 	return c.inner.Sign(ctx, keyID, digest, expectedPubKey)
 }
 
+// SignBSCDeposit satisfies the widened requests.Signer interface,
+// counted the same way Sign is -- c.inner (a *kmssign.Wrapper in every
+// test below) must have SetBSCDepositKeys called for this to succeed;
+// see newTestStore's own wiring.
+func (c *countingSigner) SignBSCDeposit(ctx context.Context, index uint32, digest [32]byte, expectedPubKey [33]byte) ([65]byte, error) {
+	atomic.AddInt64(&c.calls, 1)
+	if atomic.LoadInt64(&c.failNextCalls) > 0 {
+		atomic.AddInt64(&c.failNextCalls, -1)
+		return [65]byte{}, fmt.Errorf("countingSigner: forced failure")
+	}
+	return c.inner.SignBSCDeposit(ctx, index, digest, expectedPubKey)
+}
+
 func (c *countingSigner) forceFailNext(n int64) { atomic.StoreInt64(&c.failNextCalls, n) }
 
 func (c *countingSigner) callCount() int64 { return atomic.LoadInt64(&c.calls) }
+
+// testBSCDepositXprvXpub returns a real, matching (xprv, xpub) fixture
+// pair for BSC deposit-key tests -- the same go-bip32-as-fixture-
+// generator convention internal/kmssign/bscdeposit_test.go's own cross-
+// validation test uses, never a production seed.
+func testBSCDepositXprvXpub(t *testing.T) (xprv, xpub string) {
+	t.Helper()
+	master, err := bip32.NewMasterKey([]byte("s1 requests package integration-test fixture seed -- not real"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return master.B58Serialize(), master.PublicKey().B58Serialize()
+}
 
 func newTestStore(t *testing.T, pool *db.Pool, thresholdUSD float64) (*requests.Store, *countingSigner, requests.SlotKeyInfo) {
 	t.Helper()
@@ -113,9 +142,16 @@ func newTestStore(t *testing.T, pool *db.Pool, thresholdUSD float64) (*requests.
 	}
 	slotKey := requests.SlotKeyInfo{KMSKeyID: "kms-key-slot-1", PublicKey: pubKey, TronAddress: "TFakeSlotAddress00000000000001"}
 
+	xprv, xpub := testBSCDepositXprvXpub(t)
+	depositKeys, err := kmssign.NewBSCDepositKeys(xprv, xpub)
+	if err != nil {
+		t.Fatalf("NewBSCDepositKeys: %v", err)
+	}
+	wrapper.SetBSCDepositKeys(depositKeys)
+
 	signer := &countingSigner{inner: wrapper}
 	slotGetter := fakeSlotKeyGetter{keys: map[int]requests.SlotKeyInfo{1: slotKey}}
-	store := requests.NewStore(pool, slotGetter, signer, requests.Config{ApprovalThresholdUSD: thresholdUSD})
+	store := requests.NewStore(pool, slotGetter, wrapper, signer, requests.Config{ApprovalThresholdUSD: thresholdUSD})
 	return store, signer, slotKey
 }
 
@@ -227,6 +263,129 @@ func TestRequestSignature_ConcurrentSameIdempotencyKeyYieldsOneRequestAndOneSign
 	if rowCount != 1 {
 		t.Fatalf("signing_requests rows = %d, want exactly 1", rowCount)
 	}
+}
+
+func TestRequestDepositSweepSignature_UnderThresholdSignsSynchronously(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	store, signer, _ := newTestStore(t, pool, 10000)
+
+	req, err := store.RequestDepositSweepSignature(ctx, 1042, [32]byte{1, 2, 3}, 5000, "idem-deposit-1")
+	if err != nil {
+		t.Fatalf("RequestDepositSweepSignature: %v", err)
+	}
+	if req.Status != requests.StatusSigned {
+		t.Fatalf("Status = %s, want SIGNED", req.Status)
+	}
+	if req.SignedTx == ([65]byte{}) {
+		t.Fatal("SignedTx is empty on a SIGNED request")
+	}
+	if got := signer.callCount(); got != 1 {
+		t.Fatalf("Signer was called %d times, want exactly 1", got)
+	}
+
+	var auditCount int
+	var slotID *int
+	var depositIndex *int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM signing_audit_log WHERE signing_request_id = $1`, req.ID).Scan(&auditCount); err != nil {
+		t.Fatalf("counting audit rows: %v", err)
+	}
+	if auditCount != 1 {
+		t.Fatalf("signing_audit_log rows for request %d = %d, want exactly 1", req.ID, auditCount)
+	}
+	if err := pool.QueryRow(ctx, `SELECT slot_id, bsc_deposit_index FROM signing_requests WHERE id = $1`, req.ID).Scan(&slotID, &depositIndex); err != nil {
+		t.Fatalf("reading back the request row: %v", err)
+	}
+	if slotID != nil {
+		t.Fatalf("slot_id = %v, want NULL for a deposit-sweep request", *slotID)
+	}
+	if depositIndex == nil || *depositIndex != 1042 {
+		t.Fatalf("bsc_deposit_index = %v, want 1042", depositIndex)
+	}
+}
+
+func TestRequestDepositSweepSignature_AtOrAboveThresholdStaysPendingWithZeroSignCalls(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	store, signer, _ := newTestStore(t, pool, 10000)
+
+	req, err := store.RequestDepositSweepSignature(ctx, 1042, [32]byte{1}, 10000, "idem-deposit-2")
+	if err != nil {
+		t.Fatalf("RequestDepositSweepSignature: %v", err)
+	}
+	if req.Status != requests.StatusPending {
+		t.Fatalf("Status = %s, want PENDING for a request at the threshold", req.Status)
+	}
+	if got := signer.callCount(); got != 0 {
+		t.Fatalf("Signer was called %d times, want 0", got)
+	}
+}
+
+func TestRequestDepositSweepSignature_ApprovalFlowSignsWithTheCorrectDerivedKey(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	store, signer, _ := newTestStore(t, pool, 10000)
+
+	pending, err := store.RequestDepositSweepSignature(ctx, 1042, [32]byte{7, 7, 7}, 50000, "idem-deposit-approve")
+	if err != nil {
+		t.Fatalf("RequestDepositSweepSignature: %v", err)
+	}
+	if pending.Status != requests.StatusPending {
+		t.Fatalf("Status = %s, want PENDING", pending.Status)
+	}
+
+	if _, err := store.Approve(ctx, pending.ID, "approver-a"); err != nil {
+		t.Fatalf("Approve (1st): %v", err)
+	}
+	signed, err := store.Approve(ctx, pending.ID, "approver-b")
+	if err != nil {
+		t.Fatalf("Approve (2nd): %v", err)
+	}
+	if signed.Status != requests.StatusSigned {
+		t.Fatalf("Status = %s, want SIGNED after two distinct approvals", signed.Status)
+	}
+	if got := signer.callCount(); got != 1 {
+		t.Fatalf("Signer was called %d times, want exactly 1", got)
+	}
+
+	// The whole point of this test: the signature that came back really
+	// does verify against the deposit index's OWN derived public key,
+	// not some other key entirely -- signAndRecord's own signWith
+	// routing (store.go) is what this proves end to end, against a real
+	// Postgres round trip through the approval queue.
+	digest := [32]byte{7, 7, 7}
+	xprv, xpub := testBSCDepositXprvXpub(t)
+	depositKeys, err := kmssign.NewBSCDepositKeys(xprv, xpub)
+	if err != nil {
+		t.Fatalf("NewBSCDepositKeys: %v", err)
+	}
+	expectedPub, err := depositKeys.PublicKey(1042)
+	if err != nil {
+		t.Fatalf("PublicKey: %v", err)
+	}
+	expected, err := secp256k1.ParsePubKey(expectedPub[:])
+	if err != nil {
+		t.Fatalf("parsing expected public key: %v", err)
+	}
+	recovered, _, err := ecdsa.RecoverCompact(compactFromR65(signed.SignedTx), digest[:])
+	if err != nil {
+		t.Fatalf("recovering public key from signature: %v", err)
+	}
+	if !recovered.IsEqual(expected) {
+		t.Fatal("signature recovers to a DIFFERENT public key than deposit index 1042's own derived key")
+	}
+}
+
+func compactFromR65(sig [65]byte) []byte {
+	const (
+		compactSigRecoveryBase   = 27
+		compactSigCompressedFlag = 4
+	)
+	compact := make([]byte, 65)
+	compact[0] = compactSigRecoveryBase + sig[64] + compactSigCompressedFlag
+	copy(compact[1:33], sig[0:32])
+	copy(compact[33:65], sig[32:64])
+	return compact
 }
 
 func TestGetSignature_UnknownIDReturnsErrRequestNotFound(t *testing.T) {

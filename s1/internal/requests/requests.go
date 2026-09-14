@@ -46,12 +46,15 @@ type SigningRequest struct {
 // enough for an approver to see which requests are waiting on them
 // without already knowing the id, never the digest or anything
 // signature-related, matching GetSignature's own posture of returning
-// SignedTx only once SIGNED.
+// SignedTx only once SIGNED. Exactly one of SlotID/BSCDepositIndex is
+// set, mirroring signing_requests' own CHECK constraint (migration
+// 0005) -- a slot-key request or a BSC-deposit-sweep request.
 type PendingSummary struct {
-	ID           int64
-	SlotID       int
-	EstimatedUSD float64
-	CreatedAt    time.Time
+	ID              int64
+	SlotID          *int
+	BSCDepositIndex *uint32
+	EstimatedUSD    float64
+	CreatedAt       time.Time
 }
 
 // ErrRequestAlreadyResolved guards Approve/Reject against acting on a
@@ -78,6 +81,15 @@ type SigningService interface {
 	// already be SIGNED. Otherwise it is PENDING, and the caller polls
 	// GetSignature.
 	RequestSignature(ctx context.Context, slotID int, digest [32]byte, estimatedUSD float64, idempotencyKey string) (SigningRequest, error)
+
+	// RequestDepositSweepSignature is RequestSignature's own counterpart
+	// for a per-order BSC deposit address at child index, rather than one
+	// of the 6 fixed slots -- see internal/kmssign/bscdeposit.go's own
+	// doc comment for why this needed a genuinely new signing capability,
+	// not just a new caller of the existing one. Same idempotency,
+	// approval-threshold, and PENDING/SIGNED semantics as RequestSignature
+	// throughout; the only difference is which key signs.
+	RequestDepositSweepSignature(ctx context.Context, index uint32, digest [32]byte, estimatedUSD float64, idempotencyKey string) (SigningRequest, error)
 
 	// GetSignature polls one request's own current status by id.
 	GetSignature(ctx context.Context, id int64) (SigningRequest, error)

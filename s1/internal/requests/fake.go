@@ -96,6 +96,35 @@ func (f *FakeSigningService) RequestSignature(ctx context.Context, slotID int, d
 	return *req, nil
 }
 
+// RequestDepositSweepSignature implements SigningService -- the fake's
+// own counterpart to RequestSignature for a BSC deposit-address child
+// index instead of a slot id, sharing the same id sequence and
+// idempotency-key map (a real Store's own signing_requests table is
+// similarly unified -- see migration 0005's own doc comment).
+func (f *FakeSigningService) RequestDepositSweepSignature(ctx context.Context, index uint32, digest [32]byte, estimatedUSD float64, idempotencyKey string) (SigningRequest, error) {
+	if err := ctx.Err(); err != nil {
+		return SigningRequest{}, err
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if id, ok := f.byIdemKey[idempotencyKey]; ok {
+		return *f.byID[id], nil
+	}
+
+	f.seq++
+	id := f.seq
+	req := &SigningRequest{ID: id, Status: StatusPending, CreatedAt: time.Now().UTC()}
+	if estimatedUSD < f.thresholdUSD {
+		req.Status = StatusSigned
+		req.SignedTx = fakeSignedTx(int(index), digest)
+	}
+	f.byID[id] = req
+	f.byIdemKey[idempotencyKey] = id
+	return *req, nil
+}
+
 // GetSignature implements SigningService.
 func (f *FakeSigningService) GetSignature(ctx context.Context, id int64) (SigningRequest, error) {
 	if err := ctx.Err(); err != nil {

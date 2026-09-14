@@ -49,6 +49,7 @@ func NewRouter(s *Server) http.Handler {
 		r.Group(func(r chi.Router) {
 			r.Use(authMiddleware(s.C5Auth))
 			r.Post("/signing-requests", s.postSigningRequest)
+			r.Post("/deposit-signing-requests", s.postDepositSigningRequest)
 			r.Get("/signing-requests", s.getSigningRequests)
 			r.Get("/signing-requests/{id}", s.getSigningRequest)
 			r.Get("/slots/{id}/address", s.getSlotAddress)

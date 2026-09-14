@@ -16,6 +16,18 @@ import (
 // here (the consumer), matching this project's established convention.
 type Signer interface {
 	Sign(ctx context.Context, keyID string, digest [32]byte, expectedPubKey [33]byte) ([65]byte, error)
+
+	// SignBSCDeposit is Sign's own counterpart for a per-order BSC
+	// deposit address at child index -- see
+	// internal/kmssign/bscdeposit.go's own doc comment.
+	SignBSCDeposit(ctx context.Context, index uint32, digest [32]byte, expectedPubKey [33]byte) ([65]byte, error)
+}
+
+// DepositKeyGetter is the one call this package needs to resolve a BSC
+// deposit-address child index to its own public key -- kmssign.Wrapper's
+// own PublicKeyForDeposit, or a fake for testing.
+type DepositKeyGetter interface {
+	PublicKeyForDeposit(ctx context.Context, index uint32) ([33]byte, error)
 }
 
 // SlotKeyInfo is the subset of internal/slots.SlotKey this package needs
@@ -49,23 +61,32 @@ type Config struct {
 
 // Store is this package's own real SigningService implementation.
 type Store struct {
-	pool   *db.Pool
-	slots  SlotKeyGetter
-	signer Signer
-	cfg    Config
+	pool        *db.Pool
+	slots       SlotKeyGetter
+	depositKeys DepositKeyGetter // nil disables RequestDepositSweepSignature entirely
+	signer      Signer
+	cfg         Config
 }
 
-// NewStore wires a Store.
-func NewStore(pool *db.Pool, slots SlotKeyGetter, signer Signer, cfg Config) *Store {
-	return &Store{pool: pool, slots: slots, signer: signer, cfg: cfg}
+// NewStore wires a Store. depositKeys may be nil -- a deployment that
+// never configures BSC deposit-sweep signing (S1_BSC_DEPOSIT_XPRV/XPUB
+// unset) gets ErrDepositSigningNotConfigured from
+// RequestDepositSweepSignature instead, not a nil-pointer panic.
+func NewStore(pool *db.Pool, slots SlotKeyGetter, depositKeys DepositKeyGetter, signer Signer, cfg Config) *Store {
+	return &Store{pool: pool, slots: slots, depositKeys: depositKeys, signer: signer, cfg: cfg}
 }
+
+// ErrDepositSigningNotConfigured is RequestDepositSweepSignature's own
+// result on a Store built with a nil DepositKeyGetter.
+var ErrDepositSigningNotConfigured = errors.New("requests: BSC deposit-sweep signing is not configured on this S1 deployment")
 
 // RequestSignature implements SigningService. See this package's own doc
 // comment (requests.go) for the request/poll shape, and
 // s1-key-management-build-prompts.md's own S1.3 for this method's exact
 // acceptance criteria.
 func (s *Store) RequestSignature(ctx context.Context, slotID int, digest [32]byte, estimatedUSD float64, idempotencyKey string) (SigningRequest, error) {
-	req, created, err := s.insertPending(ctx, slotID, digest, estimatedUSD, idempotencyKey)
+	ref := keyRef{slotID: &slotID}
+	req, created, err := s.insertPending(ctx, ref, digest, estimatedUSD, idempotencyKey)
 	if err != nil {
 		return SigningRequest{}, err
 	}
@@ -81,7 +102,7 @@ func (s *Store) RequestSignature(ctx context.Context, slotID int, digest [32]byt
 		return req, nil // PENDING -- S1.4's approval flow resolves it
 	}
 
-	signed, err := s.signAndRecord(ctx, req.ID, slotID, digest, nil)
+	signed, err := s.signAndRecord(ctx, req.ID, ref, digest, nil)
 	if err != nil {
 		// A failed Sign leaves the request PENDING for a caller-driven
 		// retry (a repeat RequestSignature call with the same
@@ -93,17 +114,54 @@ func (s *Store) RequestSignature(ctx context.Context, slotID int, digest [32]byt
 	return signed, nil
 }
 
+// RequestDepositSweepSignature implements SigningService. Identical
+// shape to RequestSignature -- same idempotency, same approval-threshold
+// auto-sign cutoff, same PENDING/SIGNED semantics -- routed to
+// kmssign's own BSC-deposit derivation+signing instead of a fixed slot.
+func (s *Store) RequestDepositSweepSignature(ctx context.Context, index uint32, digest [32]byte, estimatedUSD float64, idempotencyKey string) (SigningRequest, error) {
+	if s.depositKeys == nil {
+		return SigningRequest{}, ErrDepositSigningNotConfigured
+	}
+	ref := keyRef{depositIndex: &index}
+	req, created, err := s.insertPending(ctx, ref, digest, estimatedUSD, idempotencyKey)
+	if err != nil {
+		return SigningRequest{}, err
+	}
+	if !created {
+		return req, nil
+	}
+
+	if estimatedUSD >= s.cfg.ApprovalThresholdUSD {
+		return req, nil
+	}
+
+	signed, err := s.signAndRecord(ctx, req.ID, ref, digest, nil)
+	if err != nil {
+		return SigningRequest{}, fmt.Errorf("requests: auto-sign for request %d: %w", req.ID, err)
+	}
+	return signed, nil
+}
+
+// keyRef names exactly one of a slot id or a BSC deposit child index --
+// mirrors signing_requests' own CHECK constraint (migration 0005) in
+// Go, so insertPending/signAndRecord never have to juggle two separate
+// parameter lists for what is otherwise identical logic.
+type keyRef struct {
+	slotID       *int
+	depositIndex *uint32
+}
+
 // insertPending idempotently inserts a new PENDING row, or -- on a
 // conflict, meaning this idempotencyKey already has a row, whether from
 // an earlier call or a concurrent one that won the race -- fetches and
 // returns the existing row instead. created is false in the latter case.
-func (s *Store) insertPending(ctx context.Context, slotID int, digest [32]byte, estimatedUSD float64, idempotencyKey string) (SigningRequest, bool, error) {
+func (s *Store) insertPending(ctx context.Context, ref keyRef, digest [32]byte, estimatedUSD float64, idempotencyKey string) (SigningRequest, bool, error) {
 	row := s.pool.QueryRow(ctx, `
-		INSERT INTO signing_requests (idempotency_key, slot_id, digest, estimated_usd, status)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO signing_requests (idempotency_key, slot_id, bsc_deposit_index, digest, estimated_usd, status)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (idempotency_key) DO NOTHING
 		RETURNING id, status, signed_tx, created_at
-	`, idempotencyKey, slotID, digest[:], estimatedUSD, string(StatusPending))
+	`, idempotencyKey, ref.slotID, ref.depositIndex, digest[:], estimatedUSD, string(StatusPending))
 
 	req, err := scanRequest(row)
 	if err != nil {
@@ -143,15 +201,10 @@ func (s *Store) getByIdempotencyKey(ctx context.Context, idempotencyKey string) 
 // together, per invariant 4's own "every KMS Sign call is logged"
 // requirement -- a signed_tx with no matching audit row (or vice versa)
 // must never be possible to observe.
-func (s *Store) signAndRecord(ctx context.Context, requestID int64, slotID int, digest [32]byte, approvers []string) (SigningRequest, error) {
-	key, err := s.slots.Get(ctx, slotID)
+func (s *Store) signAndRecord(ctx context.Context, requestID int64, ref keyRef, digest [32]byte, approvers []string) (SigningRequest, error) {
+	sig, err := s.signWith(ctx, ref, digest)
 	if err != nil {
-		return SigningRequest{}, fmt.Errorf("looking up slot %d: %w", slotID, err)
-	}
-
-	sig, err := s.signer.Sign(ctx, key.KMSKeyID, digest, key.PublicKey)
-	if err != nil {
-		return SigningRequest{}, fmt.Errorf("signing: %w", err)
+		return SigningRequest{}, err
 	}
 
 	var alreadyDone bool
@@ -173,9 +226,9 @@ func (s *Store) signAndRecord(ctx context.Context, requestID int64, slotID int, 
 			return nil
 		}
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO signing_audit_log (signing_request_id, slot_id, digest, approvers)
-			VALUES ($1, $2, $3, $4)
-		`, requestID, slotID, digest[:], approvers); err != nil {
+			INSERT INTO signing_audit_log (signing_request_id, slot_id, bsc_deposit_index, digest, approvers)
+			VALUES ($1, $2, $3, $4, $5)
+		`, requestID, ref.slotID, ref.depositIndex, digest[:], approvers); err != nil {
 			return fmt.Errorf("recording audit log for request %d: %w", requestID, err)
 		}
 		return nil
@@ -190,6 +243,39 @@ func (s *Store) signAndRecord(ctx context.Context, requestID int64, slotID int, 
 	return SigningRequest{ID: requestID, Status: StatusSigned, SignedTx: sig}, nil
 }
 
+// signWith resolves ref to a real signature over digest -- the slot path
+// (KMS-mediated) or the BSC-deposit path (kmssign's own in-process
+// derivation), depending on which half of ref is set.
+func (s *Store) signWith(ctx context.Context, ref keyRef, digest [32]byte) ([65]byte, error) {
+	switch {
+	case ref.slotID != nil:
+		key, err := s.slots.Get(ctx, *ref.slotID)
+		if err != nil {
+			return [65]byte{}, fmt.Errorf("looking up slot %d: %w", *ref.slotID, err)
+		}
+		sig, err := s.signer.Sign(ctx, key.KMSKeyID, digest, key.PublicKey)
+		if err != nil {
+			return [65]byte{}, fmt.Errorf("signing: %w", err)
+		}
+		return sig, nil
+	case ref.depositIndex != nil:
+		if s.depositKeys == nil {
+			return [65]byte{}, ErrDepositSigningNotConfigured
+		}
+		pub, err := s.depositKeys.PublicKeyForDeposit(ctx, *ref.depositIndex)
+		if err != nil {
+			return [65]byte{}, fmt.Errorf("looking up public key for BSC deposit index %d: %w", *ref.depositIndex, err)
+		}
+		sig, err := s.signer.SignBSCDeposit(ctx, *ref.depositIndex, digest, pub)
+		if err != nil {
+			return [65]byte{}, fmt.Errorf("signing: %w", err)
+		}
+		return sig, nil
+	default:
+		return [65]byte{}, fmt.Errorf("requests: signing request has neither a slot id nor a deposit index -- data corruption")
+	}
+}
+
 // GetSignature implements SigningService.
 // ListPending lists every PENDING signing request, oldest first -- the
 // one query GetSignature (get-by-id-only) never let an approver make: an
@@ -200,7 +286,7 @@ func (s *Store) signAndRecord(ctx context.Context, requestID int64, slotID int, 
 // not "what just came in."
 func (s *Store) ListPending(ctx context.Context) ([]PendingSummary, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, slot_id, estimated_usd, created_at FROM signing_requests
+		SELECT id, slot_id, bsc_deposit_index, estimated_usd, created_at FROM signing_requests
 		WHERE status = $1 ORDER BY created_at ASC
 	`, string(StatusPending))
 	if err != nil {
@@ -211,8 +297,13 @@ func (s *Store) ListPending(ctx context.Context) ([]PendingSummary, error) {
 	var out []PendingSummary
 	for rows.Next() {
 		var p PendingSummary
-		if err := rows.Scan(&p.ID, &p.SlotID, &p.EstimatedUSD, &p.CreatedAt); err != nil {
+		var depositIndex *int64
+		if err := rows.Scan(&p.ID, &p.SlotID, &depositIndex, &p.EstimatedUSD, &p.CreatedAt); err != nil {
 			return nil, fmt.Errorf("requests: scanning pending row: %w", err)
+		}
+		if depositIndex != nil {
+			idx := uint32(*depositIndex)
+			p.BSCDepositIndex = &idx
 		}
 		out = append(out, p)
 	}
@@ -261,23 +352,30 @@ func (s *Store) EVMAddress(ctx context.Context, slotID int) (string, error) {
 const requiredApprovals = 2
 
 type pendingRequestDetail struct {
-	slotID int
+	ref    keyRef
 	digest [32]byte
 	status Status
 }
 
 func (s *Store) getPendingDetail(ctx context.Context, requestID int64) (pendingRequestDetail, error) {
 	var d pendingRequestDetail
+	var slotID *int
+	var depositIndex *int64
 	var digest []byte
 	var status string
 	err := s.pool.QueryRow(ctx, `
-		SELECT slot_id, digest, status FROM signing_requests WHERE id = $1
-	`, requestID).Scan(&d.slotID, &digest, &status)
+		SELECT slot_id, bsc_deposit_index, digest, status FROM signing_requests WHERE id = $1
+	`, requestID).Scan(&slotID, &depositIndex, &digest, &status)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return pendingRequestDetail{}, ErrRequestNotFound
 		}
 		return pendingRequestDetail{}, fmt.Errorf("requests: fetching request %d: %w", requestID, err)
+	}
+	d.ref.slotID = slotID
+	if depositIndex != nil {
+		idx := uint32(*depositIndex)
+		d.ref.depositIndex = &idx
 	}
 	d.status = Status(status)
 	copy(d.digest[:], digest)
@@ -316,7 +414,7 @@ func (s *Store) Approve(ctx context.Context, requestID int64, approver string) (
 		return s.GetSignature(ctx, requestID)
 	}
 
-	return s.signAndRecord(ctx, requestID, detail.slotID, detail.digest, approvers)
+	return s.signAndRecord(ctx, requestID, detail.ref, detail.digest, approvers)
 }
 
 // Reject records a REJECT decision from approver -- a veto, not a vote:

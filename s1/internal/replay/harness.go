@@ -61,7 +61,7 @@ func (h *harness) newSlot(namePrefix string) (int, error) {
 // own, letting each pick whatever threshold its own test needs without
 // the others interfering.
 func (h *harness) newStore(thresholdUSD float64) *requests.Store {
-	return requests.NewStore(h.pool, slotKeyGetterAdapter{h.slots}, h.signer, requests.Config{ApprovalThresholdUSD: thresholdUSD})
+	return requests.NewStore(h.pool, slotKeyGetterAdapter{h.slots}, nil, h.signer, requests.Config{ApprovalThresholdUSD: thresholdUSD})
 }
 
 type slotKeyGetterAdapter struct{ store *slots.Store }

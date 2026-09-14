@@ -75,13 +75,28 @@ func run() error {
 	}
 	wrapper := kmssign.NewWrapper(kmsClient)
 
+	depositKeysConfigured, err := configureBSCDepositKeysFromEnv(wrapper)
+	if err != nil {
+		return err
+	}
+
 	slotStore := slots.NewStore(pool, wrapper)
 
 	threshold, err := approvalThresholdFromEnv()
 	if err != nil {
 		return err
 	}
-	signingStore := requests.NewStore(pool, slotKeyGetterAdapter{slotStore}, wrapper, requests.Config{ApprovalThresholdUSD: threshold})
+	// wrapper itself satisfies both requests.Signer and
+	// requests.DepositKeyGetter -- when depositKeysConfigured is false,
+	// SetBSCDepositKeys was never called, so wrapper.SignBSCDeposit/
+	// PublicKeyForDeposit both return ErrBSCDepositKeysNotConfigured,
+	// which Store surfaces to a caller as ErrDepositSigningNotConfigured
+	// (see requests/store.go's own signWith).
+	var depositKeys requests.DepositKeyGetter
+	if depositKeysConfigured {
+		depositKeys = wrapper
+	}
+	signingStore := requests.NewStore(pool, slotKeyGetterAdapter{slotStore}, depositKeys, wrapper, requests.Config{ApprovalThresholdUSD: threshold})
 
 	server := &httpapi.Server{
 		Pool:      pool,
@@ -162,6 +177,37 @@ func kmsClientFromEnv() (kmssign.KMSClient, error) {
 	default:
 		return nil, fmt.Errorf("s1d: S1_KMS_CLIENT=%q is not a recognized KMS client (only \"fake\" exists in this codebase today -- a real cloud KMS adapter has not been built yet)", os.Getenv("S1_KMS_CLIENT"))
 	}
+}
+
+// configureBSCDepositKeysFromEnv reads S1_BSC_DEPOSIT_XPRV/XPUB and, if
+// both are set, parses and cross-validates them (see
+// kmssign.NewBSCDepositKeys's own doc comment) and enables wrapper's own
+// BSC deposit-sweep signing. Both unset is a legitimate, supported mode
+// -- most deployments (and every one before depositwatcher's own sweep
+// orchestration is wired) never need this -- returning (false, nil).
+// Exactly one set is a real misconfiguration, not a partial feature:
+// fails loud rather than silently leaving deposit-sweep signing half
+// configured. S1_BSC_DEPOSIT_XPUB should be the exact same value
+// depositwatcher's own WATCHER_XPUB is configured with -- the two
+// services must agree on which address a given index maps to, or a
+// sweep signs a transaction from the wrong address entirely.
+func configureBSCDepositKeysFromEnv(wrapper *kmssign.Wrapper) (bool, error) {
+	xprv := os.Getenv("S1_BSC_DEPOSIT_XPRV")
+	xpub := os.Getenv("S1_BSC_DEPOSIT_XPUB")
+	if xprv == "" && xpub == "" {
+		slog.Info("s1d: S1_BSC_DEPOSIT_XPRV/XPUB not set -- BSC deposit-sweep signing is disabled on this deployment")
+		return false, nil
+	}
+	if xprv == "" || xpub == "" {
+		return false, errors.New("s1d: S1_BSC_DEPOSIT_XPRV and S1_BSC_DEPOSIT_XPUB must both be set together, or both left unset")
+	}
+	keys, err := kmssign.NewBSCDepositKeys(xprv, xpub)
+	if err != nil {
+		return false, fmt.Errorf("s1d: configuring BSC deposit keys: %w", err)
+	}
+	wrapper.SetBSCDepositKeys(keys)
+	slog.Info("s1d: BSC deposit-sweep signing enabled")
+	return true, nil
 }
 
 // approvalThresholdFromEnv reads S1_APPROVAL_THRESHOLD_USD -- see

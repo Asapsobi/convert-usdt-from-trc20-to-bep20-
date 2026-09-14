@@ -60,11 +60,52 @@ func (s *Server) postSigningRequest(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusCreated, toSigningRequestResponse(result))
 }
 
+type postDepositSigningRequestRequest struct {
+	BSCDepositIndex uint32  `json:"bsc_deposit_index"`
+	Digest          string  `json:"digest"`
+	EstimatedUSD    float64 `json:"estimated_usd"`
+	IdempotencyKey  string  `json:"idempotency_key"`
+}
+
+// postDepositSigningRequest is POST /v1/deposit-signing-requests --
+// depositwatcher's own entry point into
+// SigningService.RequestDepositSweepSignature (see
+// internal/requests/requests.go's own doc comment for why this is a
+// separate method rather than overloading postSigningRequest's own
+// SlotID field). Otherwise an exact mirror of postSigningRequest above.
+func (s *Server) postDepositSigningRequest(w http.ResponseWriter, r *http.Request) {
+	var req postDepositSigningRequestRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.IdempotencyKey == "" {
+		writeAPIError(w, newAPIError(http.StatusBadRequest, errInvalidRequest.Code, "idempotency_key is required"))
+		return
+	}
+
+	digestBytes, err := hex.DecodeString(req.Digest)
+	if err != nil || len(digestBytes) != 32 {
+		writeAPIError(w, newAPIError(http.StatusBadRequest, errInvalidRequest.Code, "digest must be 32 bytes, hex-encoded"))
+		return
+	}
+	var digest [32]byte
+	copy(digest[:], digestBytes)
+
+	result, err := s.Signing.RequestDepositSweepSignature(r.Context(), req.BSCDepositIndex, digest, req.EstimatedUSD, req.IdempotencyKey)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	s.Metrics.recordSigningRequest(result.Status)
+	respondJSON(w, http.StatusCreated, toSigningRequestResponse(result))
+}
+
 type pendingSummaryResponse struct {
-	ID           int64     `json:"id"`
-	SlotID       int       `json:"slot_id"`
-	EstimatedUSD float64   `json:"estimated_usd"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID              int64     `json:"id"`
+	SlotID          *int      `json:"slot_id,omitempty"`
+	BSCDepositIndex *uint32   `json:"bsc_deposit_index,omitempty"`
+	EstimatedUSD    float64   `json:"estimated_usd"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 // getSigningRequests is GET /v1/signing-requests?status=pending -- the
@@ -89,7 +130,7 @@ func (s *Server) getSigningRequests(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]pendingSummaryResponse, len(pending))
 	for i, p := range pending {
-		out[i] = pendingSummaryResponse{ID: p.ID, SlotID: p.SlotID, EstimatedUSD: p.EstimatedUSD, CreatedAt: p.CreatedAt}
+		out[i] = pendingSummaryResponse{ID: p.ID, SlotID: p.SlotID, BSCDepositIndex: p.BSCDepositIndex, EstimatedUSD: p.EstimatedUSD, CreatedAt: p.CreatedAt}
 	}
 	respondJSON(w, http.StatusOK, map[string]any{"signing_requests": out})
 }

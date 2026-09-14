@@ -106,7 +106,7 @@ func testServer(t *testing.T, thresholdUSD float64) (baseURL string, pool *db.Po
 		t.Fatalf("registering slot 1: %v", err)
 	}
 
-	signingStore := requests.NewStore(wrapped, slotKeyGetterAdapter{slotStore}, wrapper, requests.Config{ApprovalThresholdUSD: thresholdUSD})
+	signingStore := requests.NewStore(wrapped, slotKeyGetterAdapter{slotStore}, nil, wrapper, requests.Config{ApprovalThresholdUSD: thresholdUSD})
 
 	server := &httpapi.Server{
 		Pool:      wrapped,
