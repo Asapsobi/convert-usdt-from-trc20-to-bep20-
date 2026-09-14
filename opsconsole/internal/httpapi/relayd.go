@@ -8,13 +8,14 @@ import (
 
 // relayLegsContent lists Model F's own relay legs -- read-only, unlike
 // screening holds or dispatcher slots: R5's own automatic refund path
-// (relayd/internal/orchestrate/refund.go) already handles the one
+// (relayd/internal/orchestrate/refund.go) already handles every
 // leg-level failure an operator could safely act on from here (a stuck
-// forward attempt), and UNRECOVERABLE's own resolution is an off-system
-// operational decision (a vendor support ticket, a compensation
-// reserve -- see docs/03-build/model-f-relay-build-prompts.md's own
-// "Open items"), not a button this console could correctly offer. This
-// page's job is purely to make that state visible, not to act on it.
+// forward attempt, or upstream.CreateOrder never once succeeding), and
+// UNRECOVERABLE's own resolution is an off-system operational decision
+// (a vendor support ticket, a compensation reserve -- see
+// docs/03-build/model-f-relay-build-prompts.md's own "Open items"), not
+// a button this console could correctly offer. This page's job is
+// purely to make that state visible, not to act on it.
 const relayLegsContent = `
 <h1>Relay legs</h1>
 {{ if .Error }}<div class="flash flash-error">{{ .Error }}</div>{{ end }}
