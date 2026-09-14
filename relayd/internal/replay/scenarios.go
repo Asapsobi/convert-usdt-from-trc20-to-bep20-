@@ -1,18 +1,21 @@
-// This file's own SCENARIO MIX deliberately differs from
+// This file's own SCENARIO MIX originally differed from
 // docs/03-build/model-f-relay-build-prompts.md's own R6 wording ("a
 // screening hold that resolves to refund, an upstream failed before the
-// forward transfer") -- recorded here, not silently: R5 shipped only a
-// first slice (see internal/orchestrate/refund.go's own doc comment).
-// The manual HELD->REFUNDED path via C3's own hold-review queue does not
-// exist yet (cross-module, C3's own RefundEntryBuilder is still a stub
-// repo-wide), and "upstream failed before the forward transfer" has no
-// distinct code path in this implementation -- relayd only ever learns
-// an upstream order's status by polling it AFTER its own forward
-// transfer confirms (advanceForwardedOne), so a pre-forward vendor
-// failure is, today, indistinguishable from any other reason the forward
-// attempt never completes, and is covered by the SAME stuck-forwarding-
-// timeout mechanism scenario 3 below exercises. Both gaps are also
-// recorded in README.md's own Model F status table.
+// forward transfer") because R5 initially shipped only a first slice
+// (automatic refund-by-timeout, no manual HELD->REFUNDED path). The
+// manual path is now wired too (screening/internal/holds.go's own
+// RelayAwareRefundEntryBuilder, calling relayd's GET .../refund-entry) --
+// scenarioManuallyRejectedHoldGetsRefunded below exercises it for real,
+// restoring the build-prompts doc's own original scenario. "Upstream
+// failed before the forward transfer" still has no distinct code path in
+// this implementation, though: relayd only ever learns an upstream
+// order's status by polling it AFTER its own forward transfer confirms
+// (advanceForwardedOne), so a pre-forward vendor failure is,
+// today, indistinguishable from any other reason the forward attempt
+// never completes, and is covered by the SAME stuck-forwarding-timeout
+// mechanism scenarioStuckForwardingTimeoutRefund exercises. That one
+// remaining gap is also recorded in README.md's own Model F status
+// table.
 package replay
 
 import (
@@ -217,6 +220,87 @@ func (h *harness) scenarioStuckForwardingTimeoutRefund() Result {
 		return fail(name, err)
 	}
 	h.track(trackedLeg{externalID: externalID, orderID: screened.ID, wantTerminal: relay.StatusRefunded})
+	return pass(name)
+}
+
+// scenarioManuallyRejectedHoldGetsRefunded exercises the manual
+// HELD->REFUNDED path: a real held order, refunded exactly the way
+// screening/internal/holds.go's own Reject flow does in a real
+// deployment (fetch the entry from driver.BuildRefundEntry -- what
+// relayd's own GET .../refund-entry endpoint serves -- then post
+// held->refunded to C1 with it), then picked up by
+// internal/orchestrate's own startExternallyRefundedLegs and carried
+// through REFUND_PENDING to REFUNDED with a real on-chain broadcast.
+// This restores the build-prompts doc's own original R6 scenario (see
+// this file's own top-of-file doc comment).
+func (h *harness) scenarioManuallyRejectedHoldGetsRefunded() Result {
+	const name = "ManuallyRejectedHoldGetsRefunded"
+	externalID := h.nextID("manual-reject")
+	customerID := h.nextID("cust")
+	senderAddress := "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj"
+
+	order, err := h.ledger.createRelayOrder(h.ctx, externalID, customerID, true)
+	if err != nil {
+		return fail(name, err)
+	}
+	held, err := h.ledger.advanceToHeld(h.ctx, order, "USDT_TRC20", senderAddress)
+	if err != nil {
+		return fail(name, err)
+	}
+	if _, err := h.store.Create(h.ctx, relay.Leg{
+		ExternalID: externalID, OrderID: held.ID, Direction: relay.TRC20ToBEP20,
+		CustomerID: customerID, DestinationAddress: "0xcustomer-bep20-address", DepositAddress: "Trelayd-fixture-deposit-address",
+		AmountIn: money.Amount{Asset: money.USDT_TRC20, Units: 100_000000}, AmountOutExpected: money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
+	}); err != nil {
+		return fail(name, err)
+	}
+
+	// screening's own job in a real deployment -- reproduced directly via
+	// the same Driver method its own HTTP call wraps, since this harness
+	// has no real screend process to call through (see Config's own doc
+	// comment: every boundary besides C1 is an in-process fake here).
+	entry, err := h.refundEntryDriver().BuildRefundEntry(h.ctx, externalID)
+	if err != nil {
+		return fail(name, err)
+	}
+	entryLines := make([]map[string]any, len(entry.Lines))
+	for i, l := range entry.Lines {
+		entryLines[i] = map[string]any{"account_code": l.AccountCode, "asset": l.Asset, "amount": l.Amount}
+	}
+	refunded, err := h.ledger.rejectHeld(h.ctx, held, map[string]any{
+		"entry_type": entry.EntryType, "occurred_at": entry.OccurredAt, "lines": entryLines,
+	})
+	if err != nil {
+		return fail(name, err)
+	}
+	if refunded.State != "refunded" {
+		return fail(name, fmt.Errorf("expected C1 order state refunded, got %s", refunded.State))
+	}
+
+	so := h.newOrchestrator(h.nextID("provider"), 0)
+
+	if err := h.runTicksUntil(so.orch, 3, func() (bool, error) {
+		st, err := h.legStatus(externalID)
+		return st == relay.StatusRefunded, err
+	}); err != nil {
+		return fail(name, err)
+	}
+
+	leg, err := h.store.GetByExternalID(h.ctx, externalID)
+	if err != nil {
+		return fail(name, err)
+	}
+	if leg.RefundTxID == nil || *leg.RefundTxID == "" {
+		return fail(name, errors.New("expected a refund_tx_id to be recorded"))
+	}
+
+	if err := h.assertZero(customerLiabilityCode(customerID, "USDT_TRC20")); err != nil {
+		return fail(name, err)
+	}
+	if err := h.assertZero(relayLegAccountCode(held.ID)); err != nil {
+		return fail(name, err)
+	}
+	h.track(trackedLeg{externalID: externalID, orderID: held.ID, wantTerminal: relay.StatusRefunded})
 	return pass(name)
 }
 

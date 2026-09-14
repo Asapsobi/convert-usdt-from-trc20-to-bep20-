@@ -179,6 +179,84 @@ func (f *ledgerFixture) advanceToScreened(ctx context.Context, order fixtureOrde
 	return screened, nil
 }
 
+// advanceToHeld walks a freshly created RELAY order through funded and
+// into held -- mirroring what C3's own automatic Hold verdict does
+// (funded->held, RequiresEntry: false), the starting point for the
+// manual-reject scenario (scenarioManuallyRejectedHoldGetsRefunded).
+func (f *ledgerFixture) advanceToHeld(ctx context.Context, order fixtureOrder, inAsset, senderAddress string) (fixtureOrder, error) {
+	relayLegAccount := "asset:relay:leg:" + strconv.FormatInt(order.ID, 10)
+	liability := "liability:customer:" + order.CustomerID + ":" + inAsset
+	if err := f.createAccount(ctx, relayLegAccount, "ASSET", inAsset); err != nil {
+		return fixtureOrder{}, err
+	}
+	if err := f.createAccount(ctx, liability, "LIABILITY", inAsset); err != nil {
+		return fixtureOrder{}, err
+	}
+
+	now := time.Now().UTC()
+	fundBody := map[string]any{
+		"to_state": "funded", "expected_version": order.Version, "reason": "replay_deposit_final", "occurred_at": now,
+		"entry": map[string]any{
+			"entry_type": "deposit_final", "occurred_at": now,
+			"lines": []map[string]any{
+				{"account_code": relayLegAccount, "asset": inAsset, "amount": "100.000000"},
+				{"account_code": liability, "asset": inAsset, "amount": "-100.000000"},
+			},
+		},
+	}
+	if senderAddress != "" {
+		fundBody["sender_address"] = senderAddress
+	}
+	status, respBody, err := f.do(ctx, http.MethodPost, "/v1/orders/"+order.ExternalID+"/transitions", "replay:fund:"+order.ExternalID, fundBody)
+	if err != nil {
+		return fixtureOrder{}, err
+	}
+	if status != http.StatusOK {
+		return fixtureOrder{}, fmt.Errorf("funding %s: status %d: %s", order.ExternalID, status, respBody)
+	}
+	var funded fixtureOrder
+	if err := json.Unmarshal(respBody, &funded); err != nil {
+		return fixtureOrder{}, fmt.Errorf("decoding funded order response: %w: %s", err, respBody)
+	}
+
+	status, respBody, err = f.do(ctx, http.MethodPost, "/v1/orders/"+order.ExternalID+"/transitions", "replay:hold:"+order.ExternalID, map[string]any{
+		"to_state": "held", "expected_version": funded.Version, "reason": "screening_hold_flagged", "occurred_at": now,
+	})
+	if err != nil {
+		return fixtureOrder{}, err
+	}
+	if status != http.StatusOK {
+		return fixtureOrder{}, fmt.Errorf("holding %s: status %d: %s", order.ExternalID, status, respBody)
+	}
+	var held fixtureOrder
+	if err := json.Unmarshal(respBody, &held); err != nil {
+		return fixtureOrder{}, fmt.Errorf("decoding held order response: %w: %s", err, respBody)
+	}
+	return held, nil
+}
+
+// rejectHeld walks a held RELAY order into refunded, posting entry as
+// C1's own "entry" transition field -- mirroring exactly what
+// screening/internal/holds.go's own Reject does over HTTP in a real
+// deployment.
+func (f *ledgerFixture) rejectHeld(ctx context.Context, order fixtureOrder, entry map[string]any) (fixtureOrder, error) {
+	status, respBody, err := f.do(ctx, http.MethodPost, "/v1/orders/"+order.ExternalID+"/transitions", "replay:reject:"+order.ExternalID, map[string]any{
+		"to_state": "refunded", "expected_version": order.Version, "reason": "manual_reject", "occurred_at": time.Now().UTC(),
+		"entry": entry,
+	})
+	if err != nil {
+		return fixtureOrder{}, err
+	}
+	if status != http.StatusOK {
+		return fixtureOrder{}, fmt.Errorf("rejecting held order %s: status %d: %s", order.ExternalID, status, respBody)
+	}
+	var refunded fixtureOrder
+	if err := json.Unmarshal(respBody, &refunded); err != nil {
+		return fixtureOrder{}, fmt.Errorf("decoding refunded order response: %w: %s", err, respBody)
+	}
+	return refunded, nil
+}
+
 func (f *ledgerFixture) createAccount(ctx context.Context, code, accountType, asset string) error {
 	normalSide := 1
 	if accountType == "LIABILITY" || accountType == "REVENUE" || accountType == "EQUITY" {

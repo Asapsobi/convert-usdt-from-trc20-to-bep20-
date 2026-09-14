@@ -53,7 +53,7 @@ never holds a net position and needs no capital ladder._
 | Pricing mechanism | **Commission** (pass the upstream rate through, earn a referral fee — no visible markup to the customer). Decided; `RELAYD_FEE_BASIS_POINTS`. |
 | Reuses from Model D | C1 (ledger, new `RELAY` tier + relay-leg suspense accounts), C3 (screening, unchanged — discovers `RELAY` orders via its own existing tier-agnostic polling loop), C4 (energy broker, TRC20-direction forward leg only), S1 (key management — same secp256k1 slot key, both a TRON and an EVM address derived from it) |
 | New | `tronwatcher/` (C2′ — TRON-side deposit watcher, mirrors C2 against TRC20 via TronGrid's REST API instead of `eth_getLogs`), `relayd/` (the front door + driving state machine for **both** relay directions), `internal/upstream` (a vendor-agnostic swap-provider interface), `internal/evmtx`/`internal/evmbroadcast` (relayd's own BEP20 forward-leg construction/broadcast — genuinely new code, no service in this repo had ever sent a BEP20 transaction before) |
-| Build status | **Happy flow, a first slice of the refund path, and ops-console visibility all built and tested, against fakes/placeholders — no real upstream vendor chosen yet.** `tronwatcher` (C2′): full service, unit + integration tested against real Postgres. `relayd`: full state machine (`AWAITING_DEPOSIT → FORWARDING → FORWARDED → SETTLED`) for TRC20→BEP20 *and* BEP20→TRC20, driven end-to-end against a real `ledgerd` + real Postgres in both directions (`TestFullHappyPath_TRC20ToBEP20`, `TestFullHappyPath_BEP20ToTRC20` in `relayd/internal/orchestrate`), real double-entry ledger postings verified to net to zero on every suspense account. **R5 (refund path), first slice:** a leg stuck unable to broadcast its own forward transfer past `RELAYD_FORWARDING_TIMEOUT` is now automatically refunded on-chain to whoever actually sent the deposit (reusing C1's *existing* `Dispatching→Held→Refunded` transitions — zero `ledger/` changes needed), and a leg whose forward transfer already confirmed but whose upstream swap then failed lands `UNRECOVERABLE` with a real alert (`internal/alert`) instead of a silent log line. Still open: the manual `HELD→REFUNDED` path via C3's own hold-review queue (cross-module, C3's `RefundEntryBuilder` is still a stub repo-wide), a leg stuck in `AWAITING_DEPOSIT` because `upstream.CreateOrder` itself never succeeds, and real per-vendor `EXPIRED` semantics (gated on R2/R4). **Ops console:** a read-only relay-leg listing page plus home-page cards for both new services (`opsconsole/internal/httpapi/relayd.go`) — see `opsconsole/`'s own entry below. **R6 (replay ship-gate harness):** `relayd/internal/replay` + `cmd/replay`, connecting to a real, already-running `ledgerd` (the same convention every sibling `cmd/replay` already uses — none of them spawn their own upstream dependency's process, confirmed by reading dispatcher's/gateway's own, not assumed). Scenario mix necessarily differs from the build-prompts doc's own original R6 wording since R5 shipped only a first slice — recorded honestly in that doc rather than silently: both directions' full happy path, the stuck-forwarding automatic refund, and post-forward `UNRECOVERABLE`-with-alert. Run twice for real (`go run ./cmd/replay`, two different seeds): `ALL PASSED` both times. Found one real bug in its own first-draft assertion, not in relayd itself: asserting every relay-leg suspense account closes to zero is *wrong* for an `UNRECOVERABLE` leg (its own forwarding account is supposed to stay stranded at the full forwarded amount forever, by design) — fixed. Runs against `upstream.PlaceholderProvider` (`UPSTREAM_PROVIDER=placeholder`) — every quote/swap call returns `ErrNoVendorConfigured` unless `UPSTREAM_ALLOW_PLACEHOLDER=true` is also set, the same double-gate convention `screening` uses for its own non-production placeholder. Wired into the root `docker-compose.yml`. Not yet built: R2 (real vendor choice), R4 (real vendor wiring). |
+| Build status | **Happy flow, the refund path (both its automatic and manual triggers), ops-console visibility, and the R6 replay ship gate are all built and tested — no real upstream vendor chosen yet, everything below runs against fakes/placeholders.** `tronwatcher` (C2′): full service, unit + integration tested against real Postgres. `relayd`: full state machine (`AWAITING_DEPOSIT → FORWARDING → FORWARDED → SETTLED`) for TRC20→BEP20 *and* BEP20→TRC20, driven end-to-end against a real `ledgerd` + real Postgres in both directions, real double-entry ledger postings verified to net to zero on every suspense account. **R5 (refund path):** a leg stuck unable to broadcast its own forward transfer is refunded automatically past `RELAYD_FORWARDING_TIMEOUT` (reusing C1's *existing* `Dispatching→Held→Refunded` transitions — zero `ledger/` changes); a held order a human manually rejects via C3's own hold-review queue is now *also* refunded for real — `screening/internal/holds.RelayAwareRefundEntryBuilder` asks relayd for the entry (`GET /v1/relay-legs/{id}/refund-entry`), submits it through C3's existing `Reject` flow unchanged, and relayd's own `startExternallyRefundedLegs` notices the result and drives the same on-chain broadcast the timeout path uses; a leg whose forward transfer already confirmed but whose upstream swap then failed lands `UNRECOVERABLE` with a real alert (`internal/alert`). Still open: a leg stuck `AWAITING_DEPOSIT` because `upstream.CreateOrder` itself never succeeds, and real per-vendor `EXPIRED` semantics (gated on R2/R4). **Ops console:** a read-only relay-leg listing page plus home-page cards for both new services. **R6 (replay ship gate):** `relayd/internal/replay` + `cmd/replay`, connecting to a real, already-running `ledgerd` (the convention every sibling `cmd/replay` in this repo already uses). Five scenarios — both directions' full happy path, the stuck-forwarding automatic refund, the manually-rejected-hold refund, and post-forward `UNRECOVERABLE`-with-alert — all pass against a real `ledgerd`, confirmed across several real runs (`go run ./cmd/replay`, different seeds), all `ALL PASSED`. Found one real bug in its own first-draft assertion, not in relayd itself: asserting every relay-leg suspense account closes to zero is *wrong* for an `UNRECOVERABLE` leg (its own forwarding account is supposed to stay stranded at the full forwarded amount forever, by design) — fixed. Runs against `upstream.PlaceholderProvider` (`UPSTREAM_PROVIDER=placeholder`) — every quote/swap call returns `ErrNoVendorConfigured` unless `UPSTREAM_ALLOW_PLACEHOLDER=true` is also set, the same double-gate convention `screening` uses for its own non-production placeholder. Wired into the root `docker-compose.yml`. Not yet built: R2 (real vendor choice), R4 (real vendor wiring). |
 | Next action | R2 in the build-prompts doc: get a real quote/create-order/status API and a partner/affiliate terms sheet from a candidate upstream platform, then R4 to wire it in behind `internal/upstream`'s own `SwapProvider` interface (no `relayd` code elsewhere needs to change — see that package's own `dependency_test.go`). |
 
 Documents, in reading order: `docs/01-strategy/model-f-relay-findings.md` →
@@ -241,6 +241,17 @@ compliance decision), `cmd/migrate`, `cmd/replay` (C3.9's own ship-gate
 harness). Packages under `internal/`: `provider` (the vendor-agnostic AML
 interface, plus `AlwaysCleanProvider`), `cache`, `verdict`, `discovery`,
 `pipeline`, `holds`, `rescreen`, `ledgerclient`, `httpapi`, `replay`.
+`internal/holds`' own `RefundEntryBuilder` (the journal entry a manually
+rejected hold's `held→refunded` transition needs) has two implementations
+now: `StubRefundEntryBuilder` (every non-RELAY tier, `ErrRefundEntryNotImplemented`
+— unchanged, still no owner for the physical BEP20 refund) and, added
+14 Sep 2026 for Model F, `RelayAwareRefundEntryBuilder` (`internal/holds/relay_refund.go`):
+asks relayd for the entry via a new narrow client, `internal/relaydclient`,
+falling back to the stub for any external_id relayd reports it has no
+relay leg for. `cmd/screend` wires the real one only if
+`SCREENING_RELAYD_BASE_URL`/`SCREENING_RELAYD_TOKEN` are both set —
+optional, same "Model F is a separate product line" posture
+`opsconsole`'s own Relayd/Tronwatcher clients already take.
 
 ### `energybroker/`
 
@@ -444,15 +455,22 @@ first slice: a leg stuck unable to broadcast its own forward transfer past
 whoever actually sent the deposit — reusing C1's *existing*
 `Dispatching→Held→Refunded` transitions, not a new one — and a leg whose
 forward transfer already confirmed but whose upstream swap then failed lands
-`UNRECOVERABLE` and fires a real alert (`internal/alert`). `internal/replay` +
-`cmd/replay` is R6's own ship gate, connecting to a real, already-running
-`ledgerd` (the same convention every sibling `cmd/replay` in this repo already
-uses) — `go run ./cmd/replay` twice, two different seeds, both `ALL PASSED`.
-Not yet built: the manual `HELD→REFUNDED` path via C3's own hold-review queue
-(cross-module — C3's `RefundEntryBuilder` is still a stub repo-wide), a leg
-stuck `AWAITING_DEPOSIT` because `upstream.CreateOrder` itself never succeeds,
-real per-vendor `EXPIRED` semantics (gated on a real vendor, R2/R4), and a
-stale-relay-leg reconciliation alarm. `cmd/relayd` is the binary — see its own
+`UNRECOVERABLE` and fires a real alert (`internal/alert`). The manual
+`HELD→REFUNDED` path is also wired (added 14 Sep 2026): `GET /v1/relay-legs/{id}/refund-entry`
+(`internal/httpapi/relay_legs_handlers.go` → `driver.BuildRefundEntry`) computes the
+same entry shape for a real held order that `screening/internal/holds.RelayAwareRefundEntryBuilder`
+calls and submits through C3's own existing `Reject` flow, unchanged;
+`internal/orchestrate/refund.go`'s own new `startExternallyRefundedLegs` phase notices
+the order reached `refunded` this way and drives the on-chain broadcast through the
+*same* `advanceRefundPendingLegs` machinery the timeout-triggered path already uses —
+no new broadcast code, only a new trigger. `internal/replay` + `cmd/replay` is R6's own
+ship gate, connecting to a real, already-running `ledgerd` (the same convention every
+sibling `cmd/replay` in this repo already uses) — five scenarios (both directions'
+happy path, the automatic timeout refund, the manually-rejected-hold refund, and
+`UNRECOVERABLE`-with-alert), run for real across several seeds, all `ALL PASSED`.
+Not yet built: a leg stuck `AWAITING_DEPOSIT` because `upstream.CreateOrder` itself
+never succeeds, real per-vendor `EXPIRED` semantics (gated on a real vendor, R2/R4),
+and a stale-relay-leg reconciliation alarm. `cmd/relayd` is the binary — see its own
 `buildDriverAndOrchestrator` for the full list of required env vars, no
 hardcoded defaults for anything real-money-shaped.
 

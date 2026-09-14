@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -121,6 +122,63 @@ func (s *Server) getRelayLeg(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondJSON(w, http.StatusOK, resp)
+}
+
+type refundEntryLineResponse struct {
+	AccountCode string `json:"account_code"`
+	Asset       string `json:"asset"`
+	Amount      string `json:"amount"`
+}
+
+type refundEntryResponse struct {
+	EntryType  string                    `json:"entry_type"`
+	OccurredAt string                    `json:"occurred_at"`
+	Lines      []refundEntryLineResponse `json:"lines"`
+}
+
+// getRelayLegRefundEntry is GET /v1/relay-legs/{external_id}/refund-entry
+// -- the one thing screening's own RELAY-aware RefundEntryBuilder needs
+// from relayd to manually reject a screening hold on a RELAY-tier order
+// (screening/internal/holds.go's own Reject flow, which already exists
+// for every tier but has never had a real RefundEntryBuilder
+// implementation to call -- see that package's own StubRefundEntryBuilder).
+// 404 means externalID has no relay leg at all (not a RELAY order --
+// screening's own caller falls back to the stub for those, unchanged
+// behavior); 409 means a leg exists but isn't currently eligible (not
+// AWAITING_DEPOSIT locally, or C1's own order isn't held) -- see
+// driver.ErrLegNotEligibleForRefundEntry's own doc comment for exactly
+// why both conditions matter.
+//
+// This endpoint only COMPUTES the entry -- it does not submit it to C1
+// (screening's own Reject flow does that, as part of its own existing
+// held->refunded transition call) and does not itself trigger the
+// physical on-chain refund (internal/orchestrate's own
+// startExternallyRefundedLegs phase notices the order reached `refunded`
+// on a later tick and drives that, the same advanceRefundPendingLegs
+// machinery R5's own timeout-triggered refund already uses).
+func (s *Server) getRelayLegRefundEntry(w http.ResponseWriter, r *http.Request) {
+	externalID := chi.URLParam(r, "external_id")
+	entry, err := s.Driver.BuildRefundEntry(r.Context(), externalID)
+	if err != nil {
+		if errors.Is(err, relay.ErrLegNotFound) {
+			writeError(w, http.StatusNotFound, err)
+			return
+		}
+		if errors.Is(err, driver.ErrLegNotEligibleForRefundEntry) {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+
+	lines := make([]refundEntryLineResponse, len(entry.Lines))
+	for i, l := range entry.Lines {
+		lines[i] = refundEntryLineResponse{AccountCode: l.AccountCode, Asset: l.Asset, Amount: l.Amount}
+	}
+	respondJSON(w, http.StatusOK, refundEntryResponse{
+		EntryType: entry.EntryType, OccurredAt: entry.OccurredAt.Format(time.RFC3339), Lines: lines,
+	})
 }
 
 type relayLegSummary struct {

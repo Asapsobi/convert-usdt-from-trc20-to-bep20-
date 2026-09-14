@@ -37,10 +37,12 @@ import (
 
 	"screening/internal/db"
 	"screening/internal/discovery"
+	"screening/internal/holds"
 	"screening/internal/httpapi"
 	"screening/internal/ledgerclient"
 	"screening/internal/pipeline"
 	"screening/internal/provider"
+	"screening/internal/relaydclient"
 	"screening/internal/rescreen"
 )
 
@@ -81,11 +83,26 @@ func run() error {
 	}
 	ledgerClient := ledgerclient.New(ledgerBaseURL, ledgerToken)
 
+	// Optional, unlike ledgerClient above -- Model F is a separate
+	// product line not every deployment of this service runs alongside
+	// (see httpapi.Server's own doc comment). Left unset, POST
+	// /v1/holds/{id}/reject keeps today's exact behavior for every
+	// order (holds.StubRefundEntryBuilder, 501
+	// refund_entry_not_implemented) -- this never blocks startup.
+	var refundEntryBuilder holds.RefundEntryBuilder = holds.StubRefundEntryBuilder{}
+	relaydBaseURL := os.Getenv("SCREENING_RELAYD_BASE_URL")
+	relaydToken := os.Getenv("SCREENING_RELAYD_TOKEN")
+	if relaydBaseURL != "" && relaydToken != "" {
+		refundEntryBuilder = holds.RelayAwareRefundEntryBuilder{Relayd: relaydclient.New(relaydBaseURL, relaydToken)}
+		slog.Info("screend: RELAY-aware refund entry builder configured", "relayd_base_url", relaydBaseURL)
+	}
+
 	server := &httpapi.Server{
-		Pool:         pool,
-		Auth:         auth,
-		LedgerClient: ledgerClient,
-		BuildInfo:    buildInfo,
+		Pool:               pool,
+		Auth:               auth,
+		LedgerClient:       ledgerClient,
+		RefundEntryBuilder: refundEntryBuilder,
+		BuildInfo:          buildInfo,
 	}
 	router := httpapi.NewRouter(server)
 

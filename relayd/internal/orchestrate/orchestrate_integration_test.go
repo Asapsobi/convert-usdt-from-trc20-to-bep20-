@@ -26,6 +26,7 @@ import (
 
 	"relayd/internal/alert"
 	"relayd/internal/db"
+	"relayd/internal/driver"
 	"relayd/internal/energy"
 	"relayd/internal/ledgerclient"
 	"relayd/internal/money"
@@ -752,3 +753,131 @@ func TestFullHappyPath_BEP20ToTRC20(t *testing.T) {
 }
 
 func ptrAmount(a money.Amount) *money.Amount { return &a }
+
+// TestExternalRefund_ManuallyRejectedHoldGetsRefunded proves the manual
+// HELD->REFUNDED path end to end: a real held RELAY order, refunded
+// exactly the way screening/internal/holds.go's own Reject flow would
+// (fetch the entry from driver.BuildRefundEntry -- what relayd's own
+// GET .../refund-entry endpoint serves -- then post held->refunded to
+// C1 with it, mirroring ledgerclient.RejectHold's own request shape
+// verbatim since this test has no real screend process to call through),
+// then picked up by internal/orchestrate's own startExternallyRefundedLegs
+// and carried through REFUND_PENDING to REFUNDED with a real on-chain
+// broadcast -- the same advanceRefundPendingLegs machinery R5's own
+// timeout-triggered refund already uses from that point on.
+func TestExternalRefund_ManuallyRejectedHoldGetsRefunded(t *testing.T) {
+	ledger := startLedger(t)
+	pool := testPool(t)
+	store := relay.NewStore(pool)
+	client := ledgerclient.New(ledger.BaseURL(), ledger.Token())
+
+	externalID := uniqueExternalID(t)
+	order := ledger.CreateRelayOrder(externalID, "cust-external-refund-1")
+	senderAddress := "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj"
+	held := ledger.AdvanceToHeld(order, senderAddress)
+	if held.State != "held" {
+		t.Fatalf("fixture setup: expected held, got %s", held.State)
+	}
+
+	if _, err := store.Create(context.Background(), relay.Leg{
+		ExternalID: externalID, OrderID: order.ID, Direction: relay.TRC20ToBEP20,
+		CustomerID: "cust-external-refund-1", DestinationAddress: "0xcustomer-bep20-address",
+		DepositAddress:    "Trelayd-fixture-deposit-address",
+		AmountIn:          money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
+		AmountOutExpected: money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
+	}); err != nil {
+		t.Fatalf("creating relay leg: %v", err)
+	}
+
+	// This is screening's own job in a real deployment (its own
+	// RelayAwareRefundEntryBuilder calls relayd's HTTP endpoint) --
+	// reproduced directly here via the same Driver method that endpoint
+	// wraps, since this test has no real screend/relayd HTTP boundary to
+	// cross.
+	d := &driver.Driver{Ledger: client, Store: store}
+	entry, err := d.BuildRefundEntry(context.Background(), externalID)
+	if err != nil {
+		t.Fatalf("BuildRefundEntry: %v", err)
+	}
+	entryLines := make([]map[string]any, len(entry.Lines))
+	for i, l := range entry.Lines {
+		entryLines[i] = map[string]any{"account_code": l.AccountCode, "asset": l.Asset, "amount": l.Amount}
+	}
+	refunded := ledger.RejectHeld(held, map[string]any{
+		"entry_type": entry.EntryType, "occurred_at": entry.OccurredAt, "lines": entryLines,
+	})
+	if refunded.State != "refunded" {
+		t.Fatalf("expected C1 order state refunded, got %s", refunded.State)
+	}
+
+	// The leg is still AWAITING_DEPOSIT locally -- relayd never engaged
+	// it (it never reached screened).
+	preTick, err := store.GetByExternalID(context.Background(), externalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preTick.Status != relay.StatusAwaitingDeposit {
+		t.Fatalf("expected AWAITING_DEPOSIT before any tick, got %s", preTick.Status)
+	}
+
+	signer := signing.NewFakeSigningService()
+	signer.SetSlotAddress(1, "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH")
+	chain := &fakeChain{}
+	finality := newFakeFinality()
+	evmChain := &fakeEVMChain{}
+	evmFinality := newFakeEVMFinality()
+	mockProvider := upstream.NewMockProvider("mock-external-refund", 1)
+
+	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alert.LogAlerter{}, orchestrate.Config{
+		SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH",
+		EnergyPerTransferUnits: 65000,
+	})
+
+	ctx := context.Background()
+
+	// One tick: startExternallyRefundedLegs notices the refunded order,
+	// marks REFUND_PENDING; advanceRefundPendingLegs, later the same
+	// tick, signs and broadcasts the real refund transfer and marks
+	// REFUNDED -- the same one-tick-carries-multiple-phases behavior
+	// this package's own other tests already document.
+	if err := orch.RunTick(ctx); err != nil {
+		t.Fatalf("RunTick 1: %v", err)
+	}
+	afterTick, err := store.GetByExternalID(ctx, externalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterTick.Status == relay.StatusRefundPending {
+		if err := orch.RunTick(ctx); err != nil {
+			t.Fatalf("RunTick 2: %v", err)
+		}
+		afterTick, err = store.GetByExternalID(ctx, externalID)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if afterTick.Status != relay.StatusRefunded {
+		t.Fatalf("expected REFUNDED, got %s", afterTick.Status)
+	}
+	if afterTick.RefundTxID == nil || *afterTick.RefundTxID == "" {
+		t.Fatal("expected a refund_tx_id to be recorded")
+	}
+	if chain.broadcasts != 1 {
+		t.Errorf("expected exactly 1 TRC20 broadcast (the refund), got %d", chain.broadcasts)
+	}
+
+	if got := ledger.AccountBalance("liability:customer:cust-external-refund-1:USDT_TRC20"); got != 0 {
+		t.Errorf("expected customer liability to close to 0, got %d", got)
+	}
+	if got := ledger.AccountBalance(fmt.Sprintf("asset:relay:leg:%d", order.ID)); got != 0 {
+		t.Errorf("expected asset:relay:leg:%d to close to 0, got %d", order.ID, got)
+	}
+
+	// Idempotency: one more tick must not re-broadcast or error.
+	if err := orch.RunTick(ctx); err != nil {
+		t.Fatalf("RunTick (idempotent replay): %v", err)
+	}
+	if chain.broadcasts != 1 {
+		t.Errorf("expected still exactly 1 broadcast after one more tick, got %d", chain.broadcasts)
+	}
+}

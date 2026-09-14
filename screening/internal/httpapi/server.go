@@ -11,6 +11,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"screening/internal/db"
+	"screening/internal/holds"
 	"screening/internal/ledgerclient"
 )
 
@@ -18,13 +19,19 @@ import (
 // Release/Reject (internal/holds' own Releaser/Rejecter interfaces) --
 // nil-safe callers aren't needed here, since every write route that
 // touches it requires auth and a real Server is always constructed with
-// one in cmd/screend.
+// one in cmd/screend. RefundEntryBuilder defaults to
+// holds.StubRefundEntryBuilder{} in NewRouter if left nil -- cmd/screend
+// wires holds.RelayAwareRefundEntryBuilder instead when relayd is
+// actually configured (SCREENING_RELAYD_BASE_URL/TOKEN, both optional --
+// Model F is a separate product line, same "optional Model F dependency"
+// posture opsconsole's own Relayd/Tronwatcher clients already take).
 type Server struct {
-	Pool         *db.Pool
-	Auth         AuthConfig
-	LedgerClient *ledgerclient.Client
-	Metrics      *Metrics
-	BuildInfo    func() (version, commit string)
+	Pool               *db.Pool
+	Auth               AuthConfig
+	LedgerClient       *ledgerclient.Client
+	RefundEntryBuilder holds.RefundEntryBuilder
+	Metrics            *Metrics
+	BuildInfo          func() (version, commit string)
 }
 
 // NewRouter builds the full route table. /healthz, /readyz, and
@@ -32,6 +39,10 @@ type Server struct {
 // scraped by infrastructure, not part of the service-to-service
 // business API AUTH governs, same posture as C1.8/C2.9.
 func NewRouter(s *Server) http.Handler {
+	if s.RefundEntryBuilder == nil {
+		s.RefundEntryBuilder = holds.StubRefundEntryBuilder{}
+	}
+
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
 	if s.Metrics == nil {

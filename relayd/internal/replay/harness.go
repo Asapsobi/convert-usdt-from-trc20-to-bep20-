@@ -13,6 +13,7 @@ import (
 
 	"relayd/internal/alert"
 	"relayd/internal/db"
+	"relayd/internal/driver"
 	"relayd/internal/energy"
 	"relayd/internal/ledgerclient"
 	"relayd/internal/orchestrate"
@@ -230,6 +231,16 @@ func (h *harness) runTicksUntil(o *orchestrate.Orchestrator, maxTicks int, check
 		}
 	}
 	return fmt.Errorf("did not reach the expected state within %d ticks", maxTicks)
+}
+
+// refundEntryDriver is a minimal Driver -- only the two fields
+// BuildRefundEntry actually reads (Ledger, Store) -- standing in for
+// what screening's own RelayAwareRefundEntryBuilder would call over
+// HTTP in a real deployment (relayd's own GET .../refund-entry, which
+// wraps this exact method). scenarioManuallyRejectedHoldGetsRefunded is
+// the one scenario that needs it.
+func (h *harness) refundEntryDriver() *driver.Driver {
+	return &driver.Driver{Ledger: h.client, Store: h.store}
 }
 
 func (h *harness) legStatus(externalID string) (relay.Status, error) {

@@ -16,17 +16,14 @@
 //     that also does not exist today (only {Funded, Refunded} and
 //     {Held, Refunded} do). Left as a known follow-up rather than
 //     building a shortcut around either gap.
-//   - The manual HELD->REFUNDED path C3's own holds.Reject already
-//     models system-wide (screening/internal/holds.go's own
-//     RefundEntryBuilder) -- that interface's only real implementation
-//     today is StubRefundEntryBuilder (screening's own doc comment:
-//     "nothing in this system owns constructing, signing, or
-//     broadcasting the physical refund"). relayd is now positioned to be
-//     that owner for RELAY-tier orders specifically (it already owns
-//     real tx construction/signing/broadcast on both chains), but wiring
-//     that requires a new relayd-facing HTTP endpoint C3 can call plus a
-//     RELAY-aware RefundEntryBuilder in screening -- a cross-module
-//     change out of scope for this pass.
+//   - The manual HELD->REFUNDED path via C3's own hold-review queue is
+//     now wired (startExternallyRefundedLegs, below): screening's own
+//     holds.Reject calls relayd's GET .../refund-entry
+//     (internal/httpapi.getRelayLegRefundEntry -> driver.BuildRefundEntry)
+//     to get the correctly-shaped entry, then submits held->refunded to
+//     C1 itself, exactly as it already does for every other tier -- this
+//     package only needs to notice the result and drive the physical
+//     on-chain send.
 //   - EXPIRED-specific vendor behavior (a real vendor might refund its
 //     own receipt back to relayd's sending slot rather than delivering
 //     it) -- gated on a real vendor existing (R2/R4), see settle.go's
@@ -44,6 +41,7 @@ package orchestrate
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -53,6 +51,54 @@ import (
 	"relayd/internal/relay"
 	"relayd/internal/txbuild"
 )
+
+// startExternallyRefundedLegs scans C1 for orders in state=refunded and,
+// for each ref that corresponds to a relay leg still AWAITING_DEPOSIT
+// locally, marks it REFUND_PENDING directly -- no C1 call needed here,
+// unlike startRefund's own timeout-triggered path: whoever moved the
+// order to refunded (screening's own holds.Reject, per this file's own
+// top-of-file doc comment) already posted the ledger entry itself, using
+// the entry driver.BuildRefundEntry computed. advanceRefundPendingLegs,
+// run later in the same tick, then drives the actual on-chain broadcast
+// -- the identical machinery R5's own timeout-triggered refund already
+// uses from that point on. A leg NOT still AWAITING_DEPOSIT is skipped:
+// either this ref belongs to a different tier entirely (relay.ErrLegNotFound),
+// or this leg already reached REFUND_PENDING/REFUNDED some other way
+// (a replay of an already-handled ref), neither of which this phase
+// should touch.
+func (o *Orchestrator) startExternallyRefundedLegs(ctx context.Context) error {
+	cursor := ""
+	for {
+		refs, next, err := o.Ledger.ListOrdersByState(ctx, "refunded", cursor)
+		if err != nil {
+			return fmt.Errorf("listing refunded orders: %w", err)
+		}
+		for _, ref := range refs {
+			leg, err := o.Store.GetByExternalID(ctx, ref.ExternalID)
+			if err != nil {
+				if errors.Is(err, relay.ErrLegNotFound) {
+					continue // not a relay leg -- Model D's own order, not ours
+				}
+				slog.Error("orchestrate: checking a refunded order for a local relay leg failed, will retry next tick",
+					"external_id", ref.ExternalID, "error", err)
+				continue
+			}
+			if leg.Status != relay.StatusAwaitingDeposit {
+				continue
+			}
+			if err := o.Store.MarkRefundPending(ctx, leg.ExternalID); err != nil {
+				slog.Error("orchestrate: marking externally-refunded leg refund pending failed, will retry next tick",
+					"external_id", leg.ExternalID, "error", err)
+				continue
+			}
+			slog.Info("orchestrate: relay leg's screening hold was manually rejected, refund pending", "external_id", leg.ExternalID)
+		}
+		if len(refs) < ledgerclient.DefaultPollLimit || next == "" || next == cursor {
+			return nil
+		}
+		cursor = next
+	}
+}
 
 // refundStuckForwardingLegs scans every FORWARDING leg and starts a
 // refund for any whose UpdatedAt (set exactly once, by MarkForwarding,

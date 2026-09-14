@@ -86,10 +86,12 @@ func (s *Server) postReleaseHold(w http.ResponseWriter, r *http.Request) {
 }
 
 // postRejectHold is POST /v1/holds/{id}/reject. Wired with
-// holds.StubRefundEntryBuilder -- per C3.6's own build spec, this is
-// EXPECTED to fail with 501 refund_entry_not_implemented until a real
-// refund-entry owner exists; the endpoint itself is fully wired and
-// correct, waiting on that owner, not on more code here.
+// s.RefundEntryBuilder (holds.StubRefundEntryBuilder unless cmd/screend
+// configured a real relayd, per Server's own doc comment) -- against the
+// stub, this is EXPECTED to fail with 501 refund_entry_not_implemented
+// for a non-RELAY order, same as always; against
+// holds.RelayAwareRefundEntryBuilder, a RELAY-tier order now actually
+// succeeds.
 func (s *Server) postRejectHold(w http.ResponseWriter, r *http.Request) {
 	holdID, ok := urlParamInt64(w, r, "id")
 	if !ok {
@@ -100,7 +102,7 @@ func (s *Server) postRejectHold(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := holds.Reject(r.Context(), s.Pool, s.LedgerClient, holds.StubRefundEntryBuilder{}, holdID, req.Reviewer, req.Note); err != nil {
+	if err := holds.Reject(r.Context(), s.Pool, s.LedgerClient, s.RefundEntryBuilder, holdID, req.Reviewer, req.Note); err != nil {
 		writeErr(w, err)
 		return
 	}

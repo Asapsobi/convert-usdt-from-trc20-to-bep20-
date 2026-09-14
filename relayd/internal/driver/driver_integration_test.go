@@ -8,6 +8,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -240,6 +241,144 @@ func TestListLegs(t *testing.T) {
 		if l.ExternalID == ext1 || l.ExternalID == ext2 {
 			t.Errorf("expected neither fresh leg to appear under SETTLED, found %s", l.ExternalID)
 		}
+	}
+}
+
+// TestBuildRefundEntry_HeldOrderProducesCorrectEntry covers the one
+// thing relayd's own GET .../refund-entry endpoint (and, transitively,
+// screening's own RelayAwareRefundEntryBuilder) depends on: a real held
+// RELAY order's own refund entry closes the customer's liability and the
+// relay-leg suspense account by exactly amount_in, in the deposit's own
+// asset.
+func TestBuildRefundEntry_HeldOrderProducesCorrectEntry(t *testing.T) {
+	ledger := startLedger(t)
+	pool := testPool(t)
+	store := relay.NewStore(pool)
+	client := ledgerclient.New(ledger.BaseURL(), ledger.Token())
+
+	tronSrv := fakeWatcherServer(t, "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj")
+	defer tronSrv.Close()
+
+	d := &driver.Driver{
+		Ledger: client, Upstream: upstream.NewMockProvider("mock", 1),
+		TronWatcher: watcherclient.New(tronSrv.URL, "tok"), BEP20Watcher: watcherclient.New(tronSrv.URL, "tok"),
+		Store: store, Cfg: driver.Config{FeeBasisPoints: 30, QuoteValidity: 10 * time.Minute},
+	}
+
+	externalID := uniqueExternalID(t)
+	result, err := d.CreateRelayLeg(context.Background(), driver.CreateRelayLegRequest{
+		ExternalID: externalID, CustomerID: "cust-refund-entry-1", Direction: relay.TRC20ToBEP20,
+		DestinationAddress: "0xdest", AmountIn: "100.000000",
+	})
+	if err != nil {
+		t.Fatalf("CreateRelayLeg: %v", err)
+	}
+
+	held := ledger.AdvanceToHeld(ledger.GetOrder(externalID), "")
+	if held.State != "held" {
+		t.Fatalf("fixture setup: expected held, got %s", held.State)
+	}
+
+	entry, err := d.BuildRefundEntry(context.Background(), externalID)
+	if err != nil {
+		t.Fatalf("BuildRefundEntry: %v", err)
+	}
+	if entry.EntryType != "relay_refund" {
+		t.Errorf("expected entry_type relay_refund, got %s", entry.EntryType)
+	}
+	if len(entry.Lines) != 2 {
+		t.Fatalf("expected exactly 2 lines, got %d", len(entry.Lines))
+	}
+
+	want := map[string]string{
+		"liability:customer:cust-refund-entry-1:USDT_TRC20": "100.000000",
+		fmt.Sprintf("asset:relay:leg:%d", result.OrderID):   "-100.000000",
+	}
+	for _, l := range entry.Lines {
+		wantAmount, ok := want[l.AccountCode]
+		if !ok {
+			t.Errorf("unexpected account_code %s in entry", l.AccountCode)
+			continue
+		}
+		if l.Amount != wantAmount {
+			t.Errorf("account %s: amount = %s, want %s", l.AccountCode, l.Amount, wantAmount)
+		}
+		if l.Asset != "USDT_TRC20" {
+			t.Errorf("account %s: asset = %s, want USDT_TRC20", l.AccountCode, l.Asset)
+		}
+	}
+}
+
+// TestBuildRefundEntry_RejectsIneligibleLeg covers the two guard
+// conditions BuildRefundEntry enforces: a leg that has already been
+// engaged by relayd (past AWAITING_DEPOSIT), and an order that is not
+// currently held.
+func TestBuildRefundEntry_RejectsIneligibleLeg(t *testing.T) {
+	ledger := startLedger(t)
+	pool := testPool(t)
+	store := relay.NewStore(pool)
+	client := ledgerclient.New(ledger.BaseURL(), ledger.Token())
+
+	tronSrv := fakeWatcherServer(t, "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj")
+	defer tronSrv.Close()
+
+	d := &driver.Driver{
+		Ledger: client, Upstream: upstream.NewMockProvider("mock", 1),
+		TronWatcher: watcherclient.New(tronSrv.URL, "tok"), BEP20Watcher: watcherclient.New(tronSrv.URL, "tok"),
+		Store: store, Cfg: driver.Config{FeeBasisPoints: 30, QuoteValidity: 10 * time.Minute},
+	}
+
+	// Case 1: order not held (still quoted -- deliberately NOT advanced
+	// to screened here: internal/orchestrate's own startScreenedLegs
+	// actively sweeps up every screened RELAY order in this SHARED test
+	// database from ANY package's own test, including this one's leftover
+	// row, and would complete a real forward+broadcast against some
+	// OTHER test's own fake infrastructure -- found directly, not
+	// theoretical: an earlier version of this test advanced to screened
+	// and inflated relayd/internal/orchestrate's own TestFullHappyPath_TRC20ToBEP20
+	// broadcast count from 1 to 2. "quoted" is untouched by every
+	// orchestrate phase, so it is safe to leave dangling.
+	externalID1 := uniqueExternalID(t)
+	if _, err := d.CreateRelayLeg(context.Background(), driver.CreateRelayLegRequest{
+		ExternalID: externalID1, CustomerID: "cust-ineligible-1", Direction: relay.TRC20ToBEP20,
+		DestinationAddress: "0xdest", AmountIn: "100.000000",
+	}); err != nil {
+		t.Fatalf("CreateRelayLeg: %v", err)
+	}
+
+	if _, err := d.BuildRefundEntry(context.Background(), externalID1); !errors.Is(err, driver.ErrLegNotEligibleForRefundEntry) {
+		t.Fatalf("expected ErrLegNotEligibleForRefundEntry for a quoted (not held) order, got %v", err)
+	}
+
+	// Case 2: leg already past AWAITING_DEPOSIT locally (FORWARDING) --
+	// even if C1's own order were somehow held, relayd already engaged
+	// this leg and must refuse.
+	externalID2 := uniqueExternalID(t)
+	if _, err := d.CreateRelayLeg(context.Background(), driver.CreateRelayLegRequest{
+		ExternalID: externalID2, CustomerID: "cust-ineligible-2", Direction: relay.TRC20ToBEP20,
+		DestinationAddress: "0xdest", AmountIn: "100.000000",
+	}); err != nil {
+		t.Fatalf("CreateRelayLeg: %v", err)
+	}
+	if err := store.MarkForwarding(context.Background(), externalID2, "mock", "order-ineligible-2", "Taddr"); err != nil {
+		t.Fatal(err)
+	}
+	// Cleanup: this leg would otherwise sit FORWARDING forever in this
+	// SHARED test database, picked up (and repeatedly, harmlessly,
+	// failing on its own fake "Taddr" address) by every other package's
+	// own orchestrate.RunTick call for the rest of this test process --
+	// noisy, not unsafe, but tidied up anyway.
+	t.Cleanup(func() {
+		_ = store.MarkFailed(context.Background(), externalID2)
+	})
+
+	if _, err := d.BuildRefundEntry(context.Background(), externalID2); !errors.Is(err, driver.ErrLegNotEligibleForRefundEntry) {
+		t.Fatalf("expected ErrLegNotEligibleForRefundEntry for a FORWARDING leg, got %v", err)
+	}
+
+	// Case 3: no such leg at all.
+	if _, err := d.BuildRefundEntry(context.Background(), uniqueExternalID(t)); !errors.Is(err, relay.ErrLegNotFound) {
+		t.Fatalf("expected ErrLegNotFound, got %v", err)
 	}
 }
 

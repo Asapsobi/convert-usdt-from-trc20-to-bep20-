@@ -170,26 +170,34 @@ type Rejecter interface {
 
 // RefundEntryBuilder constructs the journal entry a manual reject's
 // held->refunded transition requires (C1.5's table marks it
-// RequiresEntry: true). Behind an interface because this chunk's build
-// spec is explicit that no real implementation can exist yet: nothing
-// in this system owns constructing, signing, or broadcasting the
-// physical BEP20 refund (§A's own "out of scope" note) -- see
-// StubRefundEntryBuilder, which is what ships until that owner exists.
+// RequiresEntry: true). Behind an interface because this chunk's own
+// original build spec was explicit that no real implementation could
+// exist yet: nothing in this system owned constructing, signing, or
+// broadcasting the physical refund (§A's own "out of scope" note).
+// That is still true for Model D's own DIRECT/STANDARD/SWEEP tiers --
+// StubRefundEntryBuilder is still what those get -- but a real owner now
+// exists for RELAY-tier orders: relayd, which already builds/signs/
+// broadcasts the physical refund transfer for its own R5 (see
+// relay_refund.go's own RelayAwareRefundEntryBuilder, added once relayd
+// had that capability). cmd/screend wires whichever one is actually
+// configured; this interface itself did not need to change for it.
 type RefundEntryBuilder interface {
 	BuildRefundEntry(ctx context.Context, order ledgerclient.OrderRef) (map[string]any, error)
 }
 
 // ErrRefundEntryNotImplemented is StubRefundEntryBuilder's only possible
-// result. Reject against a real C1, wired with the stub, is EXPECTED to
-// fail with this error -- not a bug, per this chunk's own build spec
-// ("this call is expected to fail against a real C1 until a
-// refund-entry owner exists; build and test it against a fake
-// ledgerclient meanwhile").
+// result -- still the real, unchanged outcome for Model D's own
+// DIRECT/STANDARD/SWEEP tiers (see RefundEntryBuilder's own doc
+// comment), and RelayAwareRefundEntryBuilder's own fallback for any
+// external_id relayd reports it has no relay leg for.
 var ErrRefundEntryNotImplemented = errors.New(
 	"holds: refund entry construction is not implemented -- no owner exists yet for the physical BEP20 refund (see docs/03-build/c3-screening-build-prompts.md §A)")
 
-// StubRefundEntryBuilder is the only RefundEntryBuilder this chunk
-// ships. Every call fails with ErrRefundEntryNotImplemented.
+// StubRefundEntryBuilder is the RefundEntryBuilder every non-RELAY tier
+// still gets (see RefundEntryBuilder's own doc comment) -- and
+// RelayAwareRefundEntryBuilder's own fallback target for an order that
+// turns out not to be RELAY-tier at all. Every call fails with
+// ErrRefundEntryNotImplemented.
 type StubRefundEntryBuilder struct{}
 
 // BuildRefundEntry implements RefundEntryBuilder.

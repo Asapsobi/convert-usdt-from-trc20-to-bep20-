@@ -14,6 +14,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -198,6 +199,101 @@ func (d *Driver) GetStatus(ctx context.Context, externalID string) (Status, erro
 		return Status{}, fmt.Errorf("driver: fetching relay leg: %w", err)
 	}
 	return Status{ExternalID: externalID, Order: order, Leg: leg}, nil
+}
+
+// ErrLegNotEligibleForRefundEntry means BuildRefundEntry was asked for a
+// leg that is not currently in the one state a C3-driven manual refund
+// can apply to: the local leg must still be AWAITING_DEPOSIT (relayd has
+// never engaged it -- a held order's own leg always is, since
+// startScreenedLegs only ever picks up state=screened orders) and C1's
+// own order must currently be held (a manual reject is only legal from
+// there). Returning this rather than silently building a wrong entry
+// protects against the caller (screening's own Reject flow) racing a
+// state change -- e.g. the order got released and moved on before this
+// call landed.
+var ErrLegNotEligibleForRefundEntry = errors.New("driver: this leg is not currently eligible for a refund entry")
+
+// RefundEntry is the C1 "entry" object a caller embeds verbatim into its
+// own held->refunded transition call. Built here, not by the caller,
+// because relayd alone owns RELAY-tier's own account-code conventions
+// (asset:relay:leg:<id>, liability:customer:<id>:<asset>) -- the exact
+// same shape internal/orchestrate/refund.go's own postRefundEntry
+// already posts for the timeout-triggered refund path, duplicated here
+// rather than imported (internal/driver and internal/orchestrate are
+// already separate packages within this module with no shared helper
+// for this, and it is two one-line format strings, not worth a new
+// shared package over).
+type RefundEntry struct {
+	EntryType  string
+	OccurredAt time.Time
+	Lines      []RefundEntryLine
+}
+
+// RefundEntryLine is one line of a RefundEntry. Amount is a decimal
+// string (C1's own entry-line format), already carrying its own sign.
+type RefundEntryLine struct {
+	AccountCode string
+	Asset       string
+	Amount      string
+}
+
+// BuildRefundEntry computes the held->refunded ledger entry for
+// externalID's own relay leg: the customer's liability closes by the
+// full amount_in, the relay-leg suspense account (asset:relay:leg:<id>)
+// closes by the same amount -- no commission line, mirroring
+// postRefundEntry's own identical shape (nothing was ever delivered on a
+// manually-rejected hold, so nothing is earned). This is the SAME entry
+// shape whether the refund was triggered by R5's own automatic timeout
+// path or by a human rejecting a screening hold via C3 -- only who
+// calls it, and when, differs. The caller (relayd's own
+// internal/httpapi.getRelayLegRefundEntry today) is responsible for
+// actually submitting this to C1; this function only computes it.
+func (d *Driver) BuildRefundEntry(ctx context.Context, externalID string) (RefundEntry, error) {
+	leg, err := d.Store.GetByExternalID(ctx, externalID)
+	if err != nil {
+		return RefundEntry{}, err
+	}
+	if leg.Status != relay.StatusAwaitingDeposit {
+		return RefundEntry{}, fmt.Errorf("%w: leg status is %s, want AWAITING_DEPOSIT", ErrLegNotEligibleForRefundEntry, leg.Status)
+	}
+
+	order, err := d.Ledger.GetOrder(ctx, externalID)
+	if err != nil {
+		return RefundEntry{}, fmt.Errorf("driver: fetching order: %w", err)
+	}
+	if order.State != "held" {
+		return RefundEntry{}, fmt.Errorf("%w: order state is %s, want held", ErrLegNotEligibleForRefundEntry, order.State)
+	}
+
+	negAmountIn, err := order.AmountIn.Neg()
+	if err != nil {
+		return RefundEntry{}, fmt.Errorf("driver: negating amount_in: %w", err)
+	}
+	amountInStr, err := money.Format(order.AmountIn)
+	if err != nil {
+		return RefundEntry{}, fmt.Errorf("driver: formatting amount_in: %w", err)
+	}
+	negAmountInStr, err := money.Format(negAmountIn)
+	if err != nil {
+		return RefundEntry{}, fmt.Errorf("driver: formatting negated amount_in: %w", err)
+	}
+
+	asset := string(order.AmountIn.Asset)
+	return RefundEntry{
+		EntryType:  "relay_refund",
+		OccurredAt: time.Now().UTC(),
+		Lines: []RefundEntryLine{
+			{AccountCode: refundCustomerAccountCode(order.CustomerID, asset), Asset: asset, Amount: amountInStr},
+			{AccountCode: refundRelayLegAccountCode(leg.OrderID), Asset: asset, Amount: negAmountInStr},
+		},
+	}, nil
+}
+
+func refundCustomerAccountCode(customerID, asset string) string {
+	return fmt.Sprintf("liability:customer:%s:%s", customerID, asset)
+}
+func refundRelayLegAccountCode(orderID int64) string {
+	return fmt.Sprintf("asset:relay:leg:%d", orderID)
 }
 
 // ListLegs returns every relay leg matching status (nil means every

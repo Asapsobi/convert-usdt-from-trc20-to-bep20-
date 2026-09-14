@@ -131,6 +131,7 @@ services:
     depends_on:
       screening-db: { condition: service_healthy }
       ledger: { condition: service_started }
+      relayd: { condition: service_started }
     environment:
       SCREENING_DATABASE_URL: postgres://screening:screening@screening-db:5432/screening_dev?sslmode=disable
       SCREENING_API_TOKENS: ${SCREENING_API_TOKENS:-screentoken:proofrun}
@@ -142,6 +143,14 @@ services:
       # this supervised, no-real-customer-traffic proof run.
       SCREENING_PROVIDER: always_clean
       SCREENING_ALLOW_ALWAYS_CLEAN: "true"
+      # Model F's own manual HELD->REFUNDED path -- optional, same
+      # posture as OC_RELAYD_BASE_URL above (see
+      # screening/internal/httpapi.Server's own doc comment): leaving
+      # these unset keeps POST /v1/holds/{id}/reject's own prior
+      # behavior (holds.StubRefundEntryBuilder) for every order. Wired
+      # by default here since this compose file runs relayd.
+      SCREENING_RELAYD_BASE_URL: http://relayd:8093
+      SCREENING_RELAYD_TOKEN: ${RELAYD_API_TOKEN_VALUE:-relaydtoken}
     ports: ["8083:8083"]
 
   # ---- C4: energy broker ----

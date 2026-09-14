@@ -34,6 +34,7 @@ func Run(ctx context.Context, pool *db.Pool, ledgerPool *pgxpool.Pool, cfg Confi
 		{"FullHappyPath_TRC20ToBEP20", h.scenarioFullHappyPath_TRC20ToBEP20},
 		{"FullHappyPath_BEP20ToTRC20", h.scenarioFullHappyPath_BEP20ToTRC20},
 		{"StuckForwardingLegAutomaticallyRefunded", h.scenarioStuckForwardingTimeoutRefund},
+		{"ManuallyRejectedHoldGetsRefunded", h.scenarioManuallyRejectedHoldGetsRefunded},
 		{"PostForwardUpstreamFailureLandsUnrecoverableAndAlerts", h.scenarioPostForwardUnrecoverable},
 	}
 	for _, s := range scenarios {

@@ -315,7 +315,7 @@ func (l *Ledger) AdvanceToScreenedWithSender(order OrderResp, senderAddress stri
 	return l.advanceToScreened(order, senderAddress)
 }
 
-func (l *Ledger) advanceToScreened(order OrderResp, senderAddress string) OrderResp {
+func (l *Ledger) advanceToFunded(order OrderResp, senderAddress string) OrderResp {
 	l.t.Helper()
 	relayLegAccount := "asset:relay:leg:" + strconv.FormatInt(order.ID, 10)
 	trcLiability := "liability:customer:" + order.CustomerID + ":USDT_TRC20"
@@ -348,12 +348,18 @@ func (l *Ledger) advanceToScreened(order OrderResp, senderAddress string) OrderR
 	if err := json.Unmarshal(body, &funded); err != nil {
 		l.t.Fatalf("decoding funded order response: %v: %s", err, body)
 	}
+	return funded
+}
 
-	resp, body = l.Do(http.MethodPost, "/v1/orders/"+order.ExternalID+"/transitions", "screen:"+order.ExternalID, map[string]any{
+func (l *Ledger) advanceToScreened(order OrderResp, senderAddress string) OrderResp {
+	l.t.Helper()
+	funded := l.advanceToFunded(order, senderAddress)
+
+	resp, body := l.Do(http.MethodPost, "/v1/orders/"+order.ExternalID+"/transitions", "screen:"+order.ExternalID, map[string]any{
 		"to_state":         "screened",
 		"expected_version": funded.Version,
 		"reason":           "screening_pass",
-		"occurred_at":      now,
+		"occurred_at":      time.Now().UTC(),
 	})
 	if resp.StatusCode != http.StatusOK {
 		l.t.Fatalf("screening %s: status %d: %s", order.ExternalID, resp.StatusCode, body)
@@ -363,6 +369,59 @@ func (l *Ledger) advanceToScreened(order OrderResp, senderAddress string) OrderR
 		l.t.Fatalf("decoding screened order response: %v: %s", err, body)
 	}
 	return screened
+}
+
+// AdvanceToHeld walks a freshly created RELAY order (in quoted) through
+// funded and into held -- mirroring what C3's own automatic Hold verdict
+// does (funded->held, C1.5's table: RequiresEntry: false). Used by any
+// test exercising the manual HELD->REFUNDED path (a human rejecting the
+// hold via C3's own holds.Reject), which needs a real held order to act
+// on, the same way AdvanceToScreened is the starting point for every
+// forward-leg test.
+func (l *Ledger) AdvanceToHeld(order OrderResp, senderAddress string) OrderResp {
+	l.t.Helper()
+	funded := l.advanceToFunded(order, senderAddress)
+
+	resp, body := l.Do(http.MethodPost, "/v1/orders/"+order.ExternalID+"/transitions", "hold:"+order.ExternalID, map[string]any{
+		"to_state":         "held",
+		"expected_version": funded.Version,
+		"reason":           "screening_hold_flagged",
+		"occurred_at":      time.Now().UTC(),
+	})
+	if resp.StatusCode != http.StatusOK {
+		l.t.Fatalf("holding %s: status %d: %s", order.ExternalID, resp.StatusCode, body)
+	}
+	var held OrderResp
+	if err := json.Unmarshal(body, &held); err != nil {
+		l.t.Fatalf("decoding held order response: %v: %s", err, body)
+	}
+	return held
+}
+
+// RejectHeld walks a held RELAY order into refunded, posting entry as
+// C1's own "entry" transition field -- mirroring exactly what
+// screening/internal/holds.go's own Reject does over HTTP in a real
+// deployment (held->refunded, C1.5's table: RequiresEntry: true), used
+// by any test exercising internal/orchestrate's own
+// startExternallyRefundedLegs, which has no real screend process to call
+// this through.
+func (l *Ledger) RejectHeld(order OrderResp, entry map[string]any) OrderResp {
+	l.t.Helper()
+	resp, body := l.Do(http.MethodPost, "/v1/orders/"+order.ExternalID+"/transitions", "reject:"+order.ExternalID, map[string]any{
+		"to_state":         "refunded",
+		"expected_version": order.Version,
+		"reason":           "manual_reject",
+		"occurred_at":      time.Now().UTC(),
+		"entry":            entry,
+	})
+	if resp.StatusCode != http.StatusOK {
+		l.t.Fatalf("rejecting held order %s: status %d: %s", order.ExternalID, resp.StatusCode, body)
+	}
+	var refunded OrderResp
+	if err := json.Unmarshal(body, &refunded); err != nil {
+		l.t.Fatalf("decoding refunded order response: %v: %s", err, body)
+	}
+	return refunded
 }
 
 // CreateAccount mirrors accounts.Create's own INSERT exactly.

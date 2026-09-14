@@ -117,20 +117,34 @@ the customer's own TRC20 address.
     a human decision is now required (see architecture §4 and "Open items" below).
   - Replay scenarios cover all three refund-triggering states plus the ordinary
     settle path.
-- **Shipped (13 Sep 2026), first slice — recorded here rather than silently closed:**
-  a leg stuck unable to broadcast its own forward transfer past
-  `RELAYD_FORWARDING_TIMEOUT` is refunded automatically (reuses C1's *existing*
-  `Dispatching→Held→Refunded` transitions, zero `ledger/` changes), and a leg whose
-  forward transfer already confirmed but whose upstream swap then failed lands
-  `UNRECOVERABLE` and fires a real alert (`internal/alert`). **Still open:** the manual
-  `HELD→REFUNDED` path via C3's own hold-review queue (cross-module — C3's own
-  `RefundEntryBuilder` is still `StubRefundEntryBuilder` repo-wide, not
-  Model-F-specific; needs a new relayd-facing endpoint C3's `Reject` can call), a leg
-  stuck `AWAITING_DEPOSIT` because `upstream.CreateOrder` itself never succeeds (needs
-  a new C1 `{Screened, Refunded}` transition plus a per-state timestamp neither exists
-  today), and real per-vendor `EXPIRED` semantics (gated on R2/R4 — see
-  `internal/orchestrate/settle.go`'s own doc comment on why `EXPIRED` is treated
-  identically to `FAILED` post-`FORWARDED` for now).
+- **Shipped (13 Sep 2026), first slice:** a leg stuck unable to broadcast its own
+  forward transfer past `RELAYD_FORWARDING_TIMEOUT` is refunded automatically (reuses
+  C1's *existing* `Dispatching→Held→Refunded` transitions, zero `ledger/` changes), and
+  a leg whose forward transfer already confirmed but whose upstream swap then failed
+  lands `UNRECOVERABLE` and fires a real alert (`internal/alert`).
+- **Shipped (14 Sep 2026), the manual path:** the `HELD→REFUNDED` path via C3's own
+  hold-review queue is now wired end to end.
+  `screening/internal/holds.RelayAwareRefundEntryBuilder` calls a new relayd endpoint,
+  `GET /v1/relay-legs/{external_id}/refund-entry` (`driver.BuildRefundEntry`), which
+  computes the same entry shape `internal/orchestrate/refund.go`'s own timeout-triggered
+  path already posts; screening's existing `holds.Reject` submits it to C1 exactly as it
+  already does for every other tier (no change to `Reject` itself, only which
+  `RefundEntryBuilder` `cmd/screend` wires in — `SCREENING_RELAYD_BASE_URL`/`TOKEN`,
+  both optional, matching every other Model F cross-service dependency's own
+  "optional, degrades cleanly if unset" posture). relayd's own
+  `internal/orchestrate/refund.go`'s new `startExternallyRefundedLegs` phase notices a
+  RELAY order reached `refunded` by this path and carries it through the *same*
+  `advanceRefundPendingLegs` machinery the timeout-triggered refund already uses — no
+  new on-chain-broadcast code was needed, only a new trigger. For any non-RELAY order,
+  `RelayAwareRefundEntryBuilder` falls back to `StubRefundEntryBuilder`'s own
+  `ErrRefundEntryNotImplemented`, unchanged from before this landed. Restores the
+  build-prompts doc's own original R6 scenario, `ManuallyRejectedHoldGetsRefunded` (see
+  R6's own entry below).
+- **Still open:** a leg stuck `AWAITING_DEPOSIT` because `upstream.CreateOrder` itself
+  never succeeds (needs a new C1 `{Screened, Refunded}` transition plus a per-state
+  timestamp neither exists today), and real per-vendor `EXPIRED` semantics (gated on
+  R2/R4 — see `internal/orchestrate/settle.go`'s own doc comment on why `EXPIRED` is
+  treated identically to `FAILED` post-`FORWARDED` for now).
 
 ### R6 — replay ship-gate harness
 - **Scope:** `relayd`'s own `internal/replay` + `cmd/replay`, mirroring every sibling
@@ -144,29 +158,30 @@ the customer's own TRC20 address.
   funded→screened step directly via HTTP+DB (`internal/replay/ledgerfixture.go`,
   mirroring `internal/testledger`'s own identical fixture), the same way dispatcher's
   own replay harness never spins up a real `depositwatcher` either.
-- **Acceptance criteria, as shipped (13 Sep 2026) — deviates from this doc's own
-  original wording above, recorded here rather than silently:** the original scenario
-  mix ("a screening hold that resolves to refund," "an upstream `failed` before the
-  forward transfer") assumed R5 shipped in full. Since R5 shipped only a first slice
-  (see R5's own "Shipped" note above), the actual scenario mix is: a full successful
-  relay in **both** directions (TRC20→BEP20 and BEP20→TRC20 — stronger than the
-  original "a full successful relay," singular), a leg stuck unable to broadcast its
-  forward transfer → automatically refunded (this is what R5 actually built, and
-  stands in for both of the original doc's refund-triggering scenarios — relayd has no
-  distinct code path for "upstream failed before forward" today: it only ever learns an
-  upstream order's own status by polling it *after* its own forward transfer confirms,
-  so a pre-forward vendor failure is indistinguishable from any other reason the
-  forward attempt never completes), and an upstream `failed` *after* the forward
-  transfer (`UNRECOVERABLE`, a real alert fires exactly once). All four pass against a
-  real `ledgerd` — no C1 mocks, same rule C6.9 already enforces — confirmed by two real
-  runs (`go run ./cmd/replay`, seeds `1789317414438614000` and `424242`), both `ALL
-  PASSED`. One real bug this run itself found: the first FINAL ASSERTION draft asserted
-  every relay-leg suspense account closes to zero, which is *wrong* for an
-  `UNRECOVERABLE` leg — its own `asset:relay:leg:forwarding:<id>` account is supposed
-  to sit at the full forwarded amount forever (nothing ever posts a closing entry
-  against it, by design); fixed by excluding `UNRECOVERABLE` legs from that assertion
-  and adding a positive counterpart confirming the stranded balance is exactly right,
-  not just non-zero.
+- **Acceptance criteria, as shipped:** the scenario mix originally deviated from this
+  doc's own wording above (13 Sep 2026, when R5 had shipped only a first slice — a
+  pre-forward vendor failure and a screening hold both collapsed into one "stuck
+  forwarding" scenario, and the manual-reject scenario didn't exist yet). Once R5's
+  manual `HELD→REFUNDED` path landed (14 Sep 2026, see R5's own entry above), a fifth
+  scenario, `ManuallyRejectedHoldGetsRefunded`, was added, restoring this doc's own
+  original "a screening hold that resolves to refund" case for real. The scenario mix
+  as shipped: a full successful relay in **both** directions (TRC20→BEP20 and
+  BEP20→TRC20 — stronger than the original "a full successful relay," singular), a leg
+  stuck unable to broadcast its forward transfer → automatically refunded (still stands
+  in for "an upstream `failed` before the forward transfer" — relayd has no distinct
+  code path for that: it only ever learns an upstream order's own status by polling it
+  *after* its own forward transfer confirms), a held order manually rejected by a human
+  via C3 → refunded, and an upstream `failed` *after* the forward transfer
+  (`UNRECOVERABLE`, a real alert fires exactly once). All five pass against a real
+  `ledgerd` — no C1 mocks, same rule C6.9 already enforces — confirmed by multiple real
+  runs (`go run ./cmd/replay`, several different seeds), all `ALL PASSED`. One real bug
+  the very first of those runs found: the first FINAL ASSERTION draft asserted every
+  relay-leg suspense account closes to zero, which is *wrong* for an `UNRECOVERABLE`
+  leg — its own `asset:relay:leg:forwarding:<id>` account is supposed to sit at the
+  full forwarded amount forever (nothing ever posts a closing entry against it, by
+  design); fixed by excluding `UNRECOVERABLE` legs from that assertion and adding a
+  positive counterpart confirming the stranded balance is exactly right, not just
+  non-zero.
 
 ## Open items
 
