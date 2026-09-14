@@ -75,6 +75,9 @@ the customer's own TRC20 address.
   (d). No `relayd` code should be written against vendor-specific assumptions before
   this exists — this is the same posture C4's own "week-2 wholesale pricing calls"
   gate took before its routing weights were trusted.
+- **Shipped (14 Sep 2026):** FixedFloat (ff.io) chosen, commission mechanism — full
+  decision record appended to `model-f-relay-findings.md`'s own "R2 decision record"
+  section, including which criteria were independently confirmed vs. inferred.
 
 ### R3 — `relayd`: relay forwarder service
 - **Scope:** the state machine in `model-f-relay-architecture.md` §4, a
@@ -104,6 +107,25 @@ the customer's own TRC20 address.
     this chunk is called done — a vendor's documented API and its real behavior have
     diverged before in this codebase (see C4's CatFee rounding and propagation-delay
     bugs, both found only by a real proof run).
+- **Shipped (14 Sep 2026), the code — the proof run is still open:**
+  `relayd/internal/upstream/fixedfloat.go` implements `SwapProvider` against
+  FixedFloat's real v2 API (`POST /api/v2/price`/`/create`/`/order`, HMAC-SHA256
+  request signing per their own docs), gated behind `UPSTREAM_PROVIDER=fixedfloat`
+  with `FIXEDFLOAT_API_KEY`/`FIXEDFLOAT_API_SECRET`/`FIXEDFLOAT_CCY_USDT_TRC20`/
+  `FIXEDFLOAT_CCY_USDT_BEP20` all required, no defaults (`cmd/relayd/upstream_provider.go`).
+  One real API-shape wrinkle: FixedFloat's own status check needs both an order id and a
+  separate security token, but `SwapProvider.GetOrder` takes one opaque string — worked
+  around by packing `"id|token"` into the single `ProviderOrderID` `CreateOrder` returns
+  rather than changing the interface (see that file's own top-of-file doc comment).
+  Unit-tested against a fake HTTP server (request signing, currency-code mapping,
+  status mapping, the id/token packing round-trip) — **this acceptance criterion's own
+  real-money proof run has NOT happened**: nobody has yet placed one real order against
+  FixedFloat's production API and confirmed the response actually matches what this
+  code assumes. The two currency-code env vars also still need verifying against a live
+  `GET /api/v2/ccies` response (see `model-f-relay-findings.md`'s own R2 decision
+  record) before that proof run can mean anything. Until both happen, treat this as
+  code-complete but unproven, the same distinction R6's own replay-vs-real-run posture
+  already draws elsewhere in this doc.
 
 ### R5 — refund path
 - **Scope:** `HELD`→`REFUNDED`, `EXPIRED`→`REFUND_PENDING`→`REFUNDED`, and the
@@ -158,10 +180,16 @@ the customer's own TRC20 address.
   and refunding"), just checked against a different clock. Restores the R6 scenario
   mix's own missing case, `StuckAwaitingDepositLegAutomaticallyRefunded` (see R6's own
   entry below).
-- **Still open:** real per-vendor `EXPIRED` semantics (gated on R2/R4 — see
-  `internal/orchestrate/settle.go`'s own doc comment on why `EXPIRED` is
-  treated identically to `FAILED` post-`FORWARDED` for now). This is the only remaining
-  R5 gap, and it is real-vendor-shaped: nothing left to build without one.
+- **Still open:** real per-vendor `EXPIRED` semantics. R2/R4 are no longer the blocker
+  (FixedFloat is chosen and wired, and its own `EMERGENCY` status already maps to
+  `SwapStatus` -- see `statusFromFixedFloat` in `internal/upstream/fixedfloat.go`), but
+  `internal/orchestrate/settle.go` still treats `StatusExpired` identically to
+  `StatusFailed` post-`FORWARDED` -- a real implementation needs to read FixedFloat's
+  own `emergency.choice` field (`NONE`/`EXCHANGE`/`REFUND`) from a live `GET
+  /api/v2/order` response to know whether the vendor already auto-refunded its own
+  receipt, something no unit test against a fake server can confirm on its own. This is
+  genuinely separate, not-yet-started work, left for its own chunk rather than folded
+  into R4's own vendor-wiring pass.
 
 ### R6 — replay ship-gate harness
 - **Scope:** `relayd`'s own `internal/replay` + `cmd/replay`, mirroring every sibling

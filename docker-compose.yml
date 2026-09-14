@@ -397,15 +397,31 @@ services:
       # own BEP20_TO_TRC20 forward leg broadcasts a real transaction
       # through this).
       RELAYD_BSC_RPC_URL: ${RELAYD_BSC_RPC_URL:?set RELAYD_BSC_RPC_URL in .env -- see .env.proofrun.example}
-      # No real upstream swap-vendor integration exists yet (R2/R4 in
-      # docs/03-build/model-f-relay-build-prompts.md are still open
-      # business decisions) -- this default runs relayd against
-      # upstream.PlaceholderProvider, which always returns
-      # ErrNoVendorConfigured. Override BOTH vars together once a real
-      # vendor is chosen and wired (internal/upstream's own
-      # dependency_test.go documents the pattern to follow).
+      # R2's decision record (docs/01-strategy/model-f-relay-findings.md)
+      # names FixedFloat as the real vendor; R4 wired it in
+      # (internal/upstream/fixedfloat.go). Still defaults to
+      # PlaceholderProvider here, though -- a fresh clone/deploy should
+      # never silently start routing real orders through a real vendor
+      # just because an operator's own shell happened to have
+      # UPSTREAM_PROVIDER set from a different project. Set
+      # UPSTREAM_PROVIDER=fixedfloat explicitly (in .env, not here) to
+      # switch this deployment to the real vendor.
       UPSTREAM_PROVIDER: ${UPSTREAM_PROVIDER:-placeholder}
       UPSTREAM_ALLOW_PLACEHOLDER: ${UPSTREAM_ALLOW_PLACEHOLDER:-true}
+      # FixedFloat's own credentials and currency-code mapping --
+      # required only when UPSTREAM_PROVIDER=fixedfloat, but always
+      # passed through so that switching the provider var alone is
+      # enough. No defaults for any of these: an empty value fails loud
+      # inside NewFixedFloatProvider rather than silently signing
+      # requests with an empty secret. FIXEDFLOAT_CCY_USDT_TRC20/BEP20
+      # must be verified against a real GET /api/v2/ccies response
+      # before going live -- see internal/upstream/fixedfloat.go's own
+      # top-of-file doc comment on why this file doesn't guess a ticker.
+      FIXEDFLOAT_API_KEY: ${FIXEDFLOAT_API_KEY:-}
+      FIXEDFLOAT_API_SECRET: ${FIXEDFLOAT_API_SECRET:-}
+      FIXEDFLOAT_REFCODE: ${FIXEDFLOAT_REFCODE:-}
+      FIXEDFLOAT_CCY_USDT_TRC20: ${FIXEDFLOAT_CCY_USDT_TRC20:-}
+      FIXEDFLOAT_CCY_USDT_BEP20: ${FIXEDFLOAT_CCY_USDT_BEP20:-}
       # Commission basis points relayd withholds from the deposited
       # (in-)asset -- see internal/orchestrate's own package doc comment
       # on why the commission always comes out of amount_in, never out

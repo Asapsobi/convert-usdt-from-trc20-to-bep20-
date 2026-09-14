@@ -54,3 +54,36 @@ a real vendor, which is R2 in `docs/03-build/model-f-relay-build-prompts.md`.
   sheet (mechanism 1 above) at a size worth building for. If none does, mechanism 2 is
   the only option, and the public-page ban above becomes load-bearing rather than
   optional.
+
+## R2 decision record (14 Sep 2026)
+
+**Chosen vendor: FixedFloat (ff.io).** Pricing mechanism: **commission** (mechanism 1
+above) — FixedFloat's own affiliate program pays a share of their margin per
+qualifying order, rather than this system quoting its own marked-up rate.
+
+Evaluated against three real candidates (ChangeNOW, SimpleSwap, StealthEX) on the four
+criteria `docs/03-build/model-f-relay-build-prompts.md`'s own R2 section lists:
+documented quote/create/status API, an arbitrary destination address distinct from any
+account of this system's own, a real partner/affiliate terms sheet (not just a retail
+UI), and current terms confirming automated commercial resale is permitted. FixedFloat
+was the only one of the three with (d) independently confirmed from their own public
+API Terms of Use rather than inferred: **API Terms of Use §6** names a dedicated "For
+commercial use with the affiliate program" API key type, with its own application/
+approval process — see https://ff.io/en/api-terms. (b)/(a) are confirmed directly
+against their own v2 API (`POST /api/v2/price`, `/create`, `/order` — a required
+`toAddress` param on order creation). (c): commission is paid automatically per
+completed order via their affiliate program, integrated through the same API key.
+
+Not independently re-verified here: the exact FixedFloat currency codes for USDT on
+TRC20/BEP20 (used `USDTTRC`/`USDTBSC` as working assumptions in R4's own code, per
+public FixedFloat pages — see `relayd/internal/upstream/fixedfloat.go`'s own doc
+comment). Whoever operates this integration for real must confirm both against a live
+`GET /api/v2/ccies` response before routing real orders — R4's own config
+(`FIXEDFLOAT_CCY_USDT_TRC20`/`FIXEDFLOAT_CCY_USDT_BEP20`) has no default specifically
+so this can't be skipped silently.
+
+R4 (wiring): `relayd/internal/upstream/fixedfloat.go` implements `SwapProvider`
+against FixedFloat's real v2 API, gated behind `UPSTREAM_PROVIDER=fixedfloat` (see
+`cmd/relayd/upstream_provider.go`). Not yet proven against FixedFloat's own live API or
+a real R6 replay run — this repo's own "prove it against something real, not just unit
+tests" discipline still applies before this is considered shipped, not just wired.
