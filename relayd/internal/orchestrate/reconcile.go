@@ -12,16 +12,17 @@
 // (FORWARDED), or one waiting on a human S1 approval that never comes
 // (REFUND_PENDING).
 //
-// Deliberately does NOT cover AWAITING_DEPOSIT, the one status every
-// other timeout mechanism in this package also declines to touch (see
-// refund.go's own top-of-file doc comment): a leg's own local UpdatedAt
-// never advances past its original quote-time CreatedAt while still
-// AWAITING_DEPOSIT (no Mark<State> call has fired yet), so it cannot
-// distinguish "no deposit has arrived yet" (legitimately open-ended,
-// nothing to alarm about) from "a deposit arrived and something is
-// stuck" without either a new relay_legs timestamp or a C1-exposed
-// per-state one, neither of which exists today -- the exact same gap
-// refund.go already flags, not a new one introduced here.
+// Deliberately does NOT cover AWAITING_DEPOSIT. That status doesn't need
+// this alarm's kind of passive visibility: refund.go's own
+// refundStuckAwaitingDepositLegs already actively recovers it (a leg's
+// own local UpdatedAt never advances past its original quote-time
+// CreatedAt while still AWAITING_DEPOSIT, since no Mark<State> call
+// fires until it leaves that status -- so refund.go tracks a dedicated
+// relay_legs.forward_attempt_started_at timestamp instead, set once the
+// first time a deposit is actually observed, rather than reusing
+// UpdatedAt the way staleCheckedStatuses below can for every other
+// status). An alarm here would be redundant with that recovery path,
+// not a gap.
 package orchestrate
 
 import (
