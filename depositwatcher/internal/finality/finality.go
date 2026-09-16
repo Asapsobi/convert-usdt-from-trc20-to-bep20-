@@ -120,6 +120,20 @@ type Candidate struct {
 
 	alertedStale bool
 	contradicted bool // set once a post-final reorg has been logged for this candidate -- see handlePostFinalReorg
+
+	// asyncConfirmations is Design B's own per-provider confirmation
+	// state (async.go, Phase 1) -- nil until CheckFinalityAsync first
+	// touches this candidate (async_driver.go, Phase 2). Design A's own
+	// code paths (OnLogObserved, CheckFinality, checkPostFinalReorgs)
+	// never read or write this field, so they are completely unaffected
+	// by its presence.
+	asyncConfirmations *CandidateConfirmations
+	// alertedDisagreement mirrors alertedStale's own "fire once" pattern
+	// (see checkStalePending) for Design B's own DISAGREEMENT_ALERT --
+	// Config.OnDisagreement is called exactly once per candidate, the
+	// first tick its async confirmations enter that state, never again
+	// on every subsequent tick it remains there.
+	alertedDisagreement bool
 }
 
 // FinalHandler is invoked exactly once for each candidate the moment it
@@ -186,6 +200,27 @@ type Config struct {
 	ReorgReporter           ReorgReporter
 	OrphanedDepositRecorder OrphanedDepositRecorder
 
+	// OnDisagreement is Design B's own alert hook (async_driver.go,
+	// Phase 2) -- optional, nil means "log only" (CheckFinalityAsync
+	// always logs at slog.Error regardless, matching
+	// handlePostFinalReorg's own posture; this hook is for a caller that
+	// wants real paging/alerting on top, the same relationship
+	// OnStalePending already has to its own logging). Called exactly
+	// once per candidate, never on every tick it remains in
+	// DISAGREEMENT_ALERT. Never used by Design A's own CheckFinality.
+	OnDisagreement func(c Candidate, note string)
+
+	// AsyncMinAgreement is Design B's own quorum size, reusing the exact
+	// same chain.Config.MinAgreement value the caller already configured
+	// on the chain.Pool this Tracker is used with -- passed here too
+	// (rather than read off the Pool internally) because
+	// finality.Config is constructed independently of any particular
+	// chain.Pool, mirroring ContractAddress/TransferTopic's own
+	// "caller's job to keep in sync" posture. Required only if
+	// CheckFinalityAsync is ever actually called; CheckFinality (Design
+	// A) never reads this field.
+	AsyncMinAgreement int
+
 	// Metrics is optional -- nil means no metrics are recorded, never a
 	// panic. C2.9's httpapi.Metrics implements this to drive
 	// candidates_detected_total/candidates_finalized_total.
@@ -234,6 +269,15 @@ type Tracker struct {
 	mu        sync.Mutex
 	pending   map[candidateKey]*Candidate
 	finalized map[candidateKey]*Candidate // invariant 4: once finalized, never re-tracked or re-finalized -- kept (not just a bool) so a later tick can re-verify it's still genuinely final
+
+	// heightMonitor is Design B's own cross-candidate, cross-tick
+	// monotonicity guard (async.go's ProviderHeightMonitor, Phase 1) --
+	// one per Tracker, not per candidate, since a provider's own
+	// finalized-height regression is a fact about that provider, not
+	// about any single deposit. Lazily created on first use by
+	// CheckFinalityAsync; nil (and never touched) for a Tracker that
+	// only ever runs Design A's own CheckFinality.
+	heightMonitor *ProviderHeightMonitor
 }
 
 // New validates cfg and returns a ready-to-use Tracker.
@@ -483,7 +527,12 @@ func (t *Tracker) HandleUnreportable(ctx context.Context, c Candidate, c1Error e
 // re-checked every tick) -- an accepted, documented cost at this
 // system's real scale (~100 deposits/day, per component-map.md), not a
 // design that would still be right at a much larger one.
-func (t *Tracker) checkPostFinalReorgs(ctx context.Context, pool *chain.Pool) {
+// pool is AsyncChainQuerier (async_driver.go), not the concrete
+// *chain.Pool -- widened so CheckFinalityAsync can call this shared
+// method too, passing whatever satisfies the interface. A concrete
+// *chain.Pool (what CheckFinality's own call below actually passes)
+// trivially satisfies it, so this change is non-breaking for Design A.
+func (t *Tracker) checkPostFinalReorgs(ctx context.Context, pool AsyncChainQuerier) {
 	byHeight := make(map[uint64][]*Candidate)
 	t.mu.Lock()
 	for _, c := range t.finalized {

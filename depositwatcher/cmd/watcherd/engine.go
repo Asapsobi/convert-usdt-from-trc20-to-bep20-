@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -97,9 +98,59 @@ func newEngineFromEnv(pool *db.Pool) (*engine, error) {
 		}
 		providers = append(providers, chain.Provider{Name: name, Client: client})
 	}
-	chainPool, err := chain.NewPool(providers, chain.Config{})
+	// WATCHER_MIN_AGREEMENT is optional -- unset means 0, which
+	// chain.NewPool already treats as "use its own built-in default of
+	// 2" (chain/pool.go), so omitting this var reproduces today's exact,
+	// previously-hardcoded chain.Config{} behavior byte for byte. This
+	// only makes chain.Pool's own already-general N-of-M quorum support
+	// reachable from configuration -- it introduces no new default and
+	// no new algorithm (see chain/agreement.go).
+	var minAgreement int
+	if raw := os.Getenv("WATCHER_MIN_AGREEMENT"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			return nil, fmt.Errorf("watcherd: WATCHER_MIN_AGREEMENT: %w", err)
+		}
+		minAgreement = parsed
+	}
+	chainPool, err := chain.NewPool(providers, chain.Config{MinAgreement: minAgreement})
 	if err != nil {
 		return nil, fmt.Errorf("watcherd: building RPC provider pool: %w", err)
+	}
+	// effectiveMinAgreement mirrors chain.NewPool's own "<=0 means 2"
+	// default resolution (chain/pool.go) -- computed here, once, so
+	// Design B's own AsyncMinAgreement (finality.Config, below) uses the
+	// SAME effective quorum size Design A's chainPool just applied,
+	// rather than silently regressing to NewCandidateConfirmations' own
+	// unrelated "<1 means 1" clamp (async.go), which would make async
+	// mode's default quorum a single provider -- exactly the
+	// height-alone-is-a-vote failure mode this whole redesign exists to
+	// prevent.
+	effectiveMinAgreement := minAgreement
+	if effectiveMinAgreement <= 0 {
+		effectiveMinAgreement = 2
+	}
+
+	// WATCHER_FINALITY_MODE=async is double-gated behind
+	// WATCHER_ALLOW_ASYNC_FINALITY=true, the same convention this
+	// project already uses for SCREENING_PROVIDER=always_clean and
+	// UPSTREAM_PROVIDER=placeholder -- a safety-relevant, unproven-in-
+	// production mode must never be reachable through one mistyped env
+	// var. Unset (the default) is Design A, byte-identical to every
+	// deployment's behavior before Phase 2.
+	asyncFinality := false
+	switch mode := os.Getenv("WATCHER_FINALITY_MODE"); mode {
+	case "", "sync":
+		// Design A, the default.
+	case "async":
+		if os.Getenv("WATCHER_ALLOW_ASYNC_FINALITY") != "true" {
+			return nil, errors.New("watcherd: WATCHER_FINALITY_MODE=async also requires " +
+				"WATCHER_ALLOW_ASYNC_FINALITY=true (Design B is not yet proven in production; " +
+				"this double gate exists so it can't be reached by one mistyped env var)")
+		}
+		asyncFinality = true
+	default:
+		return nil, fmt.Errorf("watcherd: WATCHER_FINALITY_MODE: unrecognized value %q (want \"\", \"sync\", or \"async\")", mode)
 	}
 
 	if err := bootstrapCursorIfFresh(context.Background(), chainPool, pool); err != nil {
@@ -145,6 +196,7 @@ func newEngineFromEnv(pool *db.Pool) (*engine, error) {
 			ContractAddress: common.HexToAddress(contractAddress),
 			TransferTopic:   transferEventTopic,
 			DustFloor:       dustFloor,
+			AsyncFinality:   asyncFinality,
 		},
 	}
 
@@ -154,6 +206,7 @@ func newEngineFromEnv(pool *db.Pool) (*engine, error) {
 		OnFinal:                 ledger.ReportDepositFinal,
 		ReorgReporter:           ledger,
 		OrphanedDepositRecorder: orphanedRecorder{pool: pool, ledger: ledger},
+		AsyncMinAgreement:       effectiveMinAgreement,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("watcherd: building finality tracker: %w", err)

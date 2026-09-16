@@ -528,7 +528,12 @@ func TestReportDepositFinal_HappyPath(t *testing.T) {
 	order := ll.createOrder(externalID, customerID, testAmountIn, testAmountOut, testFee, testNetworkFee)
 
 	depositAcc := fmt.Sprintf("asset:bsc:deposit:%d", order.ID)
-	custBEP := "liability:customer:" + customerID
+	// :USDT_BEP20 suffix required -- matches reportDepositFinal's own
+	// real customerAccount construction exactly (ledgerclient.go). Was
+	// missing here (a pre-existing gap, predating this session's own
+	// change -- harmless until now since this is the only test in this
+	// file that actually asserts on this balance).
+	custBEP := "liability:customer:" + customerID + ":USDT_BEP20"
 	ll.createAccount(depositAcc, "ASSET", "USDT_BEP20", 1)
 	ll.createAccount(custBEP, "LIABILITY", "USDT_BEP20", -1)
 
@@ -726,5 +731,165 @@ func TestReportDepositFinal_QuotedToFundedIsNeverHaltBlocked(t *testing.T) {
 	after := ll.getOrder(externalID)
 	if after.State != "funded" {
 		t.Fatalf("order state while halted = %q, want funded (deposit recording is documented to work while halted)", after.State)
+	}
+}
+
+// ---------------------------------------------------------------------
+// RELAY-tier (Model F) deposit routing -- the real C2->relayd seam.
+//
+// These exercise the ACTUAL boundary between this service's real
+// ReportDepositFinal and relayd's own real account-code expectations,
+// against a real ledgerd -- not relayd/internal/replay's own in-process
+// fixture, which posts directly into "asset:relay:leg:<id>" and so could
+// never have caught this account name ever having drifted from what
+// this client's own production code actually sends (see
+// ledgerclient.go's own reportDepositFinal doc comment for the full
+// story of how that drift happened and why it was invisible to the
+// replay suite).
+
+// createRelayOrder mirors createOrder exactly except tier -- a separate
+// helper rather than adding a tier parameter to createOrder itself, so
+// this fix's own diff stays minimal and every existing call site (every
+// other test in this file) is untouched.
+func (ll *liveLedger) createRelayOrder(externalID, customerID, amountIn, amountOut, fee, networkFee string) orderResp {
+	ll.t.Helper()
+	now := time.Now().UTC()
+	resp, body := ll.do(http.MethodPost, "/v1/orders", "create:"+externalID, map[string]any{
+		"external_id":       externalID,
+		"customer_id":       customerID,
+		"tier":              "RELAY",
+		"amount_in":         amountIn,
+		"amount_out":        amountOut,
+		"amount_in_asset":   "USDT_BEP20", // required for tier=RELAY -- BEP20_TO_TRC20 direction, matching this file's own BEP20-deposit scenarios
+		"amount_out_asset":  "USDT_TRC20",
+		"fee_units":         fee,
+		"network_fee_units": networkFee,
+		"recipient_address": "T-recipient-" + externalID,
+		"quoted_at":         now,
+		"quote_expires_at":  now.Add(10 * time.Minute),
+	})
+	if resp.StatusCode != http.StatusCreated {
+		ll.t.Fatalf("POST /v1/orders (tier=RELAY) for %s: status %d: %s", externalID, resp.StatusCode, body)
+	}
+	var o orderResp
+	if err := json.Unmarshal(body, &o); err != nil {
+		ll.t.Fatalf("decoding order response: %v: %s", err, body)
+	}
+	return o
+}
+
+// TestReportDepositFinal_RelayTier_PostsToRelayLegAccount is this fix's
+// own core regression test: for a RELAY-tier order, the REAL
+// ReportDepositFinal call (not a fixture standing in for it) must post
+// into "asset:relay:leg:<order_id>" -- the exact account relayd's own
+// orchestrate.go reads from -- never into Model D's
+// "asset:bsc:deposit:<order_id>", which relayd never looks at.
+func TestReportDepositFinal_RelayTier_PostsToRelayLegAccount(t *testing.T) {
+	ll := startLiveLedger(t)
+	externalID := "c27-relay-" + fmt.Sprint(time.Now().UnixNano())
+	customerID := "c27-relay-cust-" + fmt.Sprint(time.Now().UnixNano())
+	order := ll.createRelayOrder(externalID, customerID, testAmountIn, testAmountOut, testFee, testNetworkFee)
+
+	relayLegAcc := fmt.Sprintf("asset:relay:leg:%d", order.ID)
+	wrongModelDAcc := fmt.Sprintf("asset:bsc:deposit:%d", order.ID)
+	// :USDT_BEP20 suffix required -- matches reportDepositFinal's own
+	// real customerAccount construction exactly (ledgerclient.go).
+	custBEP := "liability:customer:" + customerID + ":USDT_BEP20"
+	ll.createAccount(relayLegAcc, "ASSET", "USDT_BEP20", 1)
+	ll.createAccount(custBEP, "LIABILITY", "USDT_BEP20", -1)
+
+	amount := money.Amount(3000_000000) // matches testAmountIn
+	candidate := newDepositCandidate(order, customerID, amount)
+
+	client := ledgerclient.New(ledgerBaseURL, ledgerAPIToken)
+	if err := client.ReportDepositFinal(context.Background(), candidate); err != nil {
+		t.Fatalf("ReportDepositFinal: %v", err)
+	}
+
+	after := ll.getOrder(externalID)
+	if after.State != "funded" {
+		t.Fatalf("order state after ReportDepositFinal = %q, want funded", after.State)
+	}
+
+	if got := ll.accountBalance(relayLegAcc); got != testAmountIn {
+		t.Errorf("asset:relay:leg:%d balance = %s, want %s (relayd's own suspense account must hold the real deposit)",
+			order.ID, got, testAmountIn)
+	}
+	custBalance := ll.accountBalance(custBEP)
+	if parseMinorUnits(t, custBalance) != -parseMinorUnits(t, testAmountIn) {
+		t.Errorf("customer liability balance = %s, want the negation of %s", custBalance, testAmountIn)
+	}
+
+	// The regression this test exists to catch: before this fix, the
+	// deposit landed HERE instead, silently, while relayd's own
+	// screened->dispatching entry tried (and failed to find funds in)
+	// asset:relay:leg:<id>. Confirm the old account was never even
+	// CREATED for a RELAY-tier order -- ll.accountBalance itself
+	// t.Fatalf's on a non-200, so this checks the raw status directly:
+	// a 404 (never created) is the correct, stronger proof that nothing
+	// was ever posted there, not just that its balance nets to zero.
+	resp, body := ll.do(http.MethodGet, "/v1/accounts/"+wrongModelDAcc+"/balance", "", nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("GET /v1/accounts/%s/balance = status %d (%s), want 404 (Model D's own account must never be created for a RELAY order)",
+			wrongModelDAcc, resp.StatusCode, body)
+	}
+}
+
+// TestRelayTierDeposit_ScreenedToDispatching_ConsumesWithoutGoingNegative
+// proves the OTHER half of the seam: once a real deposit has landed via
+// ReportDepositFinal, relayd's own screened->dispatching entry (mirrored
+// here exactly -- same account codes, same line shape as
+// relayd/internal/orchestrate/orchestrate.go's own postForwardStartEntry
+// and relayLegAccountCode/relayLegForwardingAccountCode; relayd's own Go
+// code cannot be imported directly, separate module) must be able to
+// fully consume that balance: asset:relay:leg:<id> nets to EXACTLY zero
+// afterward, never negative, with the full amount having moved into the
+// forwarding suspense account.
+func TestRelayTierDeposit_ScreenedToDispatching_ConsumesWithoutGoingNegative(t *testing.T) {
+	ll := startLiveLedger(t)
+	externalID := "c27-relay-consume-" + fmt.Sprint(time.Now().UnixNano())
+	customerID := "c27-relay-consume-cust-" + fmt.Sprint(time.Now().UnixNano())
+	order := ll.createRelayOrder(externalID, customerID, testAmountIn, testAmountOut, testFee, testNetworkFee)
+
+	relayLegAcc := fmt.Sprintf("asset:relay:leg:%d", order.ID)
+	forwardingAcc := fmt.Sprintf("asset:relay:leg:forwarding:%d", order.ID)
+	custBEP := "liability:customer:" + customerID
+	ll.createAccount(relayLegAcc, "ASSET", "USDT_BEP20", 1)
+	ll.createAccount(forwardingAcc, "ASSET", "USDT_BEP20", 1)
+	ll.createAccount(custBEP, "LIABILITY", "USDT_BEP20", -1)
+
+	candidate := newDepositCandidate(order, customerID, money.Amount(3000_000000))
+	client := ledgerclient.New(ledgerBaseURL, ledgerAPIToken)
+	if err := client.ReportDepositFinal(context.Background(), candidate); err != nil {
+		t.Fatalf("ReportDepositFinal: %v", err)
+	}
+
+	// funded -> screened, C3's own real transition shape (screening/internal/ledgerclient.go's
+	// own ReleaseHold: no entry, just the state change).
+	funded := ll.getOrder(externalID)
+	screened := ll.transition(externalID, "screen:"+externalID, "screened", funded.Version, nil)
+
+	// screened -> dispatching, relayd's own real "relay_forward_start"
+	// entry shape.
+	ll.transition(externalID, "forward_start:"+externalID, "dispatching", screened.Version, map[string]any{
+		"entry_type":  "relay_forward_start",
+		"occurred_at": time.Now().UTC().Format(time.RFC3339),
+		"lines": []map[string]any{
+			{"account_code": forwardingAcc, "asset": "USDT_BEP20", "amount": testAmountIn},
+			{"account_code": relayLegAcc, "asset": "USDT_BEP20", "amount": "-" + testAmountIn},
+		},
+	})
+
+	if got := ll.accountBalance(relayLegAcc); got != "0.000000" {
+		t.Errorf("asset:relay:leg:%d balance after forwarding started = %s, want exactly 0.000000 (fully consumed, never negative)",
+			order.ID, got)
+	}
+	if got := ll.accountBalance(forwardingAcc); got != testAmountIn {
+		t.Errorf("asset:relay:leg:forwarding:%d balance = %s, want %s", order.ID, got, testAmountIn)
+	}
+
+	after := ll.getOrder(externalID)
+	if after.State != "dispatching" {
+		t.Fatalf("order state after relay_forward_start = %q, want dispatching", after.State)
 	}
 }

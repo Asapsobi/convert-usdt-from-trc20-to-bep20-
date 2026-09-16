@@ -31,6 +31,31 @@ func twoNodePool(t *testing.T, minAgreement int) (pool *Pool, a, b *fakeNode) {
 	return pool, a, b
 }
 
+// threeNodePool mirrors twoNodePool exactly, for Step 1's own N-of-M
+// quorum tests (a 3rd+ configured provider was previously silently
+// ignored by LogsAt -- see logs.go's own doc comment on why that
+// defeated the whole point of adding one).
+func threeNodePool(t *testing.T, minAgreement int) (pool *Pool, a, b, c *fakeNode) {
+	t.Helper()
+	a, b, c = newFakeNode(), newFakeNode(), newFakeNode()
+	clientA, srvA := a.client()
+	clientB, srvB := b.client()
+	clientC, srvC := c.client()
+	t.Cleanup(srvA.Close)
+	t.Cleanup(srvB.Close)
+	t.Cleanup(srvC.Close)
+
+	pool, err := NewPool([]Provider{
+		{Name: "A", Client: clientA},
+		{Name: "B", Client: clientB},
+		{Name: "C", Client: clientC},
+	}, Config{MinAgreement: minAgreement})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	return pool, a, b, c
+}
+
 func hash(b byte) common.Hash {
 	var h common.Hash
 	h[31] = b
@@ -339,5 +364,93 @@ func TestLogsAt_PrimaryErrors_HardError(t *testing.T) {
 		common.HexToAddress("0x55d398326f99059fF775485246999027B3197955"), nil)
 	if err == nil {
 		t.Fatal("expected an error when the primary provider fails")
+	}
+}
+
+// ---------------------------------------------------------------------
+// LogsAt -- Step 1's own N-of-M quorum tests. Before this change, LogsAt
+// only ever consulted providers[0]/providers[1] no matter how many were
+// configured -- a 3rd provider (C, here) was silently never queried.
+// ---------------------------------------------------------------------
+
+// TestLogsAt_ThreeProviders_TwoAgreeOneDisagrees_SucceedsOnQuorum proves
+// a 3rd configured provider now actually participates: with
+// MinAgreement=2, A and B agreeing is enough even though C reports
+// something different -- the exact liveness improvement Step 1 exists
+// to deliver (a lagging/disagreeing single provider no longer blocks
+// finalization outright when a quorum of the others agree).
+func TestLogsAt_ThreeProviders_TwoAgreeOneDisagrees_SucceedsOnQuorum(t *testing.T) {
+	pool, a, b, c := threeNodePool(t, 2)
+	agreed := []types.Log{sampleLog(100, 0), sampleLog(100, 1)}
+	a.setLogs(agreed)
+	b.setLogs(agreed)
+	c.setLogs([]types.Log{sampleLog(100, 0)}) // C is missing a log -- disagrees
+
+	got, err := pool.LogsAt(context.Background(), 100, 100,
+		common.HexToAddress("0x55d398326f99059fF775485246999027B3197955"), nil)
+	if err != nil {
+		t.Fatalf("expected success on a 2-of-3 quorum, got %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected the agreed 2-log result, got %d logs", len(got))
+	}
+
+	health := pool.ProviderHealthSnapshot()
+	for _, h := range health {
+		if h.Name == "C" && h.ConsecutiveFailures == 0 {
+			t.Error("expected C's disagreement to be recorded as a failure, got 0 consecutive failures")
+		}
+		if (h.Name == "A" || h.Name == "B") && h.ConsecutiveFailures != 0 {
+			t.Errorf("expected %s (in the winning group) to have 0 consecutive failures, got %d", h.Name, h.ConsecutiveFailures)
+		}
+	}
+}
+
+// TestLogsAt_ThreeProviders_AllPairwiseDisagree_HardError proves quorum
+// requires an ACTUAL group of minAgreement, not just "more providers
+// means more chances" -- three providers each reporting a distinct
+// answer never reaches a quorum of 2, and must hard-fail exactly like
+// the 2-provider case does.
+func TestLogsAt_ThreeProviders_AllPairwiseDisagree_HardError(t *testing.T) {
+	pool, a, b, c := threeNodePool(t, 2)
+	a.setLogs([]types.Log{sampleLog(100, 0)})
+	b.setLogs([]types.Log{sampleLog(100, 0), sampleLog(100, 1)})
+	c.setLogs([]types.Log{sampleLog(100, 0), sampleLog(100, 1), sampleLog(100, 2)})
+
+	_, err := pool.LogsAt(context.Background(), 100, 100,
+		common.HexToAddress("0x55d398326f99059fF775485246999027B3197955"), nil)
+	if !errors.Is(err, ErrLogMismatch) {
+		t.Fatalf("expected ErrLogMismatch when no group reaches quorum, got %v", err)
+	}
+	if !errors.Is(err, ErrNoAgreement) {
+		t.Fatalf("expected the wrapped error to also satisfy ErrNoAgreement, got %v", err)
+	}
+}
+
+// TestLogsAt_ThreeProviders_TwoDistinctPairsBothReachQuorum_Ambiguous
+// covers the tie case resolveAgreement shares with LatestFinalized: with
+// MinAgreement=2 and 4 providers split 2-and-2 across two DIFFERENT
+// answers, neither group is unambiguously the largest -- must hard-fail,
+// never silently pick one side.
+func TestLogsAt_ThreeProviders_TwoDistinctPairsBothReachQuorum_Ambiguous(t *testing.T) {
+	d := newFakeNode()
+	clientD, srvD := d.client()
+	t.Cleanup(srvD.Close)
+
+	pool, a, b, c := threeNodePool(t, 2)
+	pool.providers = append(pool.providers, Provider{Name: "D", Client: clientD})
+	pool.health["D"] = &health{}
+
+	logsX := []types.Log{sampleLog(100, 0)}
+	logsY := []types.Log{sampleLog(100, 0), sampleLog(100, 1)}
+	a.setLogs(logsX)
+	b.setLogs(logsX)
+	c.setLogs(logsY)
+	d.setLogs(logsY)
+
+	_, err := pool.LogsAt(context.Background(), 100, 100,
+		common.HexToAddress("0x55d398326f99059fF775485246999027B3197955"), nil)
+	if !errors.Is(err, ErrAmbiguousAgreement) {
+		t.Fatalf("expected ErrAmbiguousAgreement for a 2-vs-2 split on different answers, got %v", err)
 	}
 }

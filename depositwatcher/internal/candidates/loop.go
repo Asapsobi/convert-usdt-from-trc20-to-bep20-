@@ -116,6 +116,17 @@ func runTick(ctx context.Context, pool *chain.Pool, database *db.Pool, quotes Qu
 		}
 	}
 
+	// Design B is only ever reached via cfg.AsyncFinality, itself only
+	// ever set true through cmd/watcherd's own double-gated
+	// WATCHER_FINALITY_MODE=async + WATCHER_ALLOW_ASYNC_FINALITY=true --
+	// every other caller (including every existing test in this
+	// package) gets exactly today's CheckFinality call, unchanged.
+	if cfg.AsyncFinality {
+		if err := tracker.CheckFinalityAsync(ctx, pool); err != nil {
+			return fmt.Errorf("candidates: checking finality (async): %w", err)
+		}
+		return nil
+	}
 	if err := tracker.CheckFinality(ctx, pool); err != nil {
 		return fmt.Errorf("candidates: checking finality: %w", err)
 	}

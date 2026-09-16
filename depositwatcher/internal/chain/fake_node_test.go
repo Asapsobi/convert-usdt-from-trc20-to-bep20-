@@ -227,7 +227,25 @@ func (n *fakeNode) handleGetBlockByNumber(w http.ResponseWriter, req rpcRequest)
 		writeRPCResult(w, req.ID, nil) // a real node returns JSON null for a block that doesn't exist yet
 		return
 	}
-	writeRPCResult(w, req.ID, header)
+	// A real node's eth_getBlockByNumber response is a rich block object
+	// with "hash" as its own top-level field (the header's own computed
+	// hash) alongside every raw header field -- unlike types.Header's own
+	// default JSON marshaling (used for RLP/hash computation, and so
+	// deliberately omits the derived hash itself). Phase 2's own
+	// BlockHashAt (single_provider.go) needs a real "hash" field to
+	// parse, exactly like the "finalized" branch above already provides
+	// one -- synthesized here via the same real header.Hash() the go-
+	// ethereum client itself would compute, not a fixture-only shortcut.
+	body, err := json.Marshal(header)
+	if err != nil {
+		panic(err) // fixture bug, not a test assertion
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(body, &fields); err != nil {
+		panic(err)
+	}
+	fields["hash"] = header.Hash().Hex()
+	writeRPCResult(w, req.ID, fields)
 }
 
 func writeRPCResult(w http.ResponseWriter, id json.RawMessage, result any) {

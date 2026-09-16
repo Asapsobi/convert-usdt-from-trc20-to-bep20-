@@ -65,6 +65,25 @@ type Order struct {
 	State      string `json:"state"`
 	AmountIn   string `json:"amount_in"` // decimal string, always USDT_BEP20 -- see money.ParseDecimal
 	Version    int32  `json:"version"`
+	// Tier is C1's own order tier ("DIRECT"/"STANDARD"/"SWEEP"/"RELAY",
+	// ledger/internal/orders/order.go's own Tier type) -- read here only
+	// to pick reportDepositFinal's own deposit account code (see that
+	// method's own doc comment); nothing else in this client cares which
+	// tier an order is.
+	Tier string `json:"tier"`
+}
+
+// relayTierDepositAccountCode mirrors relayd/internal/orchestrate's own
+// unexported relayLegAccountCode(orderID) exactly (same format string,
+// same OrderID) -- duplicated, not shared (separate Go modules, no
+// common internal package between depositwatcher and relayd), but MUST
+// stay byte-for-byte identical: this is the one account name both C2 and
+// relayd's own screened->dispatching entry have to agree on, or a RELAY
+// leg's deposit lands in an account relayd never looks at.
+const relayTierName = "RELAY"
+
+func relayTierDepositAccountCode(orderID int64) string {
+	return fmt.Sprintf("asset:relay:leg:%d", orderID)
 }
 
 // QuotedAmount returns externalID's order's quoted amount_in as this
@@ -322,7 +341,19 @@ func (c *Client) reportDepositFinal(ctx context.Context, candidate finality.Cand
 
 	idempotencyKey := finality.DepositFinalIdempotencyKey(candidate.TxHash, candidate.LogIndex)
 	occurredAt := candidate.BlockTime.UTC().Format(time.RFC3339)
-	depositAccount := fmt.Sprintf("asset:bsc:deposit:%d", candidate.OrderID)
+	// RELAY-tier orders (Model F, relayd) post into relayd's own suspense
+	// account instead of Model D's per-order deposit account -- relayd
+	// has no pre-funded treasury to draw from later (per
+	// docs/01-strategy/model-f-relay-findings.md's own "never holds a net
+	// position"), so its screened->dispatching entry must debit the EXACT
+	// account this deposit landed in, not a Model-D-shaped one it never
+	// looks at. Every other tier's behavior is byte-for-byte unchanged.
+	var depositAccount string
+	if order.Tier == relayTierName {
+		depositAccount = relayTierDepositAccountCode(candidate.OrderID)
+	} else {
+		depositAccount = fmt.Sprintf("asset:bsc:deposit:%d", candidate.OrderID)
+	}
 	// :USDT_BEP20 suffix required -- matches the account-code convention
 	// every other component in this project uses (e.g. dispatcher's own
 	// customerAccountCode(customerID, asset)); C5's own E2 entry later

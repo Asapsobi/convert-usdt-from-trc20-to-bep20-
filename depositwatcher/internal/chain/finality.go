@@ -40,6 +40,13 @@ type providerResult struct {
 	err    error
 }
 
+// finalizedKey is LatestFinalized's own agreement key -- a provider's
+// reported (height, hash) pair, per BEP-126's finalized tag.
+type finalizedKey struct {
+	height uint64
+	hash   common.Hash
+}
+
 // LatestFinalized returns the block height and hash that at least
 // minAgreement configured providers independently report as the chain's
 // current "finalized" block, per BSC's BEP-126 fast-finality consensus
@@ -49,94 +56,26 @@ type providerResult struct {
 // A provider that times out, errors, or reports a different (height,
 // hash) than the agreeing group is excluded from the agreement count --
 // never silently counted as agreeing, and never used as a tie-breaker.
+// The actual grouping/winner-selection algorithm lives in
+// resolveAgreement (agreement.go), shared with LogsAt's own identical
+// synchronous-round agreement check -- one algorithm, not two that could
+// drift apart.
 func (p *Pool) LatestFinalized(ctx context.Context) (height uint64, agreedHash common.Hash, err error) {
-	results := p.queryFinalizedFromAllProviders(ctx)
-
-	type key struct {
-		height uint64
-		hash   common.Hash
-	}
-	groups := make(map[key][]string) // key -> provider names reporting it
-	for _, r := range results {
-		if r.err != nil {
-			p.recordFailure(r.name, r.err)
-			continue
-		}
-		k := key{r.height, r.hash}
-		groups[k] = append(groups[k], r.name)
+	raw := p.queryFinalizedFromAllProviders(ctx)
+	results := make([]namedResult[finalizedKey], len(raw))
+	for i, r := range raw {
+		results[i] = namedResult[finalizedKey]{name: r.name, key: finalizedKey{r.height, r.hash}, err: r.err}
 	}
 
-	// Find the largest group that reaches the agreement threshold, and
-	// detect a tie at the top among groups that do.
-	var winner key
-	winnerCount := 0
-	ambiguous := false
-	for k, names := range groups {
-		if len(names) < p.minAgreement {
-			continue // doesn't reach the threshold at all -- not a contender
-		}
-		switch {
-		case winnerCount == 0:
-			winner, winnerCount = k, len(names)
-		case len(names) == winnerCount:
-			ambiguous = true
-		case len(names) > winnerCount:
-			// A strictly larger group supersedes an earlier smaller one
-			// that had also crossed the threshold -- not itself
-			// ambiguous, since one group is unambiguously the largest.
-			winner, winnerCount = k, len(names)
-			ambiguous = false
-		}
+	winner, succeeded, failed, err := resolveAgreement(results, p.minAgreement)
+	for _, n := range succeeded {
+		p.recordSuccess(n)
 	}
-
-	// A successfully-responding provider is only penalized for THIS round
-	// if there was a genuine disagreement to be on the wrong side of --
-	// i.e., at least two DISTINCT answers came back among the providers
-	// that responded at all (len(groups) > 1). A lone group whose members
-	// all agree with each other is never penalized merely for falling
-	// short of minAgreement because other providers errored: those
-	// providers' own failures were already recorded in the loop above,
-	// and the survivors did nothing wrong -- marking them down too would
-	// make a perfectly healthy provider look unhealthy purely because a
-	// DIFFERENT provider went down, exactly the misleading signal an
-	// operator chasing a health dashboard must not see.
-	switch {
-	case len(groups) > 1:
-		winningNames := make(map[string]bool)
-		if winnerCount > 0 && !ambiguous {
-			for _, n := range groups[winner] {
-				winningNames[n] = true
-			}
-		}
-		for k, names := range groups {
-			for _, n := range names {
-				if winningNames[n] {
-					p.recordSuccess(n)
-					continue
-				}
-				p.recordFailure(n, fmt.Errorf("reported (height=%d hash=%s), which was not this round's agreed result",
-					k.height, k.hash))
-			}
-		}
-	case winnerCount > 0:
-		// Exactly one distinct answer, and it reached the threshold: no
-		// disagreement occurred, every respondent succeeded.
-		for _, n := range groups[winner] {
-			p.recordSuccess(n)
-		}
-		// The remaining case -- exactly one group, below threshold -- has
-		// nothing further to record here: its members agreed with each
-		// other and simply didn't have enough company this round, which
-		// is not a fault of theirs to be penalized for.
+	for n, e := range failed {
+		p.recordFailure(n, e)
 	}
-
-	if ambiguous {
-		return 0, common.Hash{}, fmt.Errorf("%w: need >= %d providers to agree, but multiple different blocks each had that many",
-			ErrAmbiguousAgreement, p.minAgreement)
-	}
-	if winnerCount == 0 {
-		return 0, common.Hash{}, fmt.Errorf("%w: need %d, best group had fewer (of %d providers queried)",
-			ErrNoAgreement, p.minAgreement, len(p.providers))
+	if err != nil {
+		return 0, common.Hash{}, err
 	}
 	return winner.height, winner.hash, nil
 }

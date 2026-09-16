@@ -42,6 +42,15 @@ type Config struct {
 	ContractAddress common.Address
 	TransferTopic   common.Hash
 	DustFloor       money.Amount
+
+	// AsyncFinality selects Design B (finality.Tracker.CheckFinalityAsync)
+	// over the default Design A (finality.Tracker.CheckFinality) in
+	// runTick. False (the zero value) means Design A -- byte-identical
+	// to this package's pre-Phase-2 behavior -- so every existing
+	// deployment that never sets this explicitly is completely
+	// unaffected. Set via cmd/watcherd's own WATCHER_FINALITY_MODE /
+	// WATCHER_ALLOW_ASYNC_FINALITY double gate, never a bare default.
+	AsyncFinality bool
 }
 
 // ScanRange fetches Transfer logs in [fromHeight, toHeight] via
