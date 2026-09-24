@@ -17,12 +17,16 @@ import (
 
 // Server holds everything a handler needs.
 type Server struct {
-	Pool      *db.Pool
-	C5Auth    AuthConfig
-	Approver  AuthConfig
-	Signing   *requests.Store
-	Metrics   *Metrics
-	BuildInfo func() (version, commit string)
+	Pool     *db.Pool
+	C5Auth   AuthConfig
+	Approver AuthConfig
+	// Provisioning is a THIRD, separate bearer-auth scope for
+	// POST .../tron-deposit-keys -- see ProvisioningAuthConfigFromEnv's
+	// own doc comment for why tronwatcher can't just reuse C5Auth.
+	Provisioning AuthConfig
+	Signing      *requests.Store
+	Metrics      *Metrics
+	BuildInfo    func() (version, commit string)
 }
 
 // NewRouter builds the full route table. /healthz, /readyz, and
@@ -50,6 +54,7 @@ func NewRouter(s *Server) http.Handler {
 			r.Use(authMiddleware(s.C5Auth))
 			r.Post("/signing-requests", s.postSigningRequest)
 			r.Post("/deposit-signing-requests", s.postDepositSigningRequest)
+			r.Post("/tron-deposit-signing-requests", s.postTronDepositSigningRequest)
 			r.Get("/signing-requests", s.getSigningRequests)
 			r.Get("/signing-requests/{id}", s.getSigningRequest)
 			r.Get("/slots/{id}/address", s.getSlotAddress)
@@ -59,6 +64,11 @@ func NewRouter(s *Server) http.Handler {
 			r.Use(authMiddleware(s.Approver))
 			r.Post("/signing-requests/{id}/approve", s.postApprove)
 			r.Post("/signing-requests/{id}/reject", s.postReject)
+		})
+		r.Group(func(r chi.Router) {
+			r.Use(authMiddleware(s.Provisioning))
+			r.Post("/tron-deposit-keys", s.postTronDepositKey)
+			r.Post("/bsc-deposit-keys", s.postBSCDepositKey)
 		})
 	})
 

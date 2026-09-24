@@ -148,6 +148,84 @@ func TestWrapper_NormalizesANonCanonicalHighSSignature(t *testing.T) {
 	}
 }
 
+// TestFinishRecoverableSignatureRS_MatchesTheDERPath proves
+// finishRecoverableSignatureRS -- the bridge Privy's own raw_sign (bare
+// r,s, never DER) calls directly, bypassing finishRecoverableSignature's
+// DER parsing entirely -- against a LOCALLY generated (r, s) pair, with
+// zero Privy/network dependency: split a real DER signature from the
+// fake KMS client into raw r/s bytes by hand (the same shape Privy's
+// real API returns, per privy_client.go's own doc comment), then feed
+// that straight into finishRecoverableSignatureRS and independently
+// verify the result recovers to the expected public key.
+func TestFinishRecoverableSignatureRS_MatchesTheDERPath(t *testing.T) {
+	ctx := context.Background()
+	fake := NewFakeKMSClient(1)
+	w := NewWrapper(fake)
+
+	pubKey, err := w.GetPublicKey(ctx, "slot-1")
+	if err != nil {
+		t.Fatalf("GetPublicKey: %v", err)
+	}
+	digest := sha256.Sum256([]byte("privy raw_sign shaped input"))
+
+	der, err := fake.Sign(ctx, "slot-1", digest)
+	if err != nil {
+		t.Fatalf("fake.Sign: %v", err)
+	}
+	sig, err := ecdsa.ParseDERSignature(der)
+	if err != nil {
+		t.Fatalf("ParseDERSignature: %v", err)
+	}
+	r := sig.R()
+	s := sig.S()
+	var rBytes, sBytes [32]byte
+	r.PutBytesUnchecked(rBytes[:])
+	s.PutBytesUnchecked(sBytes[:])
+
+	out, err := finishRecoverableSignatureRS(rBytes, sBytes, digest, pubKey)
+	if err != nil {
+		t.Fatalf("finishRecoverableSignatureRS: %v", err)
+	}
+	if !verifyRecoverableSignature(t, out, digest, pubKey) {
+		t.Fatal("finishRecoverableSignatureRS produced a signature that does not independently recover to the expected public key")
+	}
+}
+
+// TestFinishRecoverableSignatureRS_RejectsAMismatchedPublicKey is
+// TestWrapper_RejectsASignatureOverTheWrongDigest's own raw-(r,s)-path
+// counterpart -- a signature that is internally valid but doesn't
+// correspond to expectedPubKey must never be returned as if it did.
+func TestFinishRecoverableSignatureRS_RejectsAMismatchedPublicKey(t *testing.T) {
+	ctx := context.Background()
+	fakeA := NewFakeKMSClient(1)
+	fakeB := NewFakeKMSClient(2) // different seed -> different keypair
+	digest := sha256.Sum256([]byte("mismatched key test"))
+
+	der, err := fakeA.Sign(ctx, "slot-1", digest)
+	if err != nil {
+		t.Fatalf("fakeA.Sign: %v", err)
+	}
+	sig, err := ecdsa.ParseDERSignature(der)
+	if err != nil {
+		t.Fatalf("ParseDERSignature: %v", err)
+	}
+	r := sig.R()
+	s := sig.S()
+	var rBytes, sBytes [32]byte
+	r.PutBytesUnchecked(rBytes[:])
+	s.PutBytesUnchecked(sBytes[:])
+
+	wrongPubKey, err := NewWrapper(fakeB).GetPublicKey(ctx, "slot-1")
+	if err != nil {
+		t.Fatalf("GetPublicKey (fakeB): %v", err)
+	}
+
+	_, err = finishRecoverableSignatureRS(rBytes, sBytes, digest, wrongPubKey)
+	if !errors.Is(err, ErrSignatureDoesNotMatchKey) {
+		t.Fatalf("finishRecoverableSignatureRS() error = %v, want ErrSignatureDoesNotMatchKey", err)
+	}
+}
+
 func TestWrapper_MalformedDERIsATypedWrappedError(t *testing.T) {
 	ctx := context.Background()
 	fake := NewFakeKMSClient(1)

@@ -45,7 +45,7 @@ func TestDeriveChild_MatchesIndependentImplementation(t *testing.T) {
 			t.Fatalf("index %d: parsing go-bip32's derived public key: %v", idx, err)
 		}
 
-		ourPubBytes, err := keys.PublicKey(idx)
+		ourPubBytes, err := keys.PublicKey(context.Background(), idx)
 		if err != nil {
 			t.Fatalf("index %d: our PublicKey: %v", idx, err)
 		}
@@ -87,7 +87,7 @@ func TestDeriveChild_SignatureVerifiesAndRecoversToDerivedPublicKey(t *testing.T
 	digest := sha256.Sum256([]byte("a fake unsigned BEP20 sweep transaction, for this test only"))
 	const index = uint32(1042)
 
-	pub, err := keys.PublicKey(index)
+	pub, err := keys.PublicKey(context.Background(), index)
 	if err != nil {
 		t.Fatalf("PublicKey: %v", err)
 	}

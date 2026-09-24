@@ -4,16 +4,19 @@
 // /metrics, and the full business API under /v1.
 //
 // This binary wires kmssign.Wrapper against a KMSClient built from
-// S1_KMS_CLIENT: "fake" (the only option today) uses an in-process
-// FakeKMSClient, seeded from S1_KMS_FAKE_SEED -- there is no real cloud
-// KMS adapter in this module yet (see
+// S1_KMS_CLIENT: "fake" uses an in-process FakeKMSClient, seeded from
+// S1_KMS_FAKE_SEED -- never for production, signing against a
+// synthetic, worthless key. "privy" uses kmssign.PrivyKMSClient, real
+// custody via Privy (privy.io) Server Wallets (PRIVY_APP_ID/
+// PRIVY_APP_SECRET) -- slot-key CREATION itself stays a human, out-of-
+// band operational step (see
 // docs/02-architecture/s1-key-custody-architecture.md's own "Key
-// generation and bootstrapping": that step is an operational procedure a
-// human runs with real cloud credentials this repository does not have,
-// not something this binary can do unattended). A real deployment must
-// not set S1_KMS_CLIENT=fake -- there is deliberately no default, so a
-// misconfigured production environment fails to start instead of silently
-// signing real payouts against fake, worthless keys.
+// generation and bootstrapping", and internal/kmssign/privy_kms_client.go's
+// own top-of-file doc comment); this binary only ever consumes an
+// already-created wallet's id as kms_key_id. There is deliberately no
+// default for S1_KMS_CLIENT, so a misconfigured production environment
+// fails to start instead of silently signing real payouts against fake,
+// worthless keys.
 package main
 
 import (
@@ -68,6 +71,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	provisioningAuth, err := httpapi.ProvisioningAuthConfigFromEnv()
+	if err != nil {
+		return err
+	}
 
 	kmsClient, err := kmsClientFromEnv()
 	if err != nil {
@@ -75,7 +82,11 @@ func run() error {
 	}
 	wrapper := kmssign.NewWrapper(kmsClient)
 
-	depositKeysConfigured, err := configureBSCDepositKeysFromEnv(wrapper)
+	depositKeysConfigured, bscDepositProvisioner, err := configureBSCDepositSigningFromEnv(pool, wrapper)
+	if err != nil {
+		return err
+	}
+	tronDepositKeysConfigured, tronDepositProvisioner, err := configureTronDepositSigningFromEnv(pool, wrapper)
 	if err != nil {
 		return err
 	}
@@ -86,24 +97,30 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	// wrapper itself satisfies both requests.Signer and
-	// requests.DepositKeyGetter -- when depositKeysConfigured is false,
-	// SetBSCDepositKeys was never called, so wrapper.SignBSCDeposit/
-	// PublicKeyForDeposit both return ErrBSCDepositKeysNotConfigured,
-	// which Store surfaces to a caller as ErrDepositSigningNotConfigured
-	// (see requests/store.go's own signWith).
+	// wrapper itself satisfies requests.Signer, requests.DepositKeyGetter,
+	// and requests.TronDepositKeyGetter -- when *KeysConfigured is false,
+	// the corresponding Set*DepositKeys was never called, so wrapper's
+	// own Sign*Deposit/PublicKeyFor*Deposit methods return
+	// Err*DepositKeysNotConfigured, which Store surfaces to a caller as
+	// Err*DepositSigningNotConfigured (see requests/store.go's own
+	// signWith).
 	var depositKeys requests.DepositKeyGetter
 	if depositKeysConfigured {
 		depositKeys = wrapper
 	}
-	signingStore := requests.NewStore(pool, slotKeyGetterAdapter{slotStore}, depositKeys, wrapper, requests.Config{ApprovalThresholdUSD: threshold})
+	var tronDepositKeys requests.TronDepositKeyGetter
+	if tronDepositKeysConfigured {
+		tronDepositKeys = wrapper
+	}
+	signingStore := requests.NewStore(pool, slotKeyGetterAdapter{slotStore}, depositKeys, tronDepositKeys, tronDepositProvisioner, bscDepositProvisioner, wrapper, requests.Config{ApprovalThresholdUSD: threshold})
 
 	server := &httpapi.Server{
-		Pool:      pool,
-		C5Auth:    c5Auth,
-		Approver:  approverAuth,
-		Signing:   signingStore,
-		BuildInfo: buildInfo,
+		Pool:         pool,
+		C5Auth:       c5Auth,
+		Approver:     approverAuth,
+		Provisioning: provisioningAuth,
+		Signing:      signingStore,
+		BuildInfo:    buildInfo,
 	}
 	router := httpapi.NewRouter(server)
 
@@ -172,42 +189,167 @@ func kmsClientFromEnv() (kmssign.KMSClient, error) {
 		}
 		slog.Warn("s1d: S1_KMS_CLIENT=fake -- signing against an in-process fake key, never a real one; this must never be set in production")
 		return kmssign.NewFakeKMSClient(seed), nil
+	case "privy":
+		appID := os.Getenv("PRIVY_APP_ID")
+		appSecret := os.Getenv("PRIVY_APP_SECRET")
+		if appID == "" || appSecret == "" {
+			return nil, errors.New("s1d: S1_KMS_CLIENT=privy requires PRIVY_APP_ID and PRIVY_APP_SECRET to both be set")
+		}
+		slog.Info("s1d: S1_KMS_CLIENT=privy -- slot keys are signed through real Privy Server Wallets")
+		return kmssign.NewPrivyKMSClient(appID, appSecret), nil
 	case "":
 		return nil, errors.New("s1d: S1_KMS_CLIENT is not set (no default -- see this binary's own doc comment)")
 	default:
-		return nil, fmt.Errorf("s1d: S1_KMS_CLIENT=%q is not a recognized KMS client (only \"fake\" exists in this codebase today -- a real cloud KMS adapter has not been built yet)", os.Getenv("S1_KMS_CLIENT"))
+		return nil, fmt.Errorf("s1d: S1_KMS_CLIENT=%q is not a recognized KMS client (\"fake\" or \"privy\")", os.Getenv("S1_KMS_CLIENT"))
 	}
 }
 
-// configureBSCDepositKeysFromEnv reads S1_BSC_DEPOSIT_XPRV/XPUB and, if
-// both are set, parses and cross-validates them (see
-// kmssign.NewBSCDepositKeys's own doc comment) and enables wrapper's own
-// BSC deposit-sweep signing. Both unset is a legitimate, supported mode
-// -- most deployments (and every one before depositwatcher's own sweep
-// orchestration is wired) never need this -- returning (false, nil).
-// Exactly one set is a real misconfiguration, not a partial feature:
-// fails loud rather than silently leaving deposit-sweep signing half
-// configured. S1_BSC_DEPOSIT_XPUB should be the exact same value
-// depositwatcher's own WATCHER_XPUB is configured with -- the two
-// services must agree on which address a given index maps to, or a
-// sweep signs a transaction from the wrong address entirely.
-func configureBSCDepositKeysFromEnv(wrapper *kmssign.Wrapper) (bool, error) {
+// configureBSCDepositSigningFromEnv is configureTronDepositSigningFromEnv's
+// own BSC-deposit counterpart -- TWO possible backends, mutually
+// exclusive: S1_BSC_DEPOSIT_XPRV/XPUB both set enables local, in-process
+// BIP32 signing (unchanged, original behavior); PRIVY_APP_ID/
+// PRIVY_APP_SECRET both set enables real custody via Privy Server
+// Wallets instead (see internal/kmssign/privybsc.go) -- the SAME two env
+// vars already used for slot-key and TRON-deposit-key Privy signing, one
+// Privy app, independent wallets, not a new credential. ONLY the Privy
+// branch returns a non-nil BSCDepositProvisioner -- provisioning new
+// custody is meaningless in local-BIP32 mode, where deriving a child
+// address is pure, free local math with no state to ever record.
+// Neither backend configured is a legitimate, supported mode (disabled);
+// BOTH configured is a real misconfiguration -- fails loud rather than
+// silently preferring one over the other.
+//
+// OPERATIONAL INVARIANT this function cannot itself enforce: this
+// deployment's BSC-SIGNING backend choice must agree with depositwatcher's
+// own BSC-ADDRESSING backend choice (see that binary's own
+// cmd/watcherd/main.go doc comment). If they disagree, signing for
+// deposit index N silently uses a different key than the address at
+// index N was derived from -- Privy mode has no local xpub to
+// cross-check against, unlike local-BIP32 mode's own xprv/xpub match
+// check.
+func configureBSCDepositSigningFromEnv(pool *db.Pool, wrapper *kmssign.Wrapper) (bool, requests.BSCDepositProvisioner, error) {
 	xprv := os.Getenv("S1_BSC_DEPOSIT_XPRV")
 	xpub := os.Getenv("S1_BSC_DEPOSIT_XPUB")
-	if xprv == "" && xpub == "" {
-		slog.Info("s1d: S1_BSC_DEPOSIT_XPRV/XPUB not set -- BSC deposit-sweep signing is disabled on this deployment")
-		return false, nil
+	localSet := xprv != "" || xpub != ""
+	if localSet && (xprv == "" || xpub == "") {
+		return false, nil, errors.New("s1d: S1_BSC_DEPOSIT_XPRV and S1_BSC_DEPOSIT_XPUB must both be set together, or both left unset")
 	}
-	if xprv == "" || xpub == "" {
-		return false, errors.New("s1d: S1_BSC_DEPOSIT_XPRV and S1_BSC_DEPOSIT_XPUB must both be set together, or both left unset")
+
+	privyAppID := os.Getenv("PRIVY_APP_ID")
+	privyAppSecret := os.Getenv("PRIVY_APP_SECRET")
+	privySet := privyAppID != "" || privyAppSecret != ""
+	if privySet && (privyAppID == "" || privyAppSecret == "") {
+		return false, nil, errors.New("s1d: PRIVY_APP_ID and PRIVY_APP_SECRET must both be set together, or both left unset")
 	}
-	keys, err := kmssign.NewBSCDepositKeys(xprv, xpub)
+
+	switch {
+	case localSet && privySet:
+		return false, nil, errors.New("s1d: S1_BSC_DEPOSIT_XPRV/XPUB and PRIVY_APP_ID/PRIVY_APP_SECRET are both set -- exactly one BSC deposit-signing backend must be configured, never both")
+	case localSet:
+		keys, err := kmssign.NewBSCDepositKeys(xprv, xpub)
+		if err != nil {
+			return false, nil, fmt.Errorf("s1d: configuring BSC deposit keys: %w", err)
+		}
+		wrapper.SetBSCDepositKeys(keys)
+		slog.Info("s1d: BSC deposit-sweep signing enabled (local BIP32)")
+		return true, nil, nil
+	case privySet:
+		privyKeys := kmssign.NewPrivyBSCDepositKeys(pool, privyAppID, privyAppSecret)
+		wrapper.SetBSCDepositKeys(privyKeys)
+		slog.Warn("s1d: BSC deposit-sweep signing enabled (Privy Server Wallets) -- confirm depositwatcher's own BSC-addressing backend is ALSO Privy-backed against this SAME S1 deployment, or signing will silently use the wrong key for a given deposit index")
+		return true, bscDepositProvisionerAdapter{privyKeys}, nil
+	default:
+		slog.Info("s1d: S1_BSC_DEPOSIT_XPRV/XPUB and PRIVY_APP_ID/PRIVY_APP_SECRET not set -- BSC deposit-sweep signing is disabled on this deployment")
+		return false, nil, nil
+	}
+}
+
+// bscDepositProvisionerAdapter adapts *kmssign.PrivyBSCDepositKeys's own
+// Provision (which returns kmssign.PrivyBSCKey, a type this package has
+// no reason to depend on) to requests.BSCDepositProvisioner -- the same
+// thin, package-boundary adapter shape as tronDepositProvisionerAdapter
+// above.
+type bscDepositProvisionerAdapter struct{ keys *kmssign.PrivyBSCDepositKeys }
+
+func (a bscDepositProvisionerAdapter) Provision(ctx context.Context, index uint32) (string, [33]byte, error) {
+	key, err := a.keys.Provision(ctx, index)
 	if err != nil {
-		return false, fmt.Errorf("s1d: configuring BSC deposit keys: %w", err)
+		return "", [33]byte{}, err
 	}
-	wrapper.SetBSCDepositKeys(keys)
-	slog.Info("s1d: BSC deposit-sweep signing enabled")
-	return true, nil
+	return key.Address, key.PublicKey, nil
+}
+
+// configureTronDepositSigningFromEnv is configureBSCDepositKeysFromEnv's
+// own TRON-deposit counterpart, but with TWO possible backends instead
+// of one -- see docs/02-architecture/s1-key-custody-architecture.md's
+// own Privy custody work: S1_TRON_DEPOSIT_XPRV/XPUB both set enables
+// local, in-process BIP32 signing (unchanged, original behavior);
+// PRIVY_APP_ID/PRIVY_APP_SECRET both set enables real custody via Privy
+// (privy.io) Server Wallets instead. ONLY the Privy branch returns a
+// non-nil TronDepositProvisioner -- provisioning new custody is
+// meaningless in local-BIP32 mode, where deriving a child address is
+// pure, free local math with no state to ever record. Neither backend
+// configured is a legitimate, supported mode (disabled); BOTH
+// configured is a real misconfiguration -- fails loud rather than
+// silently preferring one over the other.
+//
+// OPERATIONAL INVARIANT this function cannot itself enforce: this
+// deployment's TRON-SIGNING backend choice must agree with
+// tronwatcher's own TRON-ADDRESSING backend choice (see that binary's
+// own cmd/tronwatcherd/main.go doc comment). If they disagree, signing
+// for deposit index N silently uses a different key than the address at
+// index N was derived from -- Privy mode has no local xpub to
+// cross-check against, unlike today's xprv/xpub match checks.
+func configureTronDepositSigningFromEnv(pool *db.Pool, wrapper *kmssign.Wrapper) (bool, requests.TronDepositProvisioner, error) {
+	xprv := os.Getenv("S1_TRON_DEPOSIT_XPRV")
+	xpub := os.Getenv("S1_TRON_DEPOSIT_XPUB")
+	localSet := xprv != "" || xpub != ""
+	if localSet && (xprv == "" || xpub == "") {
+		return false, nil, errors.New("s1d: S1_TRON_DEPOSIT_XPRV and S1_TRON_DEPOSIT_XPUB must both be set together, or both left unset")
+	}
+
+	privyAppID := os.Getenv("PRIVY_APP_ID")
+	privyAppSecret := os.Getenv("PRIVY_APP_SECRET")
+	privySet := privyAppID != "" || privyAppSecret != ""
+	if privySet && (privyAppID == "" || privyAppSecret == "") {
+		return false, nil, errors.New("s1d: PRIVY_APP_ID and PRIVY_APP_SECRET must both be set together, or both left unset")
+	}
+
+	switch {
+	case localSet && privySet:
+		return false, nil, errors.New("s1d: S1_TRON_DEPOSIT_XPRV/XPUB and PRIVY_APP_ID/PRIVY_APP_SECRET are both set -- exactly one TRON deposit-signing backend must be configured, never both")
+	case localSet:
+		keys, err := kmssign.NewTronDepositKeys(xprv, xpub)
+		if err != nil {
+			return false, nil, fmt.Errorf("s1d: configuring TRON deposit keys: %w", err)
+		}
+		wrapper.SetTronDepositKeys(keys)
+		slog.Info("s1d: TRON deposit-sweep signing enabled (local BIP32)")
+		return true, nil, nil
+	case privySet:
+		privyKeys := kmssign.NewPrivyTronDepositKeys(pool, privyAppID, privyAppSecret)
+		wrapper.SetTronDepositKeys(privyKeys)
+		slog.Warn("s1d: TRON deposit-sweep signing enabled (Privy Server Wallets) -- confirm tronwatcher's own TRON-addressing backend is ALSO Privy-backed against this SAME S1 deployment, or signing will silently use the wrong key for a given deposit index")
+		return true, tronDepositProvisionerAdapter{privyKeys}, nil
+	default:
+		slog.Info("s1d: S1_TRON_DEPOSIT_XPRV/XPUB and PRIVY_APP_ID/PRIVY_APP_SECRET not set -- TRON deposit-sweep signing is disabled on this deployment")
+		return false, nil, nil
+	}
+}
+
+// tronDepositProvisionerAdapter adapts *kmssign.PrivyTronDepositKeys's
+// own Provision (which returns kmssign.PrivyTronKey, a type this
+// package has no reason to depend on) to requests.TronDepositProvisioner
+// -- the same thin, package-boundary adapter shape as
+// slotKeyGetterAdapter above.
+type tronDepositProvisionerAdapter struct{ keys *kmssign.PrivyTronDepositKeys }
+
+func (a tronDepositProvisionerAdapter) Provision(ctx context.Context, index uint32) (string, [33]byte, error) {
+	key, err := a.keys.Provision(ctx, index)
+	if err != nil {
+		return "", [33]byte{}, err
+	}
+	return key.Address, key.PublicKey, nil
 }
 
 // approvalThresholdFromEnv reads S1_APPROVAL_THRESHOLD_USD -- see

@@ -113,9 +113,16 @@ func kmsClientFromEnv() (kmssign.KMSClient, error) {
 			seed = parsed
 		}
 		return kmssign.NewFakeKMSClient(seed), nil
+	case "privy":
+		appID := os.Getenv("PRIVY_APP_ID")
+		appSecret := os.Getenv("PRIVY_APP_SECRET")
+		if appID == "" || appSecret == "" {
+			return nil, errors.New("seed-slot-key: S1_KMS_CLIENT=privy requires PRIVY_APP_ID and PRIVY_APP_SECRET to both be set")
+		}
+		return kmssign.NewPrivyKMSClient(appID, appSecret), nil
 	case "":
 		return nil, errors.New("seed-slot-key: S1_KMS_CLIENT is not set (must match whatever s1d itself is configured with)")
 	default:
-		return nil, fmt.Errorf("seed-slot-key: S1_KMS_CLIENT=%q is not a recognized KMS client (only \"fake\" exists in this codebase today)", os.Getenv("S1_KMS_CLIENT"))
+		return nil, fmt.Errorf("seed-slot-key: S1_KMS_CLIENT=%q is not a recognized KMS client (\"fake\" or \"privy\")", os.Getenv("S1_KMS_CLIENT"))
 	}
 }

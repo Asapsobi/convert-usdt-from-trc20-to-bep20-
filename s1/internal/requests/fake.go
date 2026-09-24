@@ -18,12 +18,14 @@ import (
 type FakeSigningService struct {
 	thresholdUSD float64
 
-	mu           sync.Mutex
-	seq          int64
-	byID         map[int64]*SigningRequest
-	byIdemKey    map[string]int64
-	addresses    map[int]string
-	evmAddresses map[int]string
+	mu                   sync.Mutex
+	seq                  int64
+	byID                 map[int64]*SigningRequest
+	byIdemKey            map[string]int64
+	addresses            map[int]string
+	evmAddresses         map[int]string
+	tronDepositAddresses map[uint32]string
+	bscDepositAddresses  map[uint32]string
 }
 
 // NewFakeSigningService returns a FakeSigningService that auto-signs any
@@ -31,11 +33,13 @@ type FakeSigningService struct {
 // everything else PENDING until ApproveFake/RejectFake is called.
 func NewFakeSigningService(thresholdUSD float64) *FakeSigningService {
 	return &FakeSigningService{
-		thresholdUSD: thresholdUSD,
-		byID:         make(map[int64]*SigningRequest),
-		byIdemKey:    make(map[string]int64),
-		addresses:    make(map[int]string),
-		evmAddresses: make(map[int]string),
+		thresholdUSD:         thresholdUSD,
+		byID:                 make(map[int64]*SigningRequest),
+		byIdemKey:            make(map[string]int64),
+		addresses:            make(map[int]string),
+		evmAddresses:         make(map[int]string),
+		tronDepositAddresses: make(map[uint32]string),
+		bscDepositAddresses:  make(map[uint32]string),
 	}
 }
 
@@ -125,6 +129,33 @@ func (f *FakeSigningService) RequestDepositSweepSignature(ctx context.Context, i
 	return *req, nil
 }
 
+// RequestTronDepositSweepSignature implements SigningService --
+// RequestDepositSweepSignature's own fake counterpart for a TRON deposit
+// child index, sharing the same id sequence/idempotency-key map.
+func (f *FakeSigningService) RequestTronDepositSweepSignature(ctx context.Context, index uint32, digest [32]byte, estimatedUSD float64, idempotencyKey string) (SigningRequest, error) {
+	if err := ctx.Err(); err != nil {
+		return SigningRequest{}, err
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if id, ok := f.byIdemKey[idempotencyKey]; ok {
+		return *f.byID[id], nil
+	}
+
+	f.seq++
+	id := f.seq
+	req := &SigningRequest{ID: id, Status: StatusPending, CreatedAt: time.Now().UTC()}
+	if estimatedUSD < f.thresholdUSD {
+		req.Status = StatusSigned
+		req.SignedTx = fakeSignedTx(int(index), digest)
+	}
+	f.byID[id] = req
+	f.byIdemKey[idempotencyKey] = id
+	return *req, nil
+}
+
 // GetSignature implements SigningService.
 func (f *FakeSigningService) GetSignature(ctx context.Context, id int64) (SigningRequest, error) {
 	if err := ctx.Err(); err != nil {
@@ -165,6 +196,45 @@ func (f *FakeSigningService) EVMAddress(ctx context.Context, slotID int) (string
 		return "", fmt.Errorf("requests: no EVM address configured for slot %d", slotID)
 	}
 	return addr, nil
+}
+
+// ProvisionTronDepositKey is a deterministic, in-memory fake matching
+// TronDepositProvisioner's own contract -- NOT part of SigningService
+// (see provisioning.go's own doc comment for why key provisioning is a
+// separate concern from every other method here), included on this same
+// fake purely so a caller already building tests against
+// FakeSigningService doesn't need an unrelated second fake type just for
+// this. Idempotent per index, mirroring the real Store's own
+// ProvisionTronDepositKey/kmssign.PrivyTronDepositKeys.Provision
+// guarantee.
+func (f *FakeSigningService) ProvisionTronDepositKey(ctx context.Context, index uint32) (TronDepositKey, error) {
+	if err := ctx.Err(); err != nil {
+		return TronDepositKey{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if addr, ok := f.tronDepositAddresses[index]; ok {
+		return TronDepositKey{Index: index, Address: addr}, nil
+	}
+	addr := fmt.Sprintf("TFakeTronDeposit%d", index)
+	f.tronDepositAddresses[index] = addr
+	return TronDepositKey{Index: index, Address: addr}, nil
+}
+
+// ProvisionBSCDepositKey is ProvisionTronDepositKey's own BSC-deposit
+// counterpart -- see that method's own doc comment.
+func (f *FakeSigningService) ProvisionBSCDepositKey(ctx context.Context, index uint32) (BSCDepositKey, error) {
+	if err := ctx.Err(); err != nil {
+		return BSCDepositKey{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if addr, ok := f.bscDepositAddresses[index]; ok {
+		return BSCDepositKey{Index: index, Address: addr}, nil
+	}
+	addr := fmt.Sprintf("0xFakeBSCDeposit%d", index)
+	f.bscDepositAddresses[index] = addr
+	return BSCDepositKey{Index: index, Address: addr}, nil
 }
 
 // ApproveFake simulates a human approval completing a PENDING request --

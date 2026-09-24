@@ -35,6 +35,7 @@
 package kmssign
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -46,6 +47,19 @@ import (
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 )
+
+// BSCDepositSigner is the swappable per-order BSC deposit-signing backend
+// Wrapper.SignBSCDeposit/PublicKeyForDeposit delegate to -- BSCDepositKeys's
+// own TronDepositSigner counterpart (trondeposit.go). *BSCDepositKeys
+// (this file, local in-process BIP32) and *PrivyBSCDepositKeys (privybsc.go,
+// real custody via Privy Server Wallets) both satisfy this identically --
+// it is the ENTIRE surface this package's own custody-model choice for BSC
+// deposit signing touches; requests.Store and every HTTP route above this
+// package never see which concrete type is behind it.
+type BSCDepositSigner interface {
+	PublicKey(ctx context.Context, index uint32) ([33]byte, error)
+	Sign(ctx context.Context, index uint32, digest [32]byte, expectedPubKey [33]byte) ([65]byte, error)
+}
 
 // xprvVersion/xpubVersion are BIP32's own mainnet extended-key version
 // bytes -- duplicated from depositwatcher/internal/addresses/bip32.go,
@@ -67,6 +81,10 @@ var (
 	// would otherwise cause a sweep to sign from the wrong key entirely,
 	// silently.
 	ErrXprvXpubMismatch = errors.New("kmssign: configured BSC deposit xprv and xpub do not describe the same node")
+	// ErrTronXprvXpubMismatch is ErrXprvXpubMismatch's own TRON-deposit
+	// counterpart (trondeposit.go) -- same condition, worded for the
+	// right env vars (S1_TRON_DEPOSIT_XPRV/XPUB, not the BSC ones).
+	ErrTronXprvXpubMismatch = errors.New("kmssign: configured TRON deposit xprv and xpub do not describe the same node")
 	// ErrDepositChildOverflow mirrors addresses.ErrChildOverflow --
 	// astronomically rare, but a real possible CKD result, never silently
 	// coerced into something else.
@@ -112,24 +130,34 @@ func NewBSCDepositKeys(xprv, xpub string) (*BSCDepositKeys, error) {
 }
 
 // deriveChild returns the non-hardened BIP32 child private key at index,
-// via CKDpriv: k_i = (IL + k_par) mod n, where IL is the first 32 bytes
-// of HMAC-SHA512(chainCode, parentPubCompressed || index) -- the exact
-// same HMAC input depositwatcher/internal/addresses/bip32.go's own
-// ckdPub uses (parent PUBLIC key || index, never the private key
-// itself), which is precisely why the two are mathematically guaranteed
-// to describe the same child address: point(k_i) = point(k_par) + IL*G,
-// identical to what ckdPub computes on the public side alone. See
+// via CKDpriv -- see ckdPrivChild's own doc comment for the math. See
 // bscdeposit_test.go's own cross-derivation test, which proves this
 // against a real fixture rather than asserting it from the math alone.
 func (k *BSCDepositKeys) deriveChild(index uint32) (*secp256k1.PrivateKey, error) {
+	return ckdPrivChild(k.chainCode, k.privKey, k.compressed, index)
+}
+
+// ckdPrivChild is deriveChild's own math, factored out as a free function
+// so trondeposit.go's TronDepositKeys.deriveChild can call it too --
+// CKDpriv is 100% chain-agnostic BIP32 arithmetic, identical for a BSC or
+// a TRON node (the two chains only diverge at address ENCODING, which
+// this function never touches). k_i = (IL + k_par) mod n, where IL is
+// the first 32 bytes of HMAC-SHA512(chainCode, parentPubCompressed ||
+// index) -- the exact same HMAC input depositwatcher/internal/addresses/
+// bip32.go's own ckdPub uses (parent PUBLIC key || index, never the
+// private key itself), which is precisely why the two are mathematically
+// guaranteed to describe the same child address: point(k_i) =
+// point(k_par) + IL*G, identical to what ckdPub computes on the public
+// side alone.
+func ckdPrivChild(chainCode [32]byte, parentPriv *secp256k1.PrivateKey, parentCompressed [33]byte, index uint32) (*secp256k1.PrivateKey, error) {
 	if index >= bscHardenedOffset {
 		return nil, fmt.Errorf("kmssign: hardened index %d requested, but deposit addresses are always non-hardened", index)
 	}
 	var idxBytes [4]byte
 	binary.BigEndian.PutUint32(idxBytes[:], index)
 
-	mac := hmac.New(sha512.New, k.chainCode[:])
-	mac.Write(k.compressed[:])
+	mac := hmac.New(sha512.New, chainCode[:])
+	mac.Write(parentCompressed[:])
 	mac.Write(idxBytes[:])
 	i := mac.Sum(nil)
 
@@ -139,7 +167,7 @@ func (k *BSCDepositKeys) deriveChild(index uint32) (*secp256k1.PrivateKey, error
 	}
 
 	var parentScalar secp256k1.ModNScalar
-	if overflow := parentScalar.SetByteSlice(k.privKey.Serialize()); overflow {
+	if overflow := parentScalar.SetByteSlice(parentPriv.Serialize()); overflow {
 		return nil, ErrDepositChildOverflow
 	}
 
@@ -153,8 +181,11 @@ func (k *BSCDepositKeys) deriveChild(index uint32) (*secp256k1.PrivateKey, error
 // PublicKey returns the compressed public key for child index -- safe
 // to expose freely (it's what an address is made from), used by S1's
 // own httpapi to report a deposit address's expected signing key and by
-// Wrapper.SignBSCDeposit's own expectedPubKey check.
-func (k *BSCDepositKeys) PublicKey(index uint32) ([33]byte, error) {
+// Wrapper.SignBSCDeposit's own expectedPubKey check. Takes ctx for
+// BSCDepositSigner interface parity with the Privy-backed implementation
+// (privybsc.go), even though this one is purely in-process and never
+// touches it.
+func (k *BSCDepositKeys) PublicKey(ctx context.Context, index uint32) ([33]byte, error) {
 	child, err := k.deriveChild(index)
 	if err != nil {
 		return [33]byte{}, err
@@ -166,11 +197,11 @@ func (k *BSCDepositKeys) PublicKey(index uint32) ([33]byte, error) {
 
 // sign produces a DER-encoded ECDSA signature over digest using the
 // child private key at index -- the direct, in-process counterpart to
-// KMSClient.Sign, never exported outside this package (Wrapper's own
-// SignBSCDeposit is the only caller, applying the exact same low-s
-// normalization and recovery-id matching Sign already applies to a real
-// KMS response, so a caller of either method gets an identically-shaped
-// guarantee regardless of which key type backed it).
+// KMSClient.Sign, never exported outside this package (this type's own
+// exported Sign, below, is the only caller, applying the exact same
+// low-s normalization and recovery-id matching Sign already applies to a
+// real KMS response, so a caller of either method gets an
+// identically-shaped guarantee regardless of which key type backed it).
 func (k *BSCDepositKeys) sign(index uint32, digest [32]byte) ([]byte, error) {
 	child, err := k.deriveChild(index)
 	if err != nil {
@@ -178,6 +209,18 @@ func (k *BSCDepositKeys) sign(index uint32, digest [32]byte) ([]byte, error) {
 	}
 	sig := ecdsa.Sign(child, digest[:])
 	return sig.Serialize(), nil
+}
+
+// Sign implements BSCDepositSigner: derive the child private key at
+// index, sign digest with it in-process, and apply the same low-s
+// normalization and recovery-id matching finishRecoverableSignature
+// already applies for every other signing path in this package.
+func (k *BSCDepositKeys) Sign(ctx context.Context, index uint32, digest [32]byte, expectedPubKey [33]byte) ([65]byte, error) {
+	der, err := k.sign(index, digest)
+	if err != nil {
+		return [65]byte{}, fmt.Errorf("kmssign: deriving/signing BSC deposit index %d: %w", index, err)
+	}
+	return finishRecoverableSignature(der, digest, expectedPubKey)
 }
 
 // --- xprv parsing: base58check, self-contained (stdlib math/big +

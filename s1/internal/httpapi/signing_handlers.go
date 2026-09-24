@@ -100,12 +100,55 @@ func (s *Server) postDepositSigningRequest(w http.ResponseWriter, r *http.Reques
 	respondJSON(w, http.StatusCreated, toSigningRequestResponse(result))
 }
 
+type postTronDepositSigningRequestRequest struct {
+	TronDepositIndex uint32  `json:"tron_deposit_index"`
+	Digest           string  `json:"digest"`
+	EstimatedUSD     float64 `json:"estimated_usd"`
+	IdempotencyKey   string  `json:"idempotency_key"`
+}
+
+// postTronDepositSigningRequest is POST /v1/tron-deposit-signing-requests
+// -- postDepositSigningRequest's own TRON-deposit counterpart
+// (tronwatcher's own entry point into
+// SigningService.RequestTronDepositSweepSignature). A separate route and
+// request field from the BSC one, not an overload: BSC and TRON
+// derivation indices are independent sequences from two different
+// watchers, so conflating them risks deriving from the wrong xprv for a
+// colliding index.
+func (s *Server) postTronDepositSigningRequest(w http.ResponseWriter, r *http.Request) {
+	var req postTronDepositSigningRequestRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.IdempotencyKey == "" {
+		writeAPIError(w, newAPIError(http.StatusBadRequest, errInvalidRequest.Code, "idempotency_key is required"))
+		return
+	}
+
+	digestBytes, err := hex.DecodeString(req.Digest)
+	if err != nil || len(digestBytes) != 32 {
+		writeAPIError(w, newAPIError(http.StatusBadRequest, errInvalidRequest.Code, "digest must be 32 bytes, hex-encoded"))
+		return
+	}
+	var digest [32]byte
+	copy(digest[:], digestBytes)
+
+	result, err := s.Signing.RequestTronDepositSweepSignature(r.Context(), req.TronDepositIndex, digest, req.EstimatedUSD, req.IdempotencyKey)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	s.Metrics.recordSigningRequest(result.Status)
+	respondJSON(w, http.StatusCreated, toSigningRequestResponse(result))
+}
+
 type pendingSummaryResponse struct {
-	ID              int64     `json:"id"`
-	SlotID          *int      `json:"slot_id,omitempty"`
-	BSCDepositIndex *uint32   `json:"bsc_deposit_index,omitempty"`
-	EstimatedUSD    float64   `json:"estimated_usd"`
-	CreatedAt       time.Time `json:"created_at"`
+	ID               int64     `json:"id"`
+	SlotID           *int      `json:"slot_id,omitempty"`
+	BSCDepositIndex  *uint32   `json:"bsc_deposit_index,omitempty"`
+	TronDepositIndex *uint32   `json:"tron_deposit_index,omitempty"`
+	EstimatedUSD     float64   `json:"estimated_usd"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 // getSigningRequests is GET /v1/signing-requests?status=pending -- the
@@ -130,7 +173,7 @@ func (s *Server) getSigningRequests(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]pendingSummaryResponse, len(pending))
 	for i, p := range pending {
-		out[i] = pendingSummaryResponse{ID: p.ID, SlotID: p.SlotID, BSCDepositIndex: p.BSCDepositIndex, EstimatedUSD: p.EstimatedUSD, CreatedAt: p.CreatedAt}
+		out[i] = pendingSummaryResponse{ID: p.ID, SlotID: p.SlotID, BSCDepositIndex: p.BSCDepositIndex, TronDepositIndex: p.TronDepositIndex, EstimatedUSD: p.EstimatedUSD, CreatedAt: p.CreatedAt}
 	}
 	respondJSON(w, http.StatusOK, map[string]any{"signing_requests": out})
 }

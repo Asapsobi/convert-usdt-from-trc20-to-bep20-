@@ -46,15 +46,17 @@ type SigningRequest struct {
 // enough for an approver to see which requests are waiting on them
 // without already knowing the id, never the digest or anything
 // signature-related, matching GetSignature's own posture of returning
-// SignedTx only once SIGNED. Exactly one of SlotID/BSCDepositIndex is
-// set, mirroring signing_requests' own CHECK constraint (migration
-// 0005) -- a slot-key request or a BSC-deposit-sweep request.
+// SignedTx only once SIGNED. Exactly one of SlotID/BSCDepositIndex/
+// TronDepositIndex is set, mirroring signing_requests' own CHECK
+// constraint (migration 0006's num_nonnulls(...) = 1) -- a slot-key
+// request, a BSC-deposit-sweep request, or a TRON-deposit-sweep request.
 type PendingSummary struct {
-	ID              int64
-	SlotID          *int
-	BSCDepositIndex *uint32
-	EstimatedUSD    float64
-	CreatedAt       time.Time
+	ID               int64
+	SlotID           *int
+	BSCDepositIndex  *uint32
+	TronDepositIndex *uint32
+	EstimatedUSD     float64
+	CreatedAt        time.Time
 }
 
 // ErrRequestAlreadyResolved guards Approve/Reject against acting on a
@@ -90,6 +92,13 @@ type SigningService interface {
 	// approval-threshold, and PENDING/SIGNED semantics as RequestSignature
 	// throughout; the only difference is which key signs.
 	RequestDepositSweepSignature(ctx context.Context, index uint32, digest [32]byte, estimatedUSD float64, idempotencyKey string) (SigningRequest, error)
+
+	// RequestTronDepositSweepSignature is RequestDepositSweepSignature's
+	// own counterpart for a per-order TRON deposit address at child
+	// index -- see internal/kmssign/trondeposit.go's own doc comment.
+	// Same idempotency, approval-threshold, and PENDING/SIGNED semantics
+	// throughout; the only difference is which key signs.
+	RequestTronDepositSweepSignature(ctx context.Context, index uint32, digest [32]byte, estimatedUSD float64, idempotencyKey string) (SigningRequest, error)
 
 	// GetSignature polls one request's own current status by id.
 	GetSignature(ctx context.Context, id int64) (SigningRequest, error)

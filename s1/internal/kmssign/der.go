@@ -60,10 +60,11 @@ func parseDERPublicKey(der []byte) ([33]byte, error) {
 	return out, nil
 }
 
-// marshalDERPublicKey is parseDERPublicKey's inverse -- used only by
-// FakeKMSClient, to produce a realistic DER response the same parsing
-// path above must round-trip correctly. A real KMS produces this shape
-// on its own; this package never needs to marshal one outside tests.
+// marshalDERPublicKey is parseDERPublicKey's inverse -- used by
+// FakeKMSClient to produce a realistic DER response the same parsing
+// path above must round-trip correctly, and by PrivyKMSClient
+// (privy_kms_client.go) to wrap Privy's own raw compressed public key
+// into the same shape a real KMS's GetPublicKey response already has.
 func marshalDERPublicKey(compressed [33]byte) ([]byte, error) {
 	pub, err := secp256k1.ParsePubKey(compressed[:])
 	if err != nil {

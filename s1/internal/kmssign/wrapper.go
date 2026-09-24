@@ -28,15 +28,17 @@ const (
 // "Signing mechanics" section describes. It is the only type in this
 // module that ever calls KMSClient.Sign.
 type Wrapper struct {
-	client      KMSClient
-	depositKeys *BSCDepositKeys
+	client          KMSClient
+	depositKeys     BSCDepositSigner
+	tronDepositKeys TronDepositSigner
 }
 
-// NewWrapper returns a Wrapper calling client for every Sign. BSC
-// deposit-address signing (SignBSCDeposit/PublicKeyForDeposit) starts
-// disabled -- call SetBSCDepositKeys to enable it. Most deployments
+// NewWrapper returns a Wrapper calling client for every Sign. BSC/TRON
+// deposit-address signing (SignBSCDeposit/PublicKeyForDeposit and
+// SignTronDeposit/PublicKeyForTronDeposit) each start disabled -- call
+// SetBSCDepositKeys/SetTronDepositKeys to enable them. Most deployments
 // (and cmd/seed-slot-key, internal/replay's own fake harness) never
-// need it.
+// need either.
 func NewWrapper(client KMSClient) *Wrapper {
 	return &Wrapper{client: client}
 }
@@ -48,10 +50,32 @@ func NewWrapper(client KMSClient) *Wrapper {
 // a genuine custody-model gap, not something to enable by default).
 var ErrBSCDepositKeysNotConfigured = errors.New("kmssign: no BSC deposit keys configured on this Wrapper -- call SetBSCDepositKeys")
 
+// ErrTronDepositKeysNotConfigured is ErrBSCDepositKeysNotConfigured's own
+// TRON-deposit counterpart.
+var ErrTronDepositKeysNotConfigured = errors.New("kmssign: no TRON deposit keys configured on this Wrapper -- call SetTronDepositKeys")
+
 // SetBSCDepositKeys enables this Wrapper's own SignBSCDeposit and
-// PublicKeyForDeposit methods, backed by keys.
-func (w *Wrapper) SetBSCDepositKeys(keys *BSCDepositKeys) {
+// PublicKeyForDeposit methods, backed by keys -- either the local
+// in-process *BSCDepositKeys (BIP32) or *PrivyBSCDepositKeys (real
+// custody via Privy Server Wallets, see privybsc.go), both of which
+// satisfy BSCDepositSigner identically. This is the ONLY place this
+// package's own custody-model choice for BSC deposit signing is ever
+// visible -- everything above Wrapper (requests.Store, keyRef, every
+// HTTP route) is unaffected by which concrete type is behind it.
+func (w *Wrapper) SetBSCDepositKeys(keys BSCDepositSigner) {
 	w.depositKeys = keys
+}
+
+// SetTronDepositKeys enables this Wrapper's own SignTronDeposit and
+// PublicKeyForTronDeposit methods, backed by keys -- either the local
+// in-process *TronDepositKeys (BIP32) or *PrivyTronDepositKeys (real
+// custody via Privy Server Wallets, see privytron.go), both of which
+// satisfy TronDepositSigner identically. This is the ONLY place this
+// package's own custody-model choice for TRON deposit signing is ever
+// visible -- everything above Wrapper (requests.Store, keyRef, every
+// HTTP route) is unaffected by which concrete type is behind it.
+func (w *Wrapper) SetTronDepositKeys(keys TronDepositSigner) {
+	w.tronDepositKeys = keys
 }
 
 // PublicKeyForDeposit returns the compressed public key for the BSC
@@ -65,25 +89,42 @@ func (w *Wrapper) PublicKeyForDeposit(ctx context.Context, index uint32) ([33]by
 	if w.depositKeys == nil {
 		return [33]byte{}, ErrBSCDepositKeysNotConfigured
 	}
-	return w.depositKeys.PublicKey(index)
+	return w.depositKeys.PublicKey(ctx, index)
 }
 
-// SignBSCDeposit is SignBSCDeposit's own real implementation: derive the
-// child private key at index, sign digest with it in-process (see
-// bscdeposit.go's own top-of-file doc comment on why this differs from
-// Sign's KMS-mediated custody model), and apply the exact same low-s
-// normalization and recovery-id matching against expectedPubKey that
-// Sign applies to a real KMS response. Takes ctx for the same reason as
-// PublicKeyForDeposit above.
+// SignBSCDeposit is SignBSCDeposit's own real implementation --
+// delegates to whichever BSCDepositSigner is configured (local BIP32 or
+// Privy). Each concrete implementation is responsible for its own
+// low-s-normalization/recovery-id matching against expectedPubKey (both
+// funnel through finishRecoverableSignature/finishRecoverableSignatureRS
+// internally, so callers of either get an identically-shaped guarantee).
 func (w *Wrapper) SignBSCDeposit(ctx context.Context, index uint32, digest [32]byte, expectedPubKey [33]byte) ([65]byte, error) {
 	if w.depositKeys == nil {
 		return [65]byte{}, ErrBSCDepositKeysNotConfigured
 	}
-	der, err := w.depositKeys.sign(index, digest)
-	if err != nil {
-		return [65]byte{}, fmt.Errorf("kmssign: deriving/signing BSC deposit index %d: %w", index, err)
+	return w.depositKeys.Sign(ctx, index, digest, expectedPubKey)
+}
+
+// PublicKeyForTronDeposit is PublicKeyForDeposit's own TRON-deposit
+// counterpart -- delegates to whichever TronDepositSigner is configured.
+func (w *Wrapper) PublicKeyForTronDeposit(ctx context.Context, index uint32) ([33]byte, error) {
+	if w.tronDepositKeys == nil {
+		return [33]byte{}, ErrTronDepositKeysNotConfigured
 	}
-	return finishRecoverableSignature(der, digest, expectedPubKey)
+	return w.tronDepositKeys.PublicKey(ctx, index)
+}
+
+// SignTronDeposit is SignBSCDeposit's own TRON-deposit counterpart --
+// delegates to whichever TronDepositSigner is configured (local BIP32 or
+// Privy). Each concrete implementation is responsible for its own
+// low-s-normalization/recovery-id matching against expectedPubKey (both
+// funnel through finishRecoverableSignature/finishRecoverableSignatureRS
+// internally, so callers of either get an identically-shaped guarantee).
+func (w *Wrapper) SignTronDeposit(ctx context.Context, index uint32, digest [32]byte, expectedPubKey [33]byte) ([65]byte, error) {
+	if w.tronDepositKeys == nil {
+		return [65]byte{}, ErrTronDepositKeysNotConfigured
+	}
+	return w.tronDepositKeys.Sign(ctx, index, digest, expectedPubKey)
 }
 
 // GetPublicKey returns keyID's own compressed public key.
@@ -124,23 +165,48 @@ func (w *Wrapper) Sign(ctx context.Context, keyID string, digest [32]byte, expec
 }
 
 // finishRecoverableSignature is Sign's own steps 2-4, factored out so
-// SignBSCDeposit (below) applies the identical low-s normalization and
+// SignBSCDeposit applies the identical low-s normalization and
 // recovery-id matching to a DER signature produced by BSCDepositKeys's
 // own in-process sign, rather than a real KMS response -- a caller of
 // either method gets an identically-shaped guarantee regardless of which
-// key type backed it.
+// key type backed it. Thin DER-parsing wrapper around
+// finishRecoverableSignatureRS (below), which every non-DER signer
+// (Privy's own raw_sign, which returns bare (r,s), never DER) uses
+// directly instead.
 func finishRecoverableSignature(der []byte, digest [32]byte, expectedPubKey [33]byte) ([65]byte, error) {
 	sig, err := ecdsa.ParseDERSignature(der)
 	if err != nil {
 		return [65]byte{}, fmt.Errorf("%w: %v", ErrMalformedSignature, err)
 	}
-
 	r := sig.R()
 	s := sig.S()
+	var rBytes, sBytes [32]byte
+	r.PutBytesUnchecked(rBytes[:])
+	s.PutBytesUnchecked(sBytes[:])
+	return finishRecoverableSignatureRS(rBytes, sBytes, digest, expectedPubKey)
+}
+
+// finishRecoverableSignatureRS is finishRecoverableSignature's own
+// lower-level core: given r/s already extracted -- from a parsed DER
+// signature above, or directly from a signer that never produces DER to
+// begin with (Privy's own raw_sign/secp256k1_sign responses) -- applies
+// low-s normalization (defensive: a non-canonical low-s input is already
+// canonical after this, a no-op, so applying it unconditionally is
+// always safe) and brute-forces the recovery id (0 or 1) by building a
+// compact-format buffer by hand purely to reuse RecoverCompact's own,
+// already-correct, already-tested recovery math -- see this file's own
+// top-of-file doc comment on compactSigRecoveryBase/compactSigCompressedFlag.
+func finishRecoverableSignatureRS(rBytes, sBytes [32]byte, digest [32]byte, expectedPubKey [33]byte) ([65]byte, error) {
+	var r, s secp256k1.ModNScalar
+	if overflow := r.SetBytes(&rBytes); overflow != 0 {
+		return [65]byte{}, fmt.Errorf("%w: r overflows the curve order", ErrMalformedSignature)
+	}
+	if overflow := s.SetBytes(&sBytes); overflow != 0 {
+		return [65]byte{}, fmt.Errorf("%w: s overflows the curve order", ErrMalformedSignature)
+	}
 	if s.IsOverHalfOrder() {
 		s.Negate()
 	}
-	var rBytes, sBytes [32]byte
 	r.PutBytesUnchecked(rBytes[:])
 	s.PutBytesUnchecked(sBytes[:])
 

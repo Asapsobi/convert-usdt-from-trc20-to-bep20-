@@ -40,6 +40,16 @@ func ApproverAuthConfigFromEnv() (AuthConfig, error) {
 	return authConfigFromEnv("S1_APPROVER_API_TOKENS")
 }
 
+// ProvisioningAuthConfigFromEnv reads S1_PROVISIONING_API_TOKENS, same
+// format -- the credential set for POST .../tron-deposit-keys. A
+// separate scope from C5Auth/Approver: tronwatcher is a brand-new S1
+// caller (previously only relayd talked to S1), and handing it a C5
+// token would let a compromised tronwatcher credential request arbitrary
+// slot signatures.
+func ProvisioningAuthConfigFromEnv() (AuthConfig, error) {
+	return authConfigFromEnv("S1_PROVISIONING_API_TOKENS")
+}
+
 func authConfigFromEnv(envVar string) (AuthConfig, error) {
 	raw := os.Getenv(envVar)
 	if raw == "" {

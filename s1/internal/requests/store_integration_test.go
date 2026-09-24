@@ -115,6 +115,17 @@ func (c *countingSigner) SignBSCDeposit(ctx context.Context, index uint32, diges
 	return c.inner.SignBSCDeposit(ctx, index, digest, expectedPubKey)
 }
 
+// SignTronDeposit is SignBSCDeposit's own counted counterpart, satisfying
+// the same widened requests.Signer interface.
+func (c *countingSigner) SignTronDeposit(ctx context.Context, index uint32, digest [32]byte, expectedPubKey [33]byte) ([65]byte, error) {
+	atomic.AddInt64(&c.calls, 1)
+	if atomic.LoadInt64(&c.failNextCalls) > 0 {
+		atomic.AddInt64(&c.failNextCalls, -1)
+		return [65]byte{}, fmt.Errorf("countingSigner: forced failure")
+	}
+	return c.inner.SignTronDeposit(ctx, index, digest, expectedPubKey)
+}
+
 func (c *countingSigner) forceFailNext(n int64) { atomic.StoreInt64(&c.failNextCalls, n) }
 
 func (c *countingSigner) callCount() int64 { return atomic.LoadInt64(&c.calls) }
@@ -126,6 +137,19 @@ func (c *countingSigner) callCount() int64 { return atomic.LoadInt64(&c.calls) }
 func testBSCDepositXprvXpub(t *testing.T) (xprv, xpub string) {
 	t.Helper()
 	master, err := bip32.NewMasterKey([]byte("s1 requests package integration-test fixture seed -- not real"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return master.B58Serialize(), master.PublicKey().B58Serialize()
+}
+
+// testTronDepositXprvXpub is testBSCDepositXprvXpub's own TRON-deposit
+// counterpart -- a different fixture seed, since a real deployment's
+// S1_TRON_DEPOSIT_XPRV/XPUB describe a different node than
+// S1_BSC_DEPOSIT_XPRV/XPUB entirely.
+func testTronDepositXprvXpub(t *testing.T) (xprv, xpub string) {
+	t.Helper()
+	master, err := bip32.NewMasterKey([]byte("s1 requests package integration-test fixture seed -- tron -- not real"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,9 +173,16 @@ func newTestStore(t *testing.T, pool *db.Pool, thresholdUSD float64) (*requests.
 	}
 	wrapper.SetBSCDepositKeys(depositKeys)
 
+	tronXprv, tronXpub := testTronDepositXprvXpub(t)
+	tronDepositKeys, err := kmssign.NewTronDepositKeys(tronXprv, tronXpub)
+	if err != nil {
+		t.Fatalf("NewTronDepositKeys: %v", err)
+	}
+	wrapper.SetTronDepositKeys(tronDepositKeys)
+
 	signer := &countingSigner{inner: wrapper}
 	slotGetter := fakeSlotKeyGetter{keys: map[int]requests.SlotKeyInfo{1: slotKey}}
-	store := requests.NewStore(pool, slotGetter, wrapper, signer, requests.Config{ApprovalThresholdUSD: thresholdUSD})
+	store := requests.NewStore(pool, slotGetter, wrapper, wrapper, nil, nil, signer, requests.Config{ApprovalThresholdUSD: thresholdUSD})
 	return store, signer, slotKey
 }
 
@@ -359,7 +390,7 @@ func TestRequestDepositSweepSignature_ApprovalFlowSignsWithTheCorrectDerivedKey(
 	if err != nil {
 		t.Fatalf("NewBSCDepositKeys: %v", err)
 	}
-	expectedPub, err := depositKeys.PublicKey(1042)
+	expectedPub, err := depositKeys.PublicKey(context.Background(), 1042)
 	if err != nil {
 		t.Fatalf("PublicKey: %v", err)
 	}
@@ -373,6 +404,115 @@ func TestRequestDepositSweepSignature_ApprovalFlowSignsWithTheCorrectDerivedKey(
 	}
 	if !recovered.IsEqual(expected) {
 		t.Fatal("signature recovers to a DIFFERENT public key than deposit index 1042's own derived key")
+	}
+}
+
+func TestRequestTronDepositSweepSignature_UnderThresholdSignsSynchronously(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	store, signer, _ := newTestStore(t, pool, 10000)
+
+	req, err := store.RequestTronDepositSweepSignature(ctx, 2042, [32]byte{1, 2, 3}, 5000, "idem-tron-deposit-1")
+	if err != nil {
+		t.Fatalf("RequestTronDepositSweepSignature: %v", err)
+	}
+	if req.Status != requests.StatusSigned {
+		t.Fatalf("Status = %s, want SIGNED", req.Status)
+	}
+	if req.SignedTx == ([65]byte{}) {
+		t.Fatal("SignedTx is empty on a SIGNED request")
+	}
+	if got := signer.callCount(); got != 1 {
+		t.Fatalf("Signer was called %d times, want exactly 1", got)
+	}
+
+	var auditCount int
+	var slotID *int
+	var tronDepositIndex *int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM signing_audit_log WHERE signing_request_id = $1`, req.ID).Scan(&auditCount); err != nil {
+		t.Fatalf("counting audit rows: %v", err)
+	}
+	if auditCount != 1 {
+		t.Fatalf("signing_audit_log rows for request %d = %d, want exactly 1", req.ID, auditCount)
+	}
+	if err := pool.QueryRow(ctx, `SELECT slot_id, tron_deposit_index FROM signing_requests WHERE id = $1`, req.ID).Scan(&slotID, &tronDepositIndex); err != nil {
+		t.Fatalf("reading back the request row: %v", err)
+	}
+	if slotID != nil {
+		t.Fatalf("slot_id = %v, want NULL for a TRON deposit-sweep request", *slotID)
+	}
+	if tronDepositIndex == nil || *tronDepositIndex != 2042 {
+		t.Fatalf("tron_deposit_index = %v, want 2042", tronDepositIndex)
+	}
+}
+
+func TestRequestTronDepositSweepSignature_AtOrAboveThresholdStaysPendingWithZeroSignCalls(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	store, signer, _ := newTestStore(t, pool, 10000)
+
+	req, err := store.RequestTronDepositSweepSignature(ctx, 2042, [32]byte{1}, 10000, "idem-tron-deposit-2")
+	if err != nil {
+		t.Fatalf("RequestTronDepositSweepSignature: %v", err)
+	}
+	if req.Status != requests.StatusPending {
+		t.Fatalf("Status = %s, want PENDING for a request at the threshold", req.Status)
+	}
+	if got := signer.callCount(); got != 0 {
+		t.Fatalf("Signer was called %d times, want 0", got)
+	}
+}
+
+func TestRequestTronDepositSweepSignature_ApprovalFlowSignsWithTheCorrectDerivedKey(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	store, signer, _ := newTestStore(t, pool, 10000)
+
+	pending, err := store.RequestTronDepositSweepSignature(ctx, 2042, [32]byte{7, 7, 7}, 50000, "idem-tron-deposit-approve")
+	if err != nil {
+		t.Fatalf("RequestTronDepositSweepSignature: %v", err)
+	}
+	if pending.Status != requests.StatusPending {
+		t.Fatalf("Status = %s, want PENDING", pending.Status)
+	}
+
+	if _, err := store.Approve(ctx, pending.ID, "approver-a"); err != nil {
+		t.Fatalf("Approve (1st): %v", err)
+	}
+	signed, err := store.Approve(ctx, pending.ID, "approver-b")
+	if err != nil {
+		t.Fatalf("Approve (2nd): %v", err)
+	}
+	if signed.Status != requests.StatusSigned {
+		t.Fatalf("Status = %s, want SIGNED after two distinct approvals", signed.Status)
+	}
+	if got := signer.callCount(); got != 1 {
+		t.Fatalf("Signer was called %d times, want exactly 1", got)
+	}
+
+	// Same proof as TestRequestDepositSweepSignature_ApprovalFlowSignsWithTheCorrectDerivedKey,
+	// for the TRON deposit path: the signature that came back really does
+	// verify against the deposit index's OWN derived public key.
+	digest := [32]byte{7, 7, 7}
+	xprv, xpub := testTronDepositXprvXpub(t)
+	tronDepositKeys, err := kmssign.NewTronDepositKeys(xprv, xpub)
+	if err != nil {
+		t.Fatalf("NewTronDepositKeys: %v", err)
+	}
+	expectedPub, err := tronDepositKeys.PublicKey(ctx, 2042)
+	if err != nil {
+		t.Fatalf("PublicKey: %v", err)
+	}
+	expected, err := secp256k1.ParsePubKey(expectedPub[:])
+	if err != nil {
+		t.Fatalf("parsing expected public key: %v", err)
+	}
+	recovered, _, err := ecdsa.RecoverCompact(compactFromR65(signed.SignedTx), digest[:])
+	if err != nil {
+		t.Fatalf("recovering public key from signature: %v", err)
+	}
+	if !recovered.IsEqual(expected) {
+		t.Fatal("signature recovers to a DIFFERENT public key than TRON deposit index 2042's own derived key")
 	}
 }
 

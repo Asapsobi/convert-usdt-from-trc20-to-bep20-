@@ -114,3 +114,57 @@ func TestFakeSigningService_SlotAddress(t *testing.T) {
 		t.Fatal("SlotAddress for an unconfigured slot: want an error, got nil")
 	}
 }
+
+func TestFakeSigningService_ProvisionTronDepositKeyIsIdempotent(t *testing.T) {
+	f := NewFakeSigningService(10000)
+	first, err := f.ProvisionTronDepositKey(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("ProvisionTronDepositKey (1st): %v", err)
+	}
+	if first.Index != 42 || first.Address == "" {
+		t.Fatalf("ProvisionTronDepositKey (1st) = %+v, want a non-empty address for index 42", first)
+	}
+
+	second, err := f.ProvisionTronDepositKey(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("ProvisionTronDepositKey (2nd, retried): %v", err)
+	}
+	if second != first {
+		t.Fatalf("retried ProvisionTronDepositKey(42) = %+v, want identical to first %+v", second, first)
+	}
+
+	other, err := f.ProvisionTronDepositKey(context.Background(), 43)
+	if err != nil {
+		t.Fatalf("ProvisionTronDepositKey (index 43): %v", err)
+	}
+	if other.Address == first.Address {
+		t.Fatalf("different indices got the same fake address: %q", other.Address)
+	}
+}
+
+func TestFakeSigningService_ProvisionBSCDepositKeyIsIdempotent(t *testing.T) {
+	f := NewFakeSigningService(10000)
+	first, err := f.ProvisionBSCDepositKey(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("ProvisionBSCDepositKey (1st): %v", err)
+	}
+	if first.Index != 42 || first.Address == "" {
+		t.Fatalf("ProvisionBSCDepositKey (1st) = %+v, want a non-empty address for index 42", first)
+	}
+
+	second, err := f.ProvisionBSCDepositKey(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("ProvisionBSCDepositKey (2nd, retried): %v", err)
+	}
+	if second != first {
+		t.Fatalf("retried ProvisionBSCDepositKey(42) = %+v, want identical to first %+v", second, first)
+	}
+
+	other, err := f.ProvisionBSCDepositKey(context.Background(), 43)
+	if err != nil {
+		t.Fatalf("ProvisionBSCDepositKey (index 43): %v", err)
+	}
+	if other.Address == first.Address {
+		t.Fatalf("different indices got the same fake address: %q", other.Address)
+	}
+}

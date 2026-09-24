@@ -30,10 +30,13 @@ var (
 	errUnauthorized   = newAPIError(http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token for this operation")
 	errInternal       = newAPIError(http.StatusInternalServerError, "internal", "internal error")
 
-	errRequestNotFound             = newAPIError(http.StatusNotFound, "signing_request_not_found", "no signing request exists with that id")
-	errAlreadyResolved             = newAPIError(http.StatusConflict, "already_resolved", "this signing request is already SIGNED or REJECTED")
-	errSlotNotFound                = newAPIError(http.StatusNotFound, "slot_not_found", "no slot is registered with that id")
-	errDepositSigningNotConfigured = newAPIError(http.StatusServiceUnavailable, "deposit_signing_not_configured", "this S1 deployment has no BSC deposit-sweep signing configured (S1_BSC_DEPOSIT_XPRV/XPUB unset)")
+	errRequestNotFound                      = newAPIError(http.StatusNotFound, "signing_request_not_found", "no signing request exists with that id")
+	errAlreadyResolved                      = newAPIError(http.StatusConflict, "already_resolved", "this signing request is already SIGNED or REJECTED")
+	errSlotNotFound                         = newAPIError(http.StatusNotFound, "slot_not_found", "no slot is registered with that id")
+	errDepositSigningNotConfigured          = newAPIError(http.StatusServiceUnavailable, "deposit_signing_not_configured", "this S1 deployment has no BSC deposit-sweep signing configured (S1_BSC_DEPOSIT_XPRV/XPUB unset)")
+	errTronDepositSigningNotConfigured      = newAPIError(http.StatusServiceUnavailable, "tron_deposit_signing_not_configured", "this S1 deployment has no TRON deposit-sweep signing configured (S1_TRON_DEPOSIT_XPRV/XPUB unset, or Privy mode not configured)")
+	errTronDepositProvisioningNotConfigured = newAPIError(http.StatusServiceUnavailable, "tron_deposit_provisioning_not_configured", "this S1 deployment has no Privy-backed TRON deposit-key provisioning configured (PRIVY_APP_ID/PRIVY_APP_SECRET unset)")
+	errBSCDepositProvisioningNotConfigured  = newAPIError(http.StatusServiceUnavailable, "bsc_deposit_provisioning_not_configured", "this S1 deployment has no Privy-backed BSC deposit-key provisioning configured (PRIVY_APP_ID/PRIVY_APP_SECRET unset)")
 )
 
 // mapError translates a domain error from any lower layer into the
@@ -50,6 +53,12 @@ func mapError(err error) *apiError {
 		return errSlotNotFound
 	case errors.Is(err, requests.ErrDepositSigningNotConfigured):
 		return errDepositSigningNotConfigured
+	case errors.Is(err, requests.ErrTronDepositSigningNotConfigured):
+		return errTronDepositSigningNotConfigured
+	case errors.Is(err, requests.ErrTronDepositProvisioningNotConfigured):
+		return errTronDepositProvisioningNotConfigured
+	case errors.Is(err, requests.ErrBSCDepositProvisioningNotConfigured):
+		return errBSCDepositProvisioningNotConfigured
 	default:
 		return errInternal
 	}

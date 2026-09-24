@@ -18,6 +18,20 @@ import (
 // checks for BSC's own extended keys.
 const tronAddressVersion = 0x41
 
+// DeriveTronAddress computes the base58check TRON address for a
+// compressed secp256k1 public key -- exported, no database access, so a
+// caller that already has a public key in hand (e.g. a TRON deposit-key
+// signature's own recovered/derived pubkey) can derive the address
+// without a second round trip through this package's own Get call.
+// Mirrors DeriveEVMAddress's own already-precedented shape (evm.go).
+func DeriveTronAddress(compressed [33]byte) (string, error) {
+	pub, err := secp256k1.ParsePubKey(compressed[:])
+	if err != nil {
+		return "", fmt.Errorf("slots: parsing public key: %w", err)
+	}
+	return deriveTronAddress(pub), nil
+}
+
 // deriveTronAddress computes the base58check TRON address for a
 // secp256k1 public key: Keccak256 of the 64-byte uncompressed point
 // (X||Y, never the 0x04 prefix byte -- the same convention

@@ -21,6 +21,10 @@ type Signer interface {
 	// deposit address at child index -- see
 	// internal/kmssign/bscdeposit.go's own doc comment.
 	SignBSCDeposit(ctx context.Context, index uint32, digest [32]byte, expectedPubKey [33]byte) ([65]byte, error)
+
+	// SignTronDeposit is SignBSCDeposit's own TRON-deposit counterpart --
+	// see internal/kmssign/trondeposit.go's own doc comment.
+	SignTronDeposit(ctx context.Context, index uint32, digest [32]byte, expectedPubKey [33]byte) ([65]byte, error)
 }
 
 // DepositKeyGetter is the one call this package needs to resolve a BSC
@@ -28,6 +32,13 @@ type Signer interface {
 // own PublicKeyForDeposit, or a fake for testing.
 type DepositKeyGetter interface {
 	PublicKeyForDeposit(ctx context.Context, index uint32) ([33]byte, error)
+}
+
+// TronDepositKeyGetter is DepositKeyGetter's own TRON-deposit
+// counterpart -- kmssign.Wrapper's own PublicKeyForTronDeposit, or a
+// fake for testing.
+type TronDepositKeyGetter interface {
+	PublicKeyForTronDeposit(ctx context.Context, index uint32) ([33]byte, error)
 }
 
 // SlotKeyInfo is the subset of internal/slots.SlotKey this package needs
@@ -61,24 +72,45 @@ type Config struct {
 
 // Store is this package's own real SigningService implementation.
 type Store struct {
-	pool        *db.Pool
-	slots       SlotKeyGetter
-	depositKeys DepositKeyGetter // nil disables RequestDepositSweepSignature entirely
-	signer      Signer
-	cfg         Config
+	pool                   *db.Pool
+	slots                  SlotKeyGetter
+	depositKeys            DepositKeyGetter       // nil disables RequestDepositSweepSignature entirely
+	tronDepositKeys        TronDepositKeyGetter   // nil disables RequestTronDepositSweepSignature entirely
+	tronDepositProvisioner TronDepositProvisioner // nil disables ProvisionTronDepositKey entirely -- see provisioning.go
+	bscDepositProvisioner  BSCDepositProvisioner  // nil disables ProvisionBSCDepositKey entirely -- see provisioning.go
+	signer                 Signer
+	cfg                    Config
 }
 
-// NewStore wires a Store. depositKeys may be nil -- a deployment that
-// never configures BSC deposit-sweep signing (S1_BSC_DEPOSIT_XPRV/XPUB
-// unset) gets ErrDepositSigningNotConfigured from
-// RequestDepositSweepSignature instead, not a nil-pointer panic.
-func NewStore(pool *db.Pool, slots SlotKeyGetter, depositKeys DepositKeyGetter, signer Signer, cfg Config) *Store {
-	return &Store{pool: pool, slots: slots, depositKeys: depositKeys, signer: signer, cfg: cfg}
+// NewStore wires a Store. depositKeys/tronDepositKeys/
+// tronDepositProvisioner/bscDepositProvisioner may each independently be
+// nil -- a deployment that never configures BSC (or TRON) deposit-sweep
+// signing (S1_BSC_DEPOSIT_XPRV/XPUB, or S1_TRON_DEPOSIT_XPRV/XPUB,
+// unset) gets ErrDepositSigningNotConfigured (or
+// ErrTronDepositSigningNotConfigured) from the corresponding
+// RequestDepositSweepSignature/RequestTronDepositSweepSignature call
+// instead of a nil-pointer panic; a deployment that never configures
+// Privy-backed TRON (or BSC) deposit-key provisioning (PRIVY_APP_ID/
+// PRIVY_APP_SECRET unset) gets ErrTronDepositProvisioningNotConfigured
+// (or ErrBSCDepositProvisioningNotConfigured) from
+// ProvisionTronDepositKey (or ProvisionBSCDepositKey) the same way.
+func NewStore(pool *db.Pool, slots SlotKeyGetter, depositKeys DepositKeyGetter, tronDepositKeys TronDepositKeyGetter,
+	tronDepositProvisioner TronDepositProvisioner, bscDepositProvisioner BSCDepositProvisioner,
+	signer Signer, cfg Config) *Store {
+	return &Store{
+		pool: pool, slots: slots, depositKeys: depositKeys, tronDepositKeys: tronDepositKeys,
+		tronDepositProvisioner: tronDepositProvisioner, bscDepositProvisioner: bscDepositProvisioner,
+		signer: signer, cfg: cfg,
+	}
 }
 
 // ErrDepositSigningNotConfigured is RequestDepositSweepSignature's own
 // result on a Store built with a nil DepositKeyGetter.
 var ErrDepositSigningNotConfigured = errors.New("requests: BSC deposit-sweep signing is not configured on this S1 deployment")
+
+// ErrTronDepositSigningNotConfigured is ErrDepositSigningNotConfigured's
+// own TRON-deposit counterpart.
+var ErrTronDepositSigningNotConfigured = errors.New("requests: TRON deposit-sweep signing is not configured on this S1 deployment")
 
 // RequestSignature implements SigningService. See this package's own doc
 // comment (requests.go) for the request/poll shape, and
@@ -122,7 +154,7 @@ func (s *Store) RequestDepositSweepSignature(ctx context.Context, index uint32, 
 	if s.depositKeys == nil {
 		return SigningRequest{}, ErrDepositSigningNotConfigured
 	}
-	ref := keyRef{depositIndex: &index}
+	ref := keyRef{bscDepositIndex: &index}
 	req, created, err := s.insertPending(ctx, ref, digest, estimatedUSD, idempotencyKey)
 	if err != nil {
 		return SigningRequest{}, err
@@ -142,13 +174,44 @@ func (s *Store) RequestDepositSweepSignature(ctx context.Context, index uint32, 
 	return signed, nil
 }
 
-// keyRef names exactly one of a slot id or a BSC deposit child index --
-// mirrors signing_requests' own CHECK constraint (migration 0005) in
-// Go, so insertPending/signAndRecord never have to juggle two separate
-// parameter lists for what is otherwise identical logic.
+// RequestTronDepositSweepSignature implements SigningService.
+// RequestDepositSweepSignature's own TRON-deposit counterpart -- identical
+// shape, routed to kmssign's own TRON-deposit derivation+signing instead
+// of the BSC one.
+func (s *Store) RequestTronDepositSweepSignature(ctx context.Context, index uint32, digest [32]byte, estimatedUSD float64, idempotencyKey string) (SigningRequest, error) {
+	if s.tronDepositKeys == nil {
+		return SigningRequest{}, ErrTronDepositSigningNotConfigured
+	}
+	ref := keyRef{tronDepositIndex: &index}
+	req, created, err := s.insertPending(ctx, ref, digest, estimatedUSD, idempotencyKey)
+	if err != nil {
+		return SigningRequest{}, err
+	}
+	if !created {
+		return req, nil
+	}
+
+	if estimatedUSD >= s.cfg.ApprovalThresholdUSD {
+		return req, nil
+	}
+
+	signed, err := s.signAndRecord(ctx, req.ID, ref, digest, nil)
+	if err != nil {
+		return SigningRequest{}, fmt.Errorf("requests: auto-sign for request %d: %w", req.ID, err)
+	}
+	return signed, nil
+}
+
+// keyRef names exactly one of a slot id, a BSC deposit child index, or a
+// TRON deposit child index -- mirrors signing_requests' own CHECK
+// constraint (migration 0006's num_nonnulls(...) = 1, superseding
+// migration 0005's original two-way XOR) in Go, so insertPending/
+// signAndRecord never have to juggle three separate parameter lists for
+// what is otherwise identical logic.
 type keyRef struct {
-	slotID       *int
-	depositIndex *uint32
+	slotID           *int
+	bscDepositIndex  *uint32
+	tronDepositIndex *uint32
 }
 
 // insertPending idempotently inserts a new PENDING row, or -- on a
@@ -157,11 +220,11 @@ type keyRef struct {
 // returns the existing row instead. created is false in the latter case.
 func (s *Store) insertPending(ctx context.Context, ref keyRef, digest [32]byte, estimatedUSD float64, idempotencyKey string) (SigningRequest, bool, error) {
 	row := s.pool.QueryRow(ctx, `
-		INSERT INTO signing_requests (idempotency_key, slot_id, bsc_deposit_index, digest, estimated_usd, status)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO signing_requests (idempotency_key, slot_id, bsc_deposit_index, tron_deposit_index, digest, estimated_usd, status)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (idempotency_key) DO NOTHING
 		RETURNING id, status, signed_tx, created_at
-	`, idempotencyKey, ref.slotID, ref.depositIndex, digest[:], estimatedUSD, string(StatusPending))
+	`, idempotencyKey, ref.slotID, ref.bscDepositIndex, ref.tronDepositIndex, digest[:], estimatedUSD, string(StatusPending))
 
 	req, err := scanRequest(row)
 	if err != nil {
@@ -226,9 +289,9 @@ func (s *Store) signAndRecord(ctx context.Context, requestID int64, ref keyRef, 
 			return nil
 		}
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO signing_audit_log (signing_request_id, slot_id, bsc_deposit_index, digest, approvers)
-			VALUES ($1, $2, $3, $4, $5)
-		`, requestID, ref.slotID, ref.depositIndex, digest[:], approvers); err != nil {
+			INSERT INTO signing_audit_log (signing_request_id, slot_id, bsc_deposit_index, tron_deposit_index, digest, approvers)
+			VALUES ($1, $2, $3, $4, $5, $6)
+		`, requestID, ref.slotID, ref.bscDepositIndex, ref.tronDepositIndex, digest[:], approvers); err != nil {
 			return fmt.Errorf("recording audit log for request %d: %w", requestID, err)
 		}
 		return nil
@@ -258,15 +321,28 @@ func (s *Store) signWith(ctx context.Context, ref keyRef, digest [32]byte) ([65]
 			return [65]byte{}, fmt.Errorf("signing: %w", err)
 		}
 		return sig, nil
-	case ref.depositIndex != nil:
+	case ref.bscDepositIndex != nil:
 		if s.depositKeys == nil {
 			return [65]byte{}, ErrDepositSigningNotConfigured
 		}
-		pub, err := s.depositKeys.PublicKeyForDeposit(ctx, *ref.depositIndex)
+		pub, err := s.depositKeys.PublicKeyForDeposit(ctx, *ref.bscDepositIndex)
 		if err != nil {
-			return [65]byte{}, fmt.Errorf("looking up public key for BSC deposit index %d: %w", *ref.depositIndex, err)
+			return [65]byte{}, fmt.Errorf("looking up public key for BSC deposit index %d: %w", *ref.bscDepositIndex, err)
 		}
-		sig, err := s.signer.SignBSCDeposit(ctx, *ref.depositIndex, digest, pub)
+		sig, err := s.signer.SignBSCDeposit(ctx, *ref.bscDepositIndex, digest, pub)
+		if err != nil {
+			return [65]byte{}, fmt.Errorf("signing: %w", err)
+		}
+		return sig, nil
+	case ref.tronDepositIndex != nil:
+		if s.tronDepositKeys == nil {
+			return [65]byte{}, ErrTronDepositSigningNotConfigured
+		}
+		pub, err := s.tronDepositKeys.PublicKeyForTronDeposit(ctx, *ref.tronDepositIndex)
+		if err != nil {
+			return [65]byte{}, fmt.Errorf("looking up public key for TRON deposit index %d: %w", *ref.tronDepositIndex, err)
+		}
+		sig, err := s.signer.SignTronDeposit(ctx, *ref.tronDepositIndex, digest, pub)
 		if err != nil {
 			return [65]byte{}, fmt.Errorf("signing: %w", err)
 		}
@@ -286,7 +362,7 @@ func (s *Store) signWith(ctx context.Context, ref keyRef, digest [32]byte) ([65]
 // not "what just came in."
 func (s *Store) ListPending(ctx context.Context) ([]PendingSummary, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, slot_id, bsc_deposit_index, estimated_usd, created_at FROM signing_requests
+		SELECT id, slot_id, bsc_deposit_index, tron_deposit_index, estimated_usd, created_at FROM signing_requests
 		WHERE status = $1 ORDER BY created_at ASC
 	`, string(StatusPending))
 	if err != nil {
@@ -297,13 +373,17 @@ func (s *Store) ListPending(ctx context.Context) ([]PendingSummary, error) {
 	var out []PendingSummary
 	for rows.Next() {
 		var p PendingSummary
-		var depositIndex *int64
-		if err := rows.Scan(&p.ID, &p.SlotID, &depositIndex, &p.EstimatedUSD, &p.CreatedAt); err != nil {
+		var depositIndex, tronDepositIndex *int64
+		if err := rows.Scan(&p.ID, &p.SlotID, &depositIndex, &tronDepositIndex, &p.EstimatedUSD, &p.CreatedAt); err != nil {
 			return nil, fmt.Errorf("requests: scanning pending row: %w", err)
 		}
 		if depositIndex != nil {
 			idx := uint32(*depositIndex)
 			p.BSCDepositIndex = &idx
+		}
+		if tronDepositIndex != nil {
+			idx := uint32(*tronDepositIndex)
+			p.TronDepositIndex = &idx
 		}
 		out = append(out, p)
 	}
@@ -360,12 +440,12 @@ type pendingRequestDetail struct {
 func (s *Store) getPendingDetail(ctx context.Context, requestID int64) (pendingRequestDetail, error) {
 	var d pendingRequestDetail
 	var slotID *int
-	var depositIndex *int64
+	var depositIndex, tronDepositIndex *int64
 	var digest []byte
 	var status string
 	err := s.pool.QueryRow(ctx, `
-		SELECT slot_id, bsc_deposit_index, digest, status FROM signing_requests WHERE id = $1
-	`, requestID).Scan(&slotID, &depositIndex, &digest, &status)
+		SELECT slot_id, bsc_deposit_index, tron_deposit_index, digest, status FROM signing_requests WHERE id = $1
+	`, requestID).Scan(&slotID, &depositIndex, &tronDepositIndex, &digest, &status)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return pendingRequestDetail{}, ErrRequestNotFound
@@ -375,7 +455,11 @@ func (s *Store) getPendingDetail(ctx context.Context, requestID int64) (pendingR
 	d.ref.slotID = slotID
 	if depositIndex != nil {
 		idx := uint32(*depositIndex)
-		d.ref.depositIndex = &idx
+		d.ref.bscDepositIndex = &idx
+	}
+	if tronDepositIndex != nil {
+		idx := uint32(*tronDepositIndex)
+		d.ref.tronDepositIndex = &idx
 	}
 	d.status = Status(status)
 	copy(d.digest[:], digest)
