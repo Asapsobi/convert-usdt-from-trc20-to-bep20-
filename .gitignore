@@ -28,6 +28,11 @@ vendor/
 *.test
 coverage.out
 
+# Locally built service binaries (go build -o ./<name> ./cmd/<name>) --
+# never the source of truth, rebuildable from cmd/ at any time.
+/relayd/relayd
+/depositwatcher/watcherd
+
 # Node
 node_modules/
 npm-debug.log*
