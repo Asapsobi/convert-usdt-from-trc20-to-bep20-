@@ -181,6 +181,10 @@ func newEngineFromEnv(pool *db.Pool) (*engine, error) {
 		contractAddress = defaultContractAddress
 	}
 
+	if err := runEngineSelfChecks(providers, contractAddress, ledger); err != nil {
+		return nil, err
+	}
+
 	dustFloor := defaultDustFloor
 	if raw := os.Getenv("WATCHER_DUST_FLOOR"); raw != "" {
 		parsed, err := money.ParseDecimal(raw)

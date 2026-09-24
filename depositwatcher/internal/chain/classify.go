@@ -12,7 +12,7 @@ import (
 	"depositwatcher/internal/money"
 )
 
-// usdtBEP20ContractDecimals is this token's OWN on-chain decimals(), NOT
+// TokenDecimals is this token's OWN on-chain decimals(), NOT
 // this service's ledger-facing money.Decimals. Verified live against the
 // real contract on BSC mainnet (0x55d398326f99059fF775485246999027B3197955,
 // Binance-Peg BSC-USD) via a direct eth_call to decimals() on 2026-09-05,
@@ -21,7 +21,7 @@ import (
 // citation, per that spec's explicit instruction to verify independently.
 // Every raw Transfer amount this package sees is in these 18-decimal units
 // until ParseTransferLog rescales it.
-const usdtBEP20ContractDecimals = 18
+const TokenDecimals = 18
 
 // transferEventTopic is keccak256("Transfer(address,address,uint256)"),
 // the ERC20 Transfer event's signature hash -- computed here, not
@@ -58,7 +58,7 @@ func ParseTransferLog(log types.Log) (from, to common.Address, amount money.Amou
 	to = common.BytesToAddress(log.Topics[2].Bytes())
 
 	raw := new(big.Int).SetBytes(log.Data)
-	amount, err = money.FromOnChainUnits(raw, usdtBEP20ContractDecimals)
+	amount, err = money.FromOnChainUnits(raw, TokenDecimals)
 	if err != nil {
 		return common.Address{}, common.Address{}, 0, fmt.Errorf("chain: parsing transfer amount for log %s:%d: %w",
 			log.TxHash, log.Index, err)
