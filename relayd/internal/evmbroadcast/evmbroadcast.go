@@ -82,6 +82,33 @@ func (c *Client) SuggestGasPrice(ctx context.Context) (*big.Int, error) {
 }
 
 // Broadcast submits signed and returns its own transaction hash.
+// ChainID returns the connected node's own chain id -- 56 for BSC
+// mainnet, anything else means relayd is pointed at the wrong network.
+func (c *Client) ChainID(ctx context.Context) (*big.Int, error) {
+	id, err := c.eth.ChainID(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("evmbroadcast: eth_chainId: %w", err)
+	}
+	return id, nil
+}
+
+// decimalsSelector is keccak256("decimals()")[:4].
+var decimalsSelector = []byte{0x31, 0x3c, 0xe5, 0x67}
+
+// TokenDecimals reads token's own decimals() from the chain.
+func (c *Client) TokenDecimals(ctx context.Context, token string) (uint8, error) {
+	to := common.HexToAddress(token)
+	out, err := c.eth.CallContract(ctx, ethereum.CallMsg{To: &to, Data: decimalsSelector}, nil)
+	if err != nil {
+		return 0, fmt.Errorf("evmbroadcast: calling decimals() on %s: %w", token, err)
+	}
+	value := new(big.Int).SetBytes(out)
+	if len(out) != 32 || !value.IsUint64() || value.Uint64() > 255 {
+		return 0, fmt.Errorf("evmbroadcast: decimals() on %s returned %x, not a uint8", token, out)
+	}
+	return uint8(value.Uint64()), nil
+}
+
 func (c *Client) Broadcast(ctx context.Context, signed *types.Transaction) (string, error) {
 	if err := c.eth.SendTransaction(ctx, signed); err != nil {
 		return "", fmt.Errorf("evmbroadcast: broadcasting: %w", err)

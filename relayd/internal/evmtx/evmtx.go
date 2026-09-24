@@ -46,7 +46,7 @@ import (
 // BscScan per that file's own doc comment.
 const USDTContractAddress = "0x55d398326f99059fF775485246999027B3197955"
 
-// usdtBEP20OnChainDecimals is this contract's own real on-chain decimal
+// USDTOnChainDecimals is this contract's own real on-chain decimal
 // precision -- confirmed live against its actual Transfer log data
 // (2 USDT deposit encoded as 0x1bc16d674ec80000 = 2e18). This is
 // independent of money.Amount's own internal minor-unit convention
@@ -59,7 +59,7 @@ const USDTContractAddress = "0x55d398326f99059fF775485246999027B3197955"
 // the intended amount. See this package's own header comment: this file
 // is the first BEP20 transfer this codebase has ever built or
 // broadcast, which is how this went uncaught until a real one ran.
-const usdtBEP20OnChainDecimals = 18
+const USDTOnChainDecimals = 18
 
 // BSCChainID is BSC mainnet's own EIP-155 chain id -- required for
 // transaction replay protection; a signature valid on one EVM chain
@@ -172,11 +172,11 @@ func buildCalldata(recipient common.Address, amount money.Amount) []byte {
 // minor units, money.USDT_BEP20.Decimals() places -- guaranteed 6 by
 // BuildTransfer's own asset check above, which every caller of this
 // unexported helper goes through) to this contract's real 18-decimal
-// on-chain units -- see usdtBEP20OnChainDecimals's own doc comment for
+// on-chain units -- see USDTOnChainDecimals's own doc comment for
 // why this scaling exists at all.
 func onChainAmount(amount money.Amount) *big.Int {
 	internalDecimals, _ := money.USDT_BEP20.Decimals() // static, always valid -- see money.Asset.Decimals()
-	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(usdtBEP20OnChainDecimals-int64(internalDecimals)), nil)
+	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(USDTOnChainDecimals-int64(internalDecimals)), nil)
 	return new(big.Int).Mul(big.NewInt(amount.Units), scale)
 }
 
@@ -202,6 +202,59 @@ func WithSignature(tx *types.Transaction, sig [65]byte) (*types.Transaction, err
 // not over raw_data before signing the way TRON's txID is).
 func TxHash(signed *types.Transaction) [32]byte {
 	return signed.Hash()
+}
+
+// ErrNotATransfer means a transaction is not a plain, zero-value
+// transfer(address,uint256) call to a contract.
+var ErrNotATransfer = errors.New("evmtx: not a token transfer")
+
+// DecodedTransfer is what a transfer transaction actually does, read
+// back from its own bytes.
+type DecodedTransfer struct {
+	Token     common.Address
+	Recipient common.Address
+	Amount    *big.Int // raw on-chain units, not money.Amount's minor units
+}
+
+// DecodeTransfer is BuildTransfer's inverse: it reads what tx will really
+// do on-chain, so a caller can check the bytes about to be broadcast
+// instead of trusting how they were built.
+func DecodeTransfer(tx *types.Transaction) (DecodedTransfer, error) {
+	if tx.To() == nil {
+		return DecodedTransfer{}, fmt.Errorf("%w: contract creation", ErrNotATransfer)
+	}
+	if tx.Value().Sign() != 0 {
+		return DecodedTransfer{}, fmt.Errorf("%w: also sends %s wei of BNB", ErrNotATransfer, tx.Value())
+	}
+	data := tx.Data()
+	if len(data) != 4+32+32 {
+		return DecodedTransfer{}, fmt.Errorf("%w: calldata is %d bytes, want 68", ErrNotATransfer, len(data))
+	}
+	if string(data[:4]) != string(transferMethodID) {
+		return DecodedTransfer{}, fmt.Errorf("%w: method selector %x", ErrNotATransfer, data[:4])
+	}
+	for _, b := range data[4 : 4+12] {
+		if b != 0 {
+			return DecodedTransfer{}, fmt.Errorf("%w: recipient word is not a 20-byte address", ErrNotATransfer)
+		}
+	}
+	return DecodedTransfer{
+		Token:     *tx.To(),
+		Recipient: common.BytesToAddress(data[4+12 : 4+32]),
+		Amount:    new(big.Int).SetBytes(data[4+32 : 4+64]),
+	}, nil
+}
+
+// Sender recovers the address that actually signed signed, under BSC's
+// EIP-155 rules. On EVM chains the sender is never stated in a
+// transaction -- it IS whoever signed -- so a signature from the wrong
+// key silently moves funds from a different address.
+func Sender(signed *types.Transaction) (common.Address, error) {
+	from, err := types.Sender(types.NewEIP155Signer(big.NewInt(BSCChainID)), signed)
+	if err != nil {
+		return common.Address{}, fmt.Errorf("evmtx: recovering sender: %w", err)
+	}
+	return from, nil
 }
 
 // MarshalForBroadcast returns signed's own RLP-encoded bytes, ready to

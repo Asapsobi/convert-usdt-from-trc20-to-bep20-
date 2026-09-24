@@ -494,6 +494,10 @@ func (o *Orchestrator) advanceRefundPendingOneTRC20(ctx context.Context, leg rel
 		return fmt.Errorf("unexpected signing status %q", sigReq.Status)
 	}
 
+	intent := transferIntent{sender: o.Cfg.SlotAddress, recipient: *order.SenderAddress, amount: leg.AmountIn}
+	if err := o.preflightRefundTRON(ctx, leg, pb.unsignedTx, intent); err != nil {
+		return err
+	}
 	txID, err := o.Chain.BroadcastSigned(ctx, pb.unsignedTx, sigReq.SignedTx)
 	if err != nil {
 		return fmt.Errorf("broadcasting refund: %w", err)
@@ -622,6 +626,10 @@ func (o *Orchestrator) advanceRefundPendingOneBEP20(ctx context.Context, leg rel
 	signed, err := evmtx.WithSignature(pb.unsignedTx, sigReq.SignedTx)
 	if err != nil {
 		return fmt.Errorf("applying signature: %w", err)
+	}
+	intent := transferIntent{sender: o.Cfg.SlotEVMAddress, recipient: *order.SenderAddress, amount: leg.AmountIn}
+	if err := o.preflightRefundEVM(ctx, leg, signed, intent); err != nil {
+		return err
 	}
 	txHash, err := o.EVMChain.Broadcast(ctx, signed)
 	if err != nil {

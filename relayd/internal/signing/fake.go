@@ -2,15 +2,24 @@ package signing
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"crypto/sha256"
 	"fmt"
 	"sync"
+
+	"github.com/ethereum/go-ethereum/crypto"
+	tronaddress "github.com/fbsobreira/gotron-sdk/pkg/address"
 )
 
 // FakeSigningService is a deterministic, in-memory stand-in for a real
 // S1 -- mirrors dispatcher/internal/signing's own FakeSigningService,
-// used by relayd's own state-machine/orchestrate tests that care about
-// forward-leg logic, not S1's own cryptography.
+// used by relayd's own state-machine/orchestrate tests.
+//
+// It signs for real, with fixed test keys (one per slot, one per deposit
+// index), so orchestrate's pre-broadcast signer check runs in these
+// tests exactly as in production. A test's slot and deposit addresses
+// must therefore be the ones these keys control: FakeSlotEVMAddress,
+// FakeBSCDepositAddress, and friends.
 type FakeSigningService struct {
 	mu                                    sync.Mutex
 	seq                                   int64
@@ -69,12 +78,48 @@ func (f *FakeSigningService) ForceDuplicateSignature(idempotencyKey, reuseIdempo
 	f.forceDuplicateOf[idempotencyKey] = reuseIdempotencyKey
 }
 
-func fakeSignedTx(idempotencyKey string, digest [32]byte) [65]byte {
-	h := sha256.Sum256(append([]byte("fake-signed-tx:"+idempotencyKey+":"), digest[:]...))
+// fakeKey is the fixed test key for one (kind, n) -- a slot or a deposit
+// index. Never used outside tests.
+func fakeKey(kind string, n uint64) *ecdsa.PrivateKey {
+	seed := sha256.Sum256([]byte(fmt.Sprintf("relayd-fake-signing-key:%s:%d", kind, n)))
+	key, err := crypto.ToECDSA(seed[:])
+	if err != nil {
+		panic(fmt.Sprintf("signing: deriving fake %s key %d: %v", kind, n, err))
+	}
+	return key
+}
+
+func slotKey(slotID int) *ecdsa.PrivateKey          { return fakeKey("slot", uint64(slotID)) }
+func bscDepositKey(index uint32) *ecdsa.PrivateKey  { return fakeKey("bsc-deposit", uint64(index)) }
+func tronDepositKey(index uint32) *ecdsa.PrivateKey { return fakeKey("tron-deposit", uint64(index)) }
+func evmAddress(key *ecdsa.PrivateKey) string       { return crypto.PubkeyToAddress(key.PublicKey).Hex() }
+func tronAddress(key *ecdsa.PrivateKey) string {
+	return tronaddress.PubkeyToAddress(key.PublicKey).String()
+}
+
+// FakeSlotEVMAddress is the BSC address slotID's fake key signs as.
+func FakeSlotEVMAddress(slotID int) string { return evmAddress(slotKey(slotID)) }
+
+// FakeSlotTronAddress is the TRON address slotID's fake key signs as.
+func FakeSlotTronAddress(slotID int) string { return tronAddress(slotKey(slotID)) }
+
+// FakeBSCDepositAddress is the BSC deposit address index's fake key
+// controls.
+func FakeBSCDepositAddress(index uint32) string { return evmAddress(bscDepositKey(index)) }
+
+// FakeTronDepositAddress is the TRON deposit address index's fake key
+// controls.
+func FakeTronDepositAddress(index uint32) string { return tronAddress(tronDepositKey(index)) }
+
+// signWith produces a real 65-byte r||s||v signature (v a raw 0/1
+// recovery byte), the same shape the real S1 returns.
+func signWith(key *ecdsa.PrivateKey, digest [32]byte) [65]byte {
+	sig, err := crypto.Sign(digest[:], key)
+	if err != nil {
+		panic(fmt.Sprintf("signing: fake signature: %v", err))
+	}
 	var out [65]byte
-	copy(out[:32], h[:])
-	copy(out[32:64], h[:])
-	out[64] = byte(len(idempotencyKey))
+	copy(out[:], sig)
 	return out
 }
 
@@ -98,7 +143,7 @@ func (f *FakeSigningService) RequestSignature(ctx context.Context, slotID int, d
 
 	f.seq++
 	id := f.seq
-	signedTx := fakeSignedTx(idempotencyKey, digest)
+	signedTx := signWith(slotKey(slotID), digest)
 	if reuseKey, ok := f.forceDuplicateOf[idempotencyKey]; ok {
 		if reuseID, ok := f.byIdemKey[reuseKey]; ok {
 			signedTx = f.byID[reuseID].SignedTx
@@ -116,11 +161,7 @@ func (f *FakeSigningService) RequestSignature(ctx context.Context, slotID int, d
 // forceDuplicateOf with RequestSignature, mirroring the real S1's own
 // dedup-by-idempotency-key behavior regardless of slot-vs-deposit ref
 // (s1/internal/requests/store.go), with its own separate call counter.
-// Deliberately does NOT produce a real recoverable ECDSA signature (same
-// SHA256-derived fake bytes as RequestSignature) -- this fake exists for
-// state-machine/orchestrate-logic tests, never for verifying real
-// signer-recovery correctness, which is exactly why the new E2E test for
-// this fix drives a real S1 instead of this fake.
+// Signs with index's fixed BSC deposit key (FakeBSCDepositAddress).
 func (f *FakeSigningService) RequestDepositSweepSignature(ctx context.Context, index uint32, digest [32]byte, estimatedUSD float64, idempotencyKey string) (SigningRequest, error) {
 	if err := ctx.Err(); err != nil {
 		return SigningRequest{}, err
@@ -139,7 +180,7 @@ func (f *FakeSigningService) RequestDepositSweepSignature(ctx context.Context, i
 
 	f.seq++
 	id := f.seq
-	signedTx := fakeSignedTx(idempotencyKey, digest)
+	signedTx := signWith(bscDepositKey(index), digest)
 	if reuseKey, ok := f.forceDuplicateOf[idempotencyKey]; ok {
 		if reuseID, ok := f.byIdemKey[reuseKey]; ok {
 			signedTx = f.byID[reuseID].SignedTx
@@ -155,10 +196,8 @@ func (f *FakeSigningService) RequestDepositSweepSignature(ctx context.Context, i
 // RequestTronDepositSweepSignature implements the same shape as
 // signing.Client's own method -- RequestDepositSweepSignature's own
 // TRON-deposit counterpart, sharing byID/byIdemKey/forceErr/
-// forceDuplicateOf, with its own separate call counter. Same fake-bytes
-// posture as RequestDepositSweepSignature: never a real recoverable
-// signature, so real signer-recovery correctness is proven only by the
-// E2E test driving a real S1 instead of this fake.
+// forceDuplicateOf, with its own separate call counter. Signs with
+// index's fixed TRON deposit key (FakeTronDepositAddress).
 func (f *FakeSigningService) RequestTronDepositSweepSignature(ctx context.Context, index uint32, digest [32]byte, estimatedUSD float64, idempotencyKey string) (SigningRequest, error) {
 	if err := ctx.Err(); err != nil {
 		return SigningRequest{}, err
@@ -177,7 +216,7 @@ func (f *FakeSigningService) RequestTronDepositSweepSignature(ctx context.Contex
 
 	f.seq++
 	id := f.seq
-	signedTx := fakeSignedTx(idempotencyKey, digest)
+	signedTx := signWith(tronDepositKey(index), digest)
 	if reuseKey, ok := f.forceDuplicateOf[idempotencyKey]; ok {
 		if reuseID, ok := f.byIdemKey[reuseKey]; ok {
 			signedTx = f.byID[reuseID].SignedTx

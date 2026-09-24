@@ -144,6 +144,10 @@ func (o *Orchestrator) advanceForwardingOneBEP20(ctx context.Context, leg relay.
 	if err != nil {
 		return fmt.Errorf("applying signature: %w", err)
 	}
+	intent := transferIntent{sender: leg.DepositAddress, recipient: *leg.UpstreamDepositAddress, amount: amount}
+	if err := o.preflightForwardEVM(ctx, leg, signed, intent); err != nil {
+		return err
+	}
 	txHash, err := o.EVMChain.Broadcast(ctx, signed)
 	if err != nil {
 		return fmt.Errorf("broadcasting: %w", err)

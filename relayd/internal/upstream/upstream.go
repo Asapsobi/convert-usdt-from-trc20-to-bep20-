@@ -83,6 +83,18 @@ type SwapProvider interface {
 	GetOrder(ctx context.Context, providerOrderID string) (SwapOrder, error)
 }
 
+// SelfChecker is implemented by a provider that can verify, at startup,
+// that its own credentials and configuration actually work -- so a
+// placeholder API key or a wrong currency code stops relayd from
+// starting instead of failing the first real customer order.
+type SelfChecker interface {
+	SelfCheck(ctx context.Context) error
+}
+
+// ErrMisconfigured means a SelfCheck found the provider reachable but
+// wrongly configured -- fatal, unlike a transport error.
+var ErrMisconfigured = errors.New("upstream: provider misconfigured")
+
 // ErrNoVendorConfigured is PlaceholderProvider's only possible result --
 // same posture as screening's AlwaysCleanProvider and energybroker's
 // NoOpProvider: reachable through the real interface, gated behind an

@@ -850,11 +850,14 @@ func TestFullHappyPath_BEP20ToTRC20(t *testing.T) {
 	// derivation index from -- fakeBEP20DepositWatcher below is
 	// configured to agree with this fixture value, standing in for what
 	// a real depositwatcher would report.
+	// The deposit address must be the one the fake signer's key for this
+	// index controls: the pre-broadcast check recovers the real signer.
 	depositDerivationIndex := uint32(7)
+	depositAddress := signing.FakeBSCDepositAddress(depositDerivationIndex)
 	leg, err := store.Create(context.Background(), relay.Leg{
 		ExternalID: externalID, OrderID: order.ID, Direction: relay.BEP20ToTRC20,
 		CustomerID: "cust-happy-2", DestinationAddress: "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj",
-		DepositAddress:         "0xrelayd-fixture-deposit-address",
+		DepositAddress:         depositAddress,
 		DepositDerivationIndex: &depositDerivationIndex,
 		AmountIn:               money.Amount{Asset: money.USDT_BEP20, Units: 100_000000},
 		AmountOutExpected:      money.Amount{Asset: money.USDT_TRC20, Units: 99_700000},
@@ -885,7 +888,7 @@ func TestFullHappyPath_BEP20ToTRC20(t *testing.T) {
 	evmChain := &fakeEVMChain{}
 	evmFinality := newFakeEVMFinality()
 	bep20DepositWatcher := newFakeBEP20DepositWatcher()
-	bep20DepositWatcher.set(order.ID, "0xrelayd-fixture-deposit-address", depositDerivationIndex)
+	bep20DepositWatcher.set(order.ID, depositAddress, depositDerivationIndex)
 
 	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alert.LogAlerter{},
 		bep20DepositWatcher, nil, orchestrate.Config{

@@ -134,3 +134,34 @@ func TestDigest_MatchesLiveVerifiedTxID(t *testing.T) {
 		t.Fatalf("Digest = %s, want %s (a real, live-captured txID for this exact raw_data)", got, wantTxID)
 	}
 }
+
+func TestDecodeTransfer_RoundTripsBuildTransfer(t *testing.T) {
+	ref := BlockReference{BlockNumber: 0x355c, Timestamp: time.UnixMilli(1788859176552), Expiration: time.UnixMilli(1788859233000)}
+	unsigned, err := BuildTransfer("TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH", "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj", mustAmount(t, "1.630000"), ref)
+	if err != nil {
+		t.Fatalf("BuildTransfer: %v", err)
+	}
+
+	got, err := DecodeTransfer(unsigned)
+	if err != nil {
+		t.Fatalf("DecodeTransfer: %v", err)
+	}
+	if got.Owner != "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH" {
+		t.Errorf("Owner = %s", got.Owner)
+	}
+	if got.Recipient != "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj" {
+		t.Errorf("Recipient = %s", got.Recipient)
+	}
+	if got.Token != USDTContractAddress {
+		t.Errorf("Token = %s, want %s", got.Token, USDTContractAddress)
+	}
+	if got.Amount.Int64() != 1_630000 {
+		t.Errorf("Amount = %s, want 1630000 (TRC20 USDT is 6 decimals on-chain)", got.Amount)
+	}
+}
+
+func TestDecodeTransfer_RejectsNonTransferBytes(t *testing.T) {
+	if _, err := DecodeTransfer([]byte("definitely not a protobuf transaction")); !errors.Is(err, ErrNotATransfer) {
+		t.Fatalf("expected ErrNotATransfer, got %v", err)
+	}
+}

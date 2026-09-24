@@ -24,6 +24,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"math/big"
 	"strconv"
 	"time"
 
@@ -39,6 +40,12 @@ import (
 // USDTContractAddress is the one real, permanent USDT-TRC20 contract --
 // duplicated from dispatcher/internal/txbuild's own verified constant.
 const USDTContractAddress = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+
+// USDTOnChainDecimals is USDT-TRC20's own on-chain decimal precision --
+// the same 6 as money.Amount's internal units, which is why
+// buildCalldata encodes Units unscaled (unlike evmtx, whose BEP20 USDT
+// has 18).
+const USDTOnChainDecimals = 6
 
 // transferMethod is USDT's (and every standard TRC20's) transfer method
 // signature.
@@ -134,6 +141,62 @@ func buildCalldata(recipientBase58 string, amountUnits int64) ([]byte, error) {
 		{"address": recipientBase58},
 		{"uint256": strconv.FormatInt(amountUnits, 10)},
 	})
+}
+
+// ErrNotATransfer means an unsigned transaction is not a single, plain
+// TRC20 transfer(address,uint256) call.
+var ErrNotATransfer = errors.New("txbuild: not a TRC20 transfer")
+
+// transferSelector is keccak256(transferMethod)[:4], the first 4 bytes
+// buildCalldata's abi.Pack output always starts with.
+var transferSelector = []byte{0xa9, 0x05, 0x9c, 0xbb}
+
+// DecodedTransfer is what an unsigned TRC20 transfer actually does, read
+// back from its own bytes. Addresses are base58check T-addresses.
+type DecodedTransfer struct {
+	Owner     string
+	Token     string
+	Recipient string
+	Amount    *big.Int // raw on-chain units
+}
+
+// DecodeTransfer is BuildTransfer's inverse: it reads what unsignedTx
+// will really do on-chain, so a caller can check the bytes about to be
+// broadcast instead of trusting how they were built.
+func DecodeTransfer(unsignedTx []byte) (DecodedTransfer, error) {
+	raw := &core.TransactionRaw{}
+	if err := proto.Unmarshal(unsignedTx, raw); err != nil {
+		return DecodedTransfer{}, fmt.Errorf("%w: unmarshaling raw_data: %v", ErrNotATransfer, err)
+	}
+	if len(raw.Contract) != 1 || raw.Contract[0].Type != core.Transaction_Contract_TriggerSmartContract {
+		return DecodedTransfer{}, fmt.Errorf("%w: want exactly one TriggerSmartContract", ErrNotATransfer)
+	}
+	trigger := &core.TriggerSmartContract{}
+	if err := raw.Contract[0].Parameter.UnmarshalTo(trigger); err != nil {
+		return DecodedTransfer{}, fmt.Errorf("%w: unwrapping TriggerSmartContract: %v", ErrNotATransfer, err)
+	}
+	if trigger.CallValue != 0 || trigger.CallTokenValue != 0 {
+		return DecodedTransfer{}, fmt.Errorf("%w: also sends TRX or a TRC10 token", ErrNotATransfer)
+	}
+	data := trigger.Data
+	if len(data) != 4+32+32 {
+		return DecodedTransfer{}, fmt.Errorf("%w: calldata is %d bytes, want 68", ErrNotATransfer, len(data))
+	}
+	if string(data[:4]) != string(transferSelector) {
+		return DecodedTransfer{}, fmt.Errorf("%w: method selector %x", ErrNotATransfer, data[:4])
+	}
+	for _, b := range data[4 : 4+12] {
+		if b != 0 {
+			return DecodedTransfer{}, fmt.Errorf("%w: recipient word is not a 20-byte address", ErrNotATransfer)
+		}
+	}
+	recipient := append([]byte{address.TronBytePrefix}, data[4+12:4+32]...)
+	return DecodedTransfer{
+		Owner:     address.Address(trigger.OwnerAddress).String(),
+		Token:     address.Address(trigger.ContractAddress).String(),
+		Recipient: address.Address(recipient).String(),
+		Amount:    new(big.Int).SetBytes(data[4+32 : 4+64]),
+	}, nil
 }
 
 // Digest is SHA256 of unsignedTx (BuildTransfer's own return value) --

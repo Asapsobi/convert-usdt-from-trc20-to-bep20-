@@ -156,6 +156,13 @@ func buildDriverAndOrchestrator(ctx context.Context, pool *db.Pool) (*driver.Dri
 	}
 	slog.Info("relayd: upstream swap provider configured", "provider", providerName)
 
+	if err := runStartupSelfChecks(ctx, startupDeps{
+		bsc: evmClient, provider: swapProvider, ledger: ledger,
+		bep20Watcher: bep20Watcher, tronWatcher: tronWatcher,
+	}); err != nil {
+		return nil, nil, err
+	}
+
 	feeBasisPoints, err := requiredEnvInt64("RELAYD_FEE_BASIS_POINTS")
 	if err != nil {
 		return nil, nil, err

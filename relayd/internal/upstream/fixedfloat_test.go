@@ -338,3 +338,50 @@ func mustMarshal(t *testing.T, v any) json.RawMessage {
 	}
 	return b
 }
+
+func TestSelfCheck_PassesWhenBothConfiguredCurrenciesAreListed(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Write([]byte(`{"code":0,"msg":"OK","data":[{"code":"BTC"},{"code":"USDTBSC"},{"code":"USDTTRC"}]}`))
+	}))
+	defer srv.Close()
+	p, _ := NewFixedFloatProvider(testConfig(srv.Client()))
+	p.overrideBaseURLForTest(srv.URL)
+
+	if err := p.SelfCheck(context.Background()); err != nil {
+		t.Fatalf("expected pass, got %v", err)
+	}
+	if gotPath != "/ccies" {
+		t.Errorf("expected POST /ccies, got %s", gotPath)
+	}
+}
+
+func TestSelfCheck_RejectsACurrencyCodeFixedFloatDoesNotList(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"code":0,"msg":"OK","data":[{"code":"USDTTRC"}]}`))
+	}))
+	defer srv.Close()
+	p, _ := NewFixedFloatProvider(testConfig(srv.Client()))
+	p.overrideBaseURLForTest(srv.URL)
+
+	if err := p.SelfCheck(context.Background()); !errors.Is(err, ErrMisconfigured) {
+		t.Fatalf("expected ErrMisconfigured for the missing USDTBSC code, got %v", err)
+	}
+}
+
+// The exact response a placeholder API key got on 2026-09-23, with the
+// code quoted as a string.
+func TestSelfCheck_SurfacesARejectedKeyAsAnAPIError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"code":"501","msg":"Not have permission","data":null}`))
+	}))
+	defer srv.Close()
+	p, _ := NewFixedFloatProvider(testConfig(srv.Client()))
+	p.overrideBaseURLForTest(srv.URL)
+
+	var apiErr *APIError
+	if err := p.SelfCheck(context.Background()); !errors.As(err, &apiErr) || apiErr.Code != 501 {
+		t.Fatalf("expected an *APIError with code 501, got %v", err)
+	}
+}

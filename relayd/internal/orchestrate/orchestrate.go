@@ -235,6 +235,7 @@ type Orchestrator struct {
 	pendingEVM       map[string]pendingEVMForward // externalID -> cached unsigned BEP20 forward tx
 	pendingRefund    map[string]pendingForward    // externalID -> cached unsigned TRC20 refund tx
 	pendingRefundEVM map[string]pendingEVMForward // externalID -> cached unsigned BEP20 refund tx
+	preflightAlerted map[string]string            // externalID -> last pre-broadcast failure already alerted on
 }
 
 // pendingForward caches a TRC20 forward leg's unsigned bytes across
@@ -298,6 +299,7 @@ func New(store *relay.Store, ledger LedgerClient, up upstream.SwapProvider, ener
 		pendingEVM:       make(map[string]pendingEVMForward),
 		pendingRefund:    make(map[string]pendingForward),
 		pendingRefundEVM: make(map[string]pendingEVMForward),
+		preflightAlerted: make(map[string]string),
 	}
 }
 

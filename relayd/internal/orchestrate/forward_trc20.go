@@ -218,6 +218,10 @@ func (o *Orchestrator) advanceForwardingOneTRC20(ctx context.Context, leg relay.
 		return fmt.Errorf("unexpected signing status %q", sigReq.Status)
 	}
 
+	intent := transferIntent{sender: leg.DepositAddress, recipient: *leg.UpstreamDepositAddress, amount: amount}
+	if err := o.preflightForwardTRON(ctx, leg, pb.unsignedTx, intent); err != nil {
+		return err
+	}
 	txID, err := o.Chain.BroadcastSigned(ctx, pb.unsignedTx, sigReq.SignedTx)
 	if err != nil {
 		return fmt.Errorf("broadcasting: %w", err)

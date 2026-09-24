@@ -519,6 +519,32 @@ type ffStatusRequest struct {
 // this file's own top-of-file doc comment on packOrderRef) -- any other
 // string fails with a malformed-ref error, never silently queries
 // FixedFloat with a garbage id/token pair.
+type ffCcy struct {
+	Code string `json:"code"`
+}
+
+// SelfCheck proves the API key works (FixedFloat rejects any signed call
+// from a bad key -- a placeholder key once failed every real order with
+// "Not have permission") and that both configured USDT currency codes
+// exist in FixedFloat's own currency list. POST /ccies costs 1 unit of
+// the 250/minute rate budget.
+func (p *FixedFloatProvider) SelfCheck(ctx context.Context) error {
+	var ccies []ffCcy
+	if err := p.do(ctx, "/ccies", nil, &ccies); err != nil {
+		return err
+	}
+	listed := make(map[string]bool, len(ccies))
+	for _, c := range ccies {
+		listed[c.Code] = true
+	}
+	for _, code := range []string{p.cfg.USDTTRC20Ccy, p.cfg.USDTBEP20Ccy} {
+		if !listed[code] {
+			return fmt.Errorf("%w: fixedfloat: currency code %q is not in FixedFloat's own /ccies list", ErrMisconfigured, code)
+		}
+	}
+	return nil
+}
+
 func (p *FixedFloatProvider) GetOrder(ctx context.Context, providerOrderID string) (SwapOrder, error) {
 	id, token, err := unpackOrderRef(providerOrderID)
 	if err != nil {
@@ -529,10 +555,8 @@ func (p *FixedFloatProvider) GetOrder(ctx context.Context, providerOrderID strin
 	if err := p.do(ctx, "/order", ffStatusRequest{ID: id, Token: token}, &data); err != nil {
 		return SwapOrder{}, err
 	}
-	// GetOrder has no destinationAddress of its own to echo back --
-	// relayd's own caller (settle.go) already knows it from the leg row
-	// and never reads SwapOrder.DestinationAddress off a GetOrder result,
-	// only off the original CreateOrder result (see relay.Leg's own
-	// DestinationAddress field, set once at leg creation).
-	return p.toSwapOrder(data, "")
+	// FixedFloat's own record of where it will pay out -- reported, not
+	// echoed from our side, so orchestrate's pre-broadcast check can
+	// confirm the vendor will pay the customer before anything is sent.
+	return p.toSwapOrder(data, data.To.Address)
 }

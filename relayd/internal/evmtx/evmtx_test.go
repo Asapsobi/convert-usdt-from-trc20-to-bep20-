@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 
@@ -253,5 +254,68 @@ func TestSignRoundTrip_WrongKeyRecoversDifferentSender(t *testing.T) {
 	}
 	if recovered == otherAddress {
 		t.Fatal("recovered sender unexpectedly matched an unrelated key's own address")
+	}
+}
+
+func TestDecodeTransfer_RoundTripsBuildTransfer(t *testing.T) {
+	recipient := "0x4192cc99D3Cb95573dCaf8dD76921476E0c7bCAf"
+	tx, _, err := BuildTransfer(recipient, mustAmount(t, 1_995000), testParams())
+	if err != nil {
+		t.Fatalf("BuildTransfer: %v", err)
+	}
+
+	got, err := DecodeTransfer(tx)
+	if err != nil {
+		t.Fatalf("DecodeTransfer: %v", err)
+	}
+	if got.Token != common.HexToAddress(USDTContractAddress) {
+		t.Errorf("Token = %s", got.Token.Hex())
+	}
+	if got.Recipient != common.HexToAddress(recipient) {
+		t.Errorf("Recipient = %s", got.Recipient.Hex())
+	}
+	want, _ := new(big.Int).SetString("1995000000000000000", 10) // 1.995 USDT at 18 decimals
+	if got.Amount.Cmp(want) != 0 {
+		t.Errorf("Amount = %s, want %s", got.Amount, want)
+	}
+}
+
+func TestDecodeTransfer_RejectsATransactionThatAlsoSendsBNB(t *testing.T) {
+	tx, _, err := BuildTransfer("0x4192cc99D3Cb95573dCaf8dD76921476E0c7bCAf", mustAmount(t, 1_000000), testParams())
+	if err != nil {
+		t.Fatalf("BuildTransfer: %v", err)
+	}
+	withValue := types.NewTransaction(tx.Nonce(), *tx.To(), big.NewInt(1), tx.Gas(), tx.GasPrice(), tx.Data())
+	if _, err := DecodeTransfer(withValue); !errors.Is(err, ErrNotATransfer) {
+		t.Fatalf("expected ErrNotATransfer, got %v", err)
+	}
+}
+
+func TestSender_RecoversTheActualSigner(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+	tx, digest, err := BuildTransfer("0x4192cc99D3Cb95573dCaf8dD76921476E0c7bCAf", mustAmount(t, 1_000000), testParams())
+	if err != nil {
+		t.Fatalf("BuildTransfer: %v", err)
+	}
+	sigBytes, err := crypto.Sign(digest[:], key)
+	if err != nil {
+		t.Fatalf("crypto.Sign: %v", err)
+	}
+	var sig [65]byte
+	copy(sig[:], sigBytes)
+	signed, err := WithSignature(tx, sig)
+	if err != nil {
+		t.Fatalf("WithSignature: %v", err)
+	}
+
+	got, err := Sender(signed)
+	if err != nil {
+		t.Fatalf("Sender: %v", err)
+	}
+	if want := crypto.PubkeyToAddress(key.PublicKey); got != want {
+		t.Fatalf("Sender = %s, want %s", got.Hex(), want.Hex())
 	}
 }
