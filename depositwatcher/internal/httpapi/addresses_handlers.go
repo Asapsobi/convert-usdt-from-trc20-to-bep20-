@@ -9,21 +9,29 @@ import (
 )
 
 type addressResponse struct {
-	Address        string     `json:"address"`
-	OrderID        int64      `json:"order_id"`
-	ExternalID     string     `json:"external_id"`
-	CustomerID     string     `json:"customer_id"`
-	Status         string     `json:"status"`
-	QuotedAt       time.Time  `json:"quoted_at"`
-	QuoteExpiresAt time.Time  `json:"quote_expires_at"`
-	AssignedAt     time.Time  `json:"assigned_at"`
-	RetiredAt      *time.Time `json:"retired_at,omitempty"`
-	RetiredReason  *string    `json:"retired_reason,omitempty"`
+	Address string `json:"address"`
+	// DerivationIndex is the BIP32 child index addresses.Assign derived
+	// this address from -- required by any caller that later needs to
+	// request a signature FROM this exact address (e.g. a sweep), since
+	// that's the one piece S1's own per-order signing endpoint has no
+	// way to look up on its own. Never used to re-derive anything here;
+	// callers must always treat depositwatcher's own record as the
+	// source of truth, never recompute or guess this value.
+	DerivationIndex uint32     `json:"derivation_index"`
+	OrderID         int64      `json:"order_id"`
+	ExternalID      string     `json:"external_id"`
+	CustomerID      string     `json:"customer_id"`
+	Status          string     `json:"status"`
+	QuotedAt        time.Time  `json:"quoted_at"`
+	QuoteExpiresAt  time.Time  `json:"quote_expires_at"`
+	AssignedAt      time.Time  `json:"assigned_at"`
+	RetiredAt       *time.Time `json:"retired_at,omitempty"`
+	RetiredReason   *string    `json:"retired_reason,omitempty"`
 }
 
 func toAddressResponse(wa addresses.WatchedAddress) addressResponse {
 	return addressResponse{
-		Address: string(wa.Address), OrderID: wa.OrderID, ExternalID: wa.ExternalID, CustomerID: wa.CustomerID,
+		Address: string(wa.Address), DerivationIndex: wa.DerivationIndex, OrderID: wa.OrderID, ExternalID: wa.ExternalID, CustomerID: wa.CustomerID,
 		Status: string(wa.Status), QuotedAt: wa.QuotedAt, QuoteExpiresAt: wa.QuoteExpiresAt,
 		AssignedAt: wa.AssignedAt, RetiredAt: wa.RetiredAt, RetiredReason: wa.RetiredReason,
 	}

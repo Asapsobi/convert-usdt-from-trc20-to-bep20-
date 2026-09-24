@@ -9,21 +9,27 @@ import (
 )
 
 type addressResponse struct {
-	Address        string     `json:"address"`
-	OrderID        int64      `json:"order_id"`
-	ExternalID     string     `json:"external_id"`
-	CustomerID     string     `json:"customer_id"`
-	Status         string     `json:"status"`
-	QuotedAt       time.Time  `json:"quoted_at"`
-	QuoteExpiresAt time.Time  `json:"quote_expires_at"`
-	AssignedAt     time.Time  `json:"assigned_at"`
-	RetiredAt      *time.Time `json:"retired_at,omitempty"`
-	RetiredReason  *string    `json:"retired_reason,omitempty"`
+	Address string `json:"address"`
+	// DerivationIndex is the BIP32 child index addresses.Assign derived
+	// Address from -- exposed so relayd's own forward-leg signing can
+	// request a signature from THIS exact per-order key (via S1's
+	// RequestTronDepositSweepSignature) instead of relayd's own shared
+	// slot key. Mirrors depositwatcher's own identical field exactly.
+	DerivationIndex uint32     `json:"derivation_index"`
+	OrderID         int64      `json:"order_id"`
+	ExternalID      string     `json:"external_id"`
+	CustomerID      string     `json:"customer_id"`
+	Status          string     `json:"status"`
+	QuotedAt        time.Time  `json:"quoted_at"`
+	QuoteExpiresAt  time.Time  `json:"quote_expires_at"`
+	AssignedAt      time.Time  `json:"assigned_at"`
+	RetiredAt       *time.Time `json:"retired_at,omitempty"`
+	RetiredReason   *string    `json:"retired_reason,omitempty"`
 }
 
 func toAddressResponse(wa addresses.WatchedAddress) addressResponse {
 	return addressResponse{
-		Address: string(wa.Address), OrderID: wa.OrderID, ExternalID: wa.ExternalID, CustomerID: wa.CustomerID,
+		Address: string(wa.Address), DerivationIndex: wa.DerivationIndex, OrderID: wa.OrderID, ExternalID: wa.ExternalID, CustomerID: wa.CustomerID,
 		Status: string(wa.Status), QuotedAt: wa.QuotedAt, QuoteExpiresAt: wa.QuoteExpiresAt,
 		AssignedAt: wa.AssignedAt, RetiredAt: wa.RetiredAt, RetiredReason: wa.RetiredReason,
 	}

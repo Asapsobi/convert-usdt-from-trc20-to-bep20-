@@ -57,7 +57,10 @@ type WatchedAddress struct {
 type Queryer = db.Queryer
 
 // xpub is the extended PUBLIC key every Assign call derives under. Set
-// once via Configure at process startup (cmd/tronwatcherd).
+// once via Configure at process startup (cmd/tronwatcherd). Mutually
+// exclusive with provisioner below -- a deployment picks exactly one
+// backend for turning a derivation index into a real TRON address (see
+// cmd/tronwatcherd's own fail-loud startup check).
 var xpub string
 
 // Configure validates and records the extended public key Assign will
@@ -73,6 +76,28 @@ func Configure(newXpub string) error {
 	return nil
 }
 
+// Provisioner is the one call this package needs to provision the real
+// custody (a Privy Server Wallet, in production) backing a TRON deposit
+// address at a given derivation index -- s1client's own
+// ProvisionTronDepositKey, or a fake for testing.
+type Provisioner interface {
+	ProvisionTronDepositKey(ctx context.Context, index uint32) (string, error)
+}
+
+// provisioner is Assign's own real-custody backend, when configured --
+// mirrors xpub's own package-level, set-once-at-startup shape. When set,
+// Assign calls out to S1 for the real address instead of deriving one
+// locally from xpub; DeriveAddress's own pure local math becomes
+// unreachable for new assignments.
+var provisioner Provisioner
+
+// ConfigureS1Provisioning records the real-custody backend Assign
+// provisions TRON deposit addresses through -- the Privy-backed
+// alternative to Configure's own local xpub-derivation mode.
+func ConfigureS1Provisioning(p Provisioner) {
+	provisioner = p
+}
+
 const selectSQL = `
 	SELECT id, address, derivation_index, order_id, external_id, customer_id,
 		status, quoted_at, quote_expires_at, assigned_at, retired_at, retired_reason, last_scanned_at
@@ -82,7 +107,7 @@ const selectSQL = `
 // derivation index and records it against orderID. Idempotent on
 // orderID.
 func Assign(ctx context.Context, q Queryer, orderID int64, externalID, customerID string, quotedAt, quoteExpiresAt time.Time) (Address, error) {
-	if xpub == "" {
+	if xpub == "" && provisioner == nil {
 		return "", ErrNotConfigured
 	}
 
@@ -99,9 +124,18 @@ func Assign(ctx context.Context, q Queryer, orderID int64, externalID, customerI
 		return "", fmt.Errorf("addresses: allocating derivation index: %w", err)
 	}
 
-	addr, err := DeriveAddress(xpub, uint32(index))
-	if err != nil {
-		return "", fmt.Errorf("addresses: deriving address at index %d: %w", index, err)
+	var addr Address
+	if provisioner != nil {
+		address, err := provisioner.ProvisionTronDepositKey(ctx, uint32(index))
+		if err != nil {
+			return "", fmt.Errorf("addresses: provisioning address at index %d: %w", index, err)
+		}
+		addr = Address(address)
+	} else {
+		addr, err = DeriveAddress(xpub, uint32(index))
+		if err != nil {
+			return "", fmt.Errorf("addresses: deriving address at index %d: %w", index, err)
+		}
 	}
 
 	row := q.QueryRow(ctx, `

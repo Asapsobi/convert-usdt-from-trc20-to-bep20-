@@ -21,6 +21,7 @@ import (
 	"depositwatcher/internal/addresses"
 	"depositwatcher/internal/db"
 	"depositwatcher/internal/httpapi"
+	"depositwatcher/internal/s1client"
 )
 
 func main() {
@@ -47,11 +48,7 @@ func run() error {
 	}
 	defer pool.Close()
 
-	xpub := os.Getenv("WATCHER_XPUB")
-	if xpub == "" {
-		return errors.New("watcherd: WATCHER_XPUB is not set")
-	}
-	if err := addresses.Configure(xpub); err != nil {
+	if err := configureAddressingFromEnv(); err != nil {
 		return err
 	}
 
@@ -117,6 +114,44 @@ func run() error {
 	}
 	slog.Info("watcherd shut down cleanly")
 	return nil
+}
+
+// configureAddressingFromEnv chooses which backend addresses.Assign
+// derives/provisions BSC deposit addresses through -- the mirror of
+// s1d's own configureBSCDepositSigningFromEnv, since this deployment's
+// BSC-ADDRESSING backend must agree with S1's own BSC-SIGNING backend
+// (see that function's own doc comment for the operational invariant
+// neither side can mechanically check). Exactly one of WATCHER_XPUB
+// (local, pure-derivation mode) or WATCHER_S1_BASE_URL +
+// WATCHER_S1_PROVISIONING_TOKEN (Privy-backed, via S1's own POST
+// /v1/bsc-deposit-keys) must be set -- neither or both is a real
+// misconfiguration, failing loud rather than silently picking one.
+// WATCHER_* (not DEPOSITWATCHER_*) matches every other env var this
+// binary already reads (WATCHER_XPUB, WATCHER_LISTEN_ADDR,
+// WATCHER_RPC_PROVIDERS, ...), not a mechanical copy of tronwatcherd's
+// own TRONWATCHER_ prefix.
+func configureAddressingFromEnv() error {
+	xpub := os.Getenv("WATCHER_XPUB")
+	s1BaseURL := os.Getenv("WATCHER_S1_BASE_URL")
+	s1Token := os.Getenv("WATCHER_S1_PROVISIONING_TOKEN")
+	s1Set := s1BaseURL != "" || s1Token != ""
+	if s1Set && (s1BaseURL == "" || s1Token == "") {
+		return errors.New("watcherd: WATCHER_S1_BASE_URL and WATCHER_S1_PROVISIONING_TOKEN must both be set together, or both left unset")
+	}
+
+	switch {
+	case xpub != "" && s1Set:
+		return errors.New("watcherd: WATCHER_XPUB and WATCHER_S1_BASE_URL/WATCHER_S1_PROVISIONING_TOKEN are both set -- exactly one BSC-addressing backend must be configured, never both")
+	case xpub != "":
+		slog.Info("watcherd: BSC-addressing backend is local xpub derivation -- confirm S1's own BSC-signing backend is ALSO local BIP32 against the SAME xpub, or signing will silently use the wrong key")
+		return addresses.Configure(xpub)
+	case s1Set:
+		slog.Warn("watcherd: BSC-addressing backend is S1-provisioned (Privy Server Wallets) -- confirm S1's own BSC-signing backend is ALSO Privy-backed against this SAME S1 deployment, or signing will silently use the wrong key")
+		addresses.ConfigureS1Provisioning(s1client.New(s1BaseURL, s1Token))
+		return nil
+	default:
+		return errors.New("watcherd: neither WATCHER_XPUB nor WATCHER_S1_BASE_URL/WATCHER_S1_PROVISIONING_TOKEN is set -- exactly one BSC-addressing backend must be configured")
+	}
 }
 
 func listenAddr() string {

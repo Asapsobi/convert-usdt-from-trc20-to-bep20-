@@ -22,6 +22,7 @@ import (
 	"tronwatcher/internal/addresses"
 	"tronwatcher/internal/db"
 	"tronwatcher/internal/httpapi"
+	"tronwatcher/internal/s1client"
 )
 
 func main() {
@@ -48,11 +49,7 @@ func run() error {
 	}
 	defer pool.Close()
 
-	xpub := os.Getenv("TRONWATCHER_XPUB")
-	if xpub == "" {
-		return errors.New("tronwatcherd: TRONWATCHER_XPUB is not set")
-	}
-	if err := addresses.Configure(xpub); err != nil {
+	if err := configureAddressingFromEnv(); err != nil {
 		return err
 	}
 
@@ -113,6 +110,40 @@ func run() error {
 	}
 	slog.Info("tronwatcherd shut down cleanly")
 	return nil
+}
+
+// configureAddressingFromEnv chooses which backend addresses.Assign
+// derives/provisions TRON deposit addresses through -- the mirror of
+// s1d's own configureTronDepositSigningFromEnv, since this deployment's
+// TRON-ADDRESSING backend must agree with S1's own TRON-SIGNING backend
+// (see that function's own doc comment for the operational invariant
+// neither side can mechanically check). Exactly one of TRONWATCHER_XPUB
+// (local, pure-derivation mode) or TRONWATCHER_S1_BASE_URL +
+// TRONWATCHER_S1_PROVISIONING_TOKEN (Privy-backed, via S1's own POST
+// /v1/tron-deposit-keys) must be set -- neither or both is a real
+// misconfiguration, failing loud rather than silently picking one.
+func configureAddressingFromEnv() error {
+	xpub := os.Getenv("TRONWATCHER_XPUB")
+	s1BaseURL := os.Getenv("TRONWATCHER_S1_BASE_URL")
+	s1Token := os.Getenv("TRONWATCHER_S1_PROVISIONING_TOKEN")
+	s1Set := s1BaseURL != "" || s1Token != ""
+	if s1Set && (s1BaseURL == "" || s1Token == "") {
+		return errors.New("tronwatcherd: TRONWATCHER_S1_BASE_URL and TRONWATCHER_S1_PROVISIONING_TOKEN must both be set together, or both left unset")
+	}
+
+	switch {
+	case xpub != "" && s1Set:
+		return errors.New("tronwatcherd: TRONWATCHER_XPUB and TRONWATCHER_S1_BASE_URL/TRONWATCHER_S1_PROVISIONING_TOKEN are both set -- exactly one TRON-addressing backend must be configured, never both")
+	case xpub != "":
+		slog.Info("tronwatcherd: TRON-addressing backend is local xpub derivation -- confirm S1's own TRON-signing backend is ALSO local BIP32 against the SAME xpub, or signing will silently use the wrong key")
+		return addresses.Configure(xpub)
+	case s1Set:
+		slog.Warn("tronwatcherd: TRON-addressing backend is S1-provisioned (Privy Server Wallets) -- confirm S1's own TRON-signing backend is ALSO Privy-backed against this SAME S1 deployment, or signing will silently use the wrong key")
+		addresses.ConfigureS1Provisioning(s1client.New(s1BaseURL, s1Token))
+		return nil
+	default:
+		return errors.New("tronwatcherd: neither TRONWATCHER_XPUB nor TRONWATCHER_S1_BASE_URL/TRONWATCHER_S1_PROVISIONING_TOKEN is set -- exactly one TRON-addressing backend must be configured")
+	}
 }
 
 func listenAddr() string {
