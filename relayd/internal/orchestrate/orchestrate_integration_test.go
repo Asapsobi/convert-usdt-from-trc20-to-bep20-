@@ -10,11 +10,13 @@ package orchestrate_test
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -208,6 +210,14 @@ type fakeEVMChain struct {
 	mu         sync.Mutex
 	broadcasts int
 	nonce      uint64
+	last       *gethtypes.Transaction
+}
+
+// Last returns the most recently broadcast transaction, or nil.
+func (f *fakeEVMChain) Last() *gethtypes.Transaction {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.last
 }
 
 func (f *fakeEVMChain) CurrentNonce(ctx context.Context, address string) (uint64, error) {
@@ -225,6 +235,7 @@ func (f *fakeEVMChain) Broadcast(ctx context.Context, signed *gethtypes.Transact
 	f.mu.Lock()
 	f.broadcasts++
 	f.nonce++
+	f.last = signed
 	f.mu.Unlock()
 	return signed.Hash().Hex(), nil
 }
@@ -1031,12 +1042,17 @@ func TestExternalRefund_ManuallyRejectedHoldGetsRefunded(t *testing.T) {
 		t.Fatalf("fixture setup: expected held, got %s", held.State)
 	}
 
+	// The refund is sent from this deposit address, so it must be a real
+	// one that the watcher agrees with.
+	depositDerivationIndex := uint32(31)
+	depositAddress := signing.FakeTronDepositAddress(depositDerivationIndex)
 	if _, err := store.Create(context.Background(), relay.Leg{
 		ExternalID: externalID, OrderID: order.ID, Direction: relay.TRC20ToBEP20,
 		CustomerID: "cust-external-refund-1", DestinationAddress: "0xcustomer-bep20-address",
-		DepositAddress:    "Trelayd-fixture-deposit-address",
-		AmountIn:          money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
-		AmountOutExpected: money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
+		DepositAddress:         depositAddress,
+		DepositDerivationIndex: &depositDerivationIndex,
+		AmountIn:               money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
+		AmountOutExpected:      money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
 	}); err != nil {
 		t.Fatalf("creating relay leg: %v", err)
 	}
@@ -1079,8 +1095,10 @@ func TestExternalRefund_ManuallyRejectedHoldGetsRefunded(t *testing.T) {
 	evmChain := &fakeEVMChain{}
 	evmFinality := newFakeEVMFinality()
 	mockProvider := upstream.NewMockProvider("mock-external-refund", 1)
+	tronDepositWatcher := newFakeTronDepositWatcher()
+	tronDepositWatcher.set(order.ID, depositAddress, depositDerivationIndex)
 
-	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alert.LogAlerter{}, nil, nil, orchestrate.Config{
+	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alert.LogAlerter{}, nil, tronDepositWatcher, orchestrate.Config{
 		SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH",
 		EnergyPerTransferUnits: 65000,
 	})
@@ -1283,12 +1301,15 @@ func TestRefund_StuckAwaitingDepositLegGetsRefunded(t *testing.T) {
 		t.Fatalf("fixture setup: expected screened, got %s", screened.State)
 	}
 
+	depositDerivationIndex := uint32(32)
+	depositAddress := signing.FakeTronDepositAddress(depositDerivationIndex)
 	if _, err := store.Create(context.Background(), relay.Leg{
 		ExternalID: externalID, OrderID: screened.ID, Direction: relay.TRC20ToBEP20,
 		CustomerID: "cust-awaiting-refund-1", DestinationAddress: "0xcustomer-bep20-address",
-		DepositAddress:    "Trelayd-fixture-deposit-address",
-		AmountIn:          money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
-		AmountOutExpected: money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
+		DepositAddress:         depositAddress,
+		DepositDerivationIndex: &depositDerivationIndex,
+		AmountIn:               money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
+		AmountOutExpected:      money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
 	}); err != nil {
 		t.Fatalf("creating relay leg: %v", err)
 	}
@@ -1302,12 +1323,15 @@ func TestRefund_StuckAwaitingDepositLegGetsRefunded(t *testing.T) {
 	evmChain := &fakeEVMChain{}
 	evmFinality := newFakeEVMFinality()
 	alerter := &fakeAlerter{}
+	tronDepositWatcher := newFakeTronDepositWatcher()
+	tronDepositWatcher.set(screened.ID, depositAddress, depositDerivationIndex)
+	energy := newFakeEnergy()
 
 	// ForwardingTimeout starts at 0 (disabled) so tick 1 -- which
 	// records forward_attempt_started_at and fails CreateOrder -- is
 	// deterministic, matching TestStaleLegAlarm_FiresOnceThenNeverAgain's
 	// own construction.
-	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alerter, nil, nil, orchestrate.Config{
+	orch := orchestrate.New(store, client, mockProvider, energy, signer, chain, finality, evmChain, evmFinality, alerter, nil, tronDepositWatcher, orchestrate.Config{
 		SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH",
 		EnergyPerTransferUnits: 65000,
 	})
@@ -1368,6 +1392,18 @@ func TestRefund_StuckAwaitingDepositLegGetsRefunded(t *testing.T) {
 	if afterTick2b.RefundTxID == nil || *afterTick2b.RefundTxID == "" {
 		t.Fatal("expected a refund_tx_id to be recorded")
 	}
+	// The customer's funds never left the deposit address, so the refund
+	// is sent (and energy delegated) from there, signed with its own
+	// per-order key -- relayd's own slot key is never involved.
+	if got := energy.TargetAddressFor(externalID); got != depositAddress {
+		t.Errorf("expected refund energy delegated to the deposit address %s, got %s", depositAddress, got)
+	}
+	if signer.RequestTronDepositSweepSignatureCallCount() == 0 {
+		t.Error("expected the refund to be signed with the deposit address's own key")
+	}
+	if n := signer.RequestSignatureCallCount(); n != 0 {
+		t.Errorf("expected relayd's slot key never to sign a refund, got %d slot signing requests", n)
+	}
 	if chain.broadcasts != 1 {
 		t.Errorf("expected exactly 1 TRC20 broadcast (the refund), got %d", chain.broadcasts)
 	}
@@ -1401,5 +1437,102 @@ func TestRefund_StuckAwaitingDepositLegGetsRefunded(t *testing.T) {
 	if mockProvider.CreateOrderCallCount() != createOrderCallsBefore {
 		t.Errorf("expected no further CreateOrder calls once refunded, got %d more",
 			mockProvider.CreateOrderCallCount()-createOrderCallsBefore)
+	}
+}
+
+// TestRefundBEP20_IsSentFromTheDepositAddress covers the BEP20 refund
+// path end to end -- previously untested, and where refunding from the
+// wrong address mattered most: on BSC the signer IS the sender, so the
+// refund must be signed by the deposit address's own per-order key, not
+// relayd's slot, and must return the full deposit to the depositor C1
+// recorded.
+func TestRefundBEP20_IsSentFromTheDepositAddress(t *testing.T) {
+	ledger := startLedger(t)
+	pool := testPool(t)
+	store := relay.NewStore(pool)
+	client := ledgerclient.New(ledger.BaseURL(), ledger.Token())
+
+	externalID := uniqueExternalID(t)
+	order := ledger.CreateRelayOrderBEP20ToTRC20(externalID, "cust-bep20-refund-1")
+	depositor := "0xAe2166bD7901eA67c1E2BC4179418fc228108f07"
+	screened := ledger.AdvanceToScreenedBEP20ToTRC20WithSender(order, depositor)
+	if screened.State != "screened" {
+		t.Fatalf("fixture setup: expected screened, got %s", screened.State)
+	}
+
+	depositDerivationIndex := uint32(33)
+	depositAddress := signing.FakeBSCDepositAddress(depositDerivationIndex)
+	if _, err := store.Create(context.Background(), relay.Leg{
+		ExternalID: externalID, OrderID: order.ID, Direction: relay.BEP20ToTRC20,
+		CustomerID: "cust-bep20-refund-1", DestinationAddress: "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj",
+		DepositAddress:         depositAddress,
+		DepositDerivationIndex: &depositDerivationIndex,
+		AmountIn:               money.Amount{Asset: money.USDT_BEP20, Units: 100_000000},
+		AmountOutExpected:      money.Amount{Asset: money.USDT_TRC20, Units: 99_700000},
+	}); err != nil {
+		t.Fatalf("creating relay leg: %v", err)
+	}
+
+	mockProvider := upstream.NewMockProvider("mock-bep20-refund", 1)
+	mockProvider.ForceCreateOrderError(fmt.Errorf("replay: simulated permanent vendor rejection"))
+	signer := signing.NewFakeSigningService()
+	evmChain := &fakeEVMChain{}
+	bep20DepositWatcher := newFakeBEP20DepositWatcher()
+	bep20DepositWatcher.set(order.ID, depositAddress, depositDerivationIndex)
+
+	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, &fakeChain{}, newFakeFinality(), evmChain, newFakeEVMFinality(), &fakeAlerter{},
+		bep20DepositWatcher, nil, orchestrate.Config{
+			SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH", SlotEVMAddress: signing.FakeSlotEVMAddress(1),
+			EnergyPerTransferUnits: 65000,
+		})
+	ctx := context.Background()
+
+	// Tick 1: CreateOrder fails, recording forward_attempt_started_at.
+	if err := orch.RunTick(ctx); err != nil {
+		t.Fatalf("RunTick 1: %v", err)
+	}
+	orch.Cfg.ForwardingTimeout = time.Millisecond
+	time.Sleep(5 * time.Millisecond)
+
+	// Tick 2: the refund is committed on C1 and broadcast.
+	if err := orch.RunTick(ctx); err != nil {
+		t.Fatalf("RunTick 2: %v", err)
+	}
+	sent := evmChain.Last()
+	if sent == nil {
+		t.Fatal("expected a BEP20 refund broadcast")
+	}
+	from, err := gethtypes.Sender(gethtypes.NewEIP155Signer(big.NewInt(56)), sent)
+	if err != nil {
+		t.Fatalf("recovering the refund's sender: %v", err)
+	}
+	if !strings.EqualFold(from.Hex(), depositAddress) {
+		t.Errorf("refund sent from %s, want the deposit address %s", from.Hex(), depositAddress)
+	}
+	data := sent.Data()
+	if got := "0x" + hex.EncodeToString(data[4+12:4+32]); !strings.EqualFold(got, depositor) {
+		t.Errorf("refund pays %s, want the recorded depositor %s", got, depositor)
+	}
+	wantRaw, _ := new(big.Int).SetString("100000000000000000000", 10) // 100 USDT at 18 decimals
+	if got := new(big.Int).SetBytes(data[4+32 : 4+64]); got.Cmp(wantRaw) != 0 {
+		t.Errorf("refund moves %s raw units, want %s (the full deposit)", got, wantRaw)
+	}
+	if n := signer.RequestSignatureCallCount(); n != 0 {
+		t.Errorf("expected relayd's slot key never to sign a refund, got %d slot signing requests", n)
+	}
+
+	// Tick 3: the execution check confirms it.
+	if err := orch.RunTick(ctx); err != nil {
+		t.Fatalf("RunTick 3: %v", err)
+	}
+	leg, err := store.GetByExternalID(ctx, externalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if leg.Status != relay.StatusRefunded {
+		t.Fatalf("expected REFUNDED, got %s", leg.Status)
+	}
+	if got := ledger.AccountBalance("liability:customer:cust-bep20-refund-1:USDT_BEP20"); got != 0 {
+		t.Errorf("expected customer liability to close to 0, got %d", got)
 	}
 }

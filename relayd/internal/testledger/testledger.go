@@ -248,13 +248,26 @@ func (l *Ledger) CreateRelayOrderBEP20ToTRC20(externalID, customerID string) Ord
 // this direction), not USDT_TRC20.
 func (l *Ledger) AdvanceToScreenedBEP20ToTRC20(order OrderResp) OrderResp {
 	l.t.Helper()
+	return l.advanceToScreenedBEP20ToTRC20(order, "")
+}
+
+// AdvanceToScreenedBEP20ToTRC20WithSender also records the depositor's
+// own BSC address on the funded transition -- the only address a refund
+// is ever allowed to return funds to.
+func (l *Ledger) AdvanceToScreenedBEP20ToTRC20WithSender(order OrderResp, senderAddress string) OrderResp {
+	l.t.Helper()
+	return l.advanceToScreenedBEP20ToTRC20(order, senderAddress)
+}
+
+func (l *Ledger) advanceToScreenedBEP20ToTRC20(order OrderResp, senderAddress string) OrderResp {
+	l.t.Helper()
 	relayLegAccount := "asset:relay:leg:" + strconv.FormatInt(order.ID, 10)
 	bepLiability := "liability:customer:" + order.CustomerID + ":USDT_BEP20"
 	l.CreateAccount(relayLegAccount, "ASSET", "USDT_BEP20")
 	l.CreateAccount(bepLiability, "LIABILITY", "USDT_BEP20")
 
 	now := time.Now().UTC()
-	resp, body := l.Do(http.MethodPost, "/v1/orders/"+order.ExternalID+"/transitions", "fund:"+order.ExternalID, map[string]any{
+	fundBody := map[string]any{
 		"to_state":         "funded",
 		"expected_version": order.Version,
 		"reason":           "bep20_relay_deposit_final",
@@ -267,7 +280,11 @@ func (l *Ledger) AdvanceToScreenedBEP20ToTRC20(order OrderResp) OrderResp {
 				{"account_code": bepLiability, "asset": "USDT_BEP20", "amount": "-100.000000"},
 			},
 		},
-	})
+	}
+	if senderAddress != "" {
+		fundBody["sender_address"] = senderAddress
+	}
+	resp, body := l.Do(http.MethodPost, "/v1/orders/"+order.ExternalID+"/transitions", "fund:"+order.ExternalID, fundBody)
 	if resp.StatusCode != http.StatusOK {
 		l.t.Fatalf("funding %s: status %d: %s", order.ExternalID, resp.StatusCode, body)
 	}

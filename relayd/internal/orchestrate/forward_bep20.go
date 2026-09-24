@@ -59,34 +59,8 @@ func (o *Orchestrator) advanceForwardingOneBEP20(ctx context.Context, leg relay.
 		return fmt.Errorf("computing forward amount: %w", err)
 	}
 
-	if o.BEP20DepositWatcher == nil {
-		return fmt.Errorf("leg %s is a BEP20_TO_TRC20 forward leg, but this Orchestrator has no BEP20DepositWatcher configured -- "+
-			"refusing to sign without the defense-in-depth cross-check; this is a startup/wiring bug, not a transient condition",
-			leg.ExternalID)
-	}
-
-	// Defense in depth: independently re-fetch this order's own deposit
-	// address/index from depositwatcher's own live address book and
-	// verify it agrees with what's recorded locally, BEFORE ever asking
-	// S1 to sign anything. S1's own RequestDepositSweepSignature performs
-	// no such check itself -- it will derive-and-sign for whatever index
-	// it's given, so this is the one place that verification happens at
-	// all.
-	got, err := o.BEP20DepositWatcher.GetAddress(ctx, leg.OrderID)
-	if err != nil {
-		return fmt.Errorf("re-verifying deposit address with depositwatcher: %w", err)
-	}
-	if got.Address != leg.DepositAddress || got.DerivationIndex == nil || *got.DerivationIndex != *leg.DepositDerivationIndex {
-		detail := fmt.Sprintf("leg %s: locally recorded deposit_address=%s deposit_derivation_index=%d, "+
-			"but depositwatcher's own live record says address=%s derivation_index=%v -- refusing to sign",
-			leg.ExternalID, leg.DepositAddress, *leg.DepositDerivationIndex, got.Address, got.DerivationIndex)
-		if alertErr := o.Alert.Fire(ctx, alert.Alert{
-			Severity: alert.SeverityCritical, ExternalID: leg.ExternalID,
-			Reason: "relay_leg_deposit_address_mismatch", Detail: detail,
-		}); alertErr != nil {
-			slog.Error("orchestrate: firing the deposit-address-mismatch alert itself failed", "external_id", leg.ExternalID, "error", alertErr)
-		}
-		return fmt.Errorf("%s", detail)
+	if err := o.reverifyDepositAddress(ctx, leg); err != nil {
+		return err
 	}
 
 	o.mu.Lock()

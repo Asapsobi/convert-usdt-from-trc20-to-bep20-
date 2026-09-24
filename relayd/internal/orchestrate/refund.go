@@ -126,9 +126,10 @@ func (o *Orchestrator) startExternallyRefundedLegs(ctx context.Context) error {
 // otherwise get abandoned+refunded in this SAME tick, racing a broadcast
 // that may itself still go on to succeed on-chain (checked next tick via
 // checkForwardExecutionAndFinish / checkForwardEVMExecutionAndFinish).
-// Abandoning it here regardless would risk a genuine double-spend: the
-// customer refunded from operating capital while their own original
-// forward transfer also independently lands. Left alone, such a leg
+// Both transfers spend the same deposit, so the chain lets only one land
+// -- but abandoning here would still post a refund to C1 for money
+// that may be on its way to the vendor, leaving the books claiming a
+// refund the chain then rejects. Left alone, such a leg
 // becomes eligible for this same refund again, from a fresh broadcast
 // attempt, only once a confirmed on-chain FAILURE clears the pending
 // cache -- never while a real broadcast is still awaiting its own
@@ -405,6 +406,16 @@ func (o *Orchestrator) advanceRefundPendingLegs(ctx context.Context) error {
 // R5's own acceptance criterion) and the amount is the FULL amount_in,
 // not forwardAmount's discounted figure -- nothing was delivered, so no
 // commission is withheld.
+//
+// It sends FROM the leg's own deposit address, signed with that
+// address's own per-order key, exactly like the forward: every path into
+// REFUND_PENDING (screening rejected the order, CreateOrder never
+// succeeded, or the forward never confirmed) means the customer's funds
+// never left that address. Refunding from relayd's own slot instead
+// would pay the customer out of operating funds (or fail, with none)
+// while the real deposit stayed stuck -- and would be a true double
+// payment if the forward also landed. Spending the one deposit twice is
+// impossible on-chain, so this path can't double-pay by construction.
 func (o *Orchestrator) advanceRefundPendingOneTRC20(ctx context.Context, leg relay.Leg) error {
 	// A broadcast already happened for this leg's refund in an earlier
 	// tick -- check ITS OWN on-chain execution result before doing
@@ -426,6 +437,10 @@ func (o *Orchestrator) advanceRefundPendingOneTRC20(ctx context.Context, leg rel
 		return fmt.Errorf("order has no sender_address recorded -- cannot refund")
 	}
 
+	if err := o.reverifyDepositAddress(ctx, leg); err != nil {
+		return err
+	}
+
 	o.mu.Lock()
 	pb, ok := o.pendingRefund[leg.ExternalID]
 	o.mu.Unlock()
@@ -434,7 +449,7 @@ func (o *Orchestrator) advanceRefundPendingOneTRC20(ctx context.Context, leg rel
 		if err != nil {
 			return fmt.Errorf("resolving a current TRON block reference: %w", err)
 		}
-		unsignedTx, err := txbuild.BuildTransfer(o.Cfg.SlotAddress, *order.SenderAddress, leg.AmountIn, ref)
+		unsignedTx, err := txbuild.BuildTransfer(leg.DepositAddress, *order.SenderAddress, leg.AmountIn, ref)
 		if err != nil {
 			return fmt.Errorf("building the unsigned refund transfer: %w", err)
 		}
@@ -444,20 +459,13 @@ func (o *Orchestrator) advanceRefundPendingOneTRC20(ctx context.Context, leg rel
 		o.mu.Unlock()
 	}
 
-	// Energy must be delegated to o.Cfg.SlotAddress -- the REFUND
-	// transaction's own sender (txbuild.BuildTransfer above signs FROM
-	// the slot, TO the customer being refunded), mirroring the identical,
-	// separately-confirmed-live bug fix in forward_trc20.go's own
-	// advanceForwardingOneTRC20: *order.SenderAddress here is the refund
-	// RECIPIENT, which never needs energy delegated to it for this
-	// transfer to succeed.
-	// Target-address-scoped idempotency key -- see forward_trc20.go's own
-	// identical fix and doc comment: C4's own Reserve replays the
-	// original reservation's target address verbatim for a repeated key,
-	// regardless of what target this call passes.
+	// Energy goes to the refund's own sender, leg.DepositAddress -- the
+	// same rule (and the same target-address-scoped idempotency key) as
+	// forward_trc20.go's own reservation; *order.SenderAddress is only
+	// the recipient and never needs energy.
 	deadline := time.Now().Add(defaultEnergyDeadlineWindow)
-	reserveIdemKey := fmt.Sprintf("relayd:refund-reserve:%s:%s", leg.ExternalID, o.Cfg.SlotAddress)
-	reservation, err := o.Energy.Reserve(ctx, leg.ExternalID, o.Cfg.SlotAddress,
+	reserveIdemKey := fmt.Sprintf("relayd:refund-reserve:%s:%s", leg.ExternalID, leg.DepositAddress)
+	reservation, err := o.Energy.Reserve(ctx, leg.ExternalID, leg.DepositAddress,
 		o.Cfg.EnergyPerTransferUnits, "STANDARD", deadline, reserveIdemKey)
 	if err != nil {
 		return fmt.Errorf("reserving energy for refund: %w", err)
@@ -475,7 +483,7 @@ func (o *Orchestrator) advanceRefundPendingOneTRC20(ctx context.Context, leg rel
 	// which would otherwise make S1 replay a stale, since-mismatched
 	// signature.
 	idemKey := fmt.Sprintf("relayd:refund-sign:%s:%x", leg.ExternalID, digest)
-	sigReq, err := o.Signing.RequestSignature(ctx, o.Cfg.SlotID, digest, estimatedUSD, idemKey)
+	sigReq, err := o.Signing.RequestTronDepositSweepSignature(ctx, *leg.DepositDerivationIndex, digest, estimatedUSD, idemKey)
 	if err != nil {
 		return fmt.Errorf("requesting refund signature: %w", err)
 	}
@@ -494,7 +502,7 @@ func (o *Orchestrator) advanceRefundPendingOneTRC20(ctx context.Context, leg rel
 		return fmt.Errorf("unexpected signing status %q", sigReq.Status)
 	}
 
-	intent := transferIntent{sender: o.Cfg.SlotAddress, recipient: *order.SenderAddress, amount: leg.AmountIn}
+	intent := transferIntent{sender: leg.DepositAddress, recipient: *order.SenderAddress, amount: leg.AmountIn}
 	if err := o.preflightRefundTRON(ctx, leg, pb.unsignedTx, intent); err != nil {
 		return err
 	}
@@ -554,8 +562,9 @@ func (o *Orchestrator) checkRefundExecutionAndFinish(ctx context.Context, leg re
 // advanceRefundPendingOneBEP20 is advanceForwardingOneBEP20's own
 // refund-direction sibling -- see advanceRefundPendingOneTRC20's own doc
 // comment for the shared reasoning (SenderAddress-only destination, full
-// amount_in, no commission). No C4 involvement, same as the BEP20
-// forward leg.
+// amount_in, no commission, sent from the leg's own deposit address with
+// its own per-order key). No C4 involvement, same as the BEP20 forward
+// leg: the deposit address pays its own BNB gas.
 func (o *Orchestrator) advanceRefundPendingOneBEP20(ctx context.Context, leg relay.Leg) error {
 	// A broadcast already happened for this leg in an earlier tick --
 	// check ITS OWN on-chain execution result before doing anything
@@ -577,11 +586,15 @@ func (o *Orchestrator) advanceRefundPendingOneBEP20(ctx context.Context, leg rel
 		return fmt.Errorf("order has no sender_address recorded -- cannot refund")
 	}
 
+	if err := o.reverifyDepositAddress(ctx, leg); err != nil {
+		return err
+	}
+
 	o.mu.Lock()
 	pb, ok := o.pendingRefundEVM[leg.ExternalID]
 	o.mu.Unlock()
 	if !ok {
-		nonce, err := o.EVMChain.CurrentNonce(ctx, o.Cfg.SlotEVMAddress)
+		nonce, err := o.EVMChain.CurrentNonce(ctx, leg.DepositAddress)
 		if err != nil {
 			return fmt.Errorf("resolving a current BSC nonce: %w", err)
 		}
@@ -604,7 +617,7 @@ func (o *Orchestrator) advanceRefundPendingOneBEP20(ctx context.Context, leg rel
 	// Digest-scoped idempotency key -- see forward_trc20.go's own
 	// identical fix and doc comment.
 	idemKey := fmt.Sprintf("relayd:refund-sign:%s:%x", leg.ExternalID, pb.digest)
-	sigReq, err := o.Signing.RequestSignature(ctx, o.Cfg.SlotID, pb.digest, estimatedUSD, idemKey)
+	sigReq, err := o.Signing.RequestDepositSweepSignature(ctx, *leg.DepositDerivationIndex, pb.digest, estimatedUSD, idemKey)
 	if err != nil {
 		return fmt.Errorf("requesting refund signature: %w", err)
 	}
@@ -627,7 +640,7 @@ func (o *Orchestrator) advanceRefundPendingOneBEP20(ctx context.Context, leg rel
 	if err != nil {
 		return fmt.Errorf("applying signature: %w", err)
 	}
-	intent := transferIntent{sender: o.Cfg.SlotEVMAddress, recipient: *order.SenderAddress, amount: leg.AmountIn}
+	intent := transferIntent{sender: leg.DepositAddress, recipient: *order.SenderAddress, amount: leg.AmountIn}
 	if err := o.preflightRefundEVM(ctx, leg, signed, intent); err != nil {
 		return err
 	}

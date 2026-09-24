@@ -332,10 +332,11 @@ func TestRefundTRC20_RebuildsAndRetriesAfterAFailedExecution(t *testing.T) {
 	}
 
 	depositDerivationIndex := uint32(21)
+	depositAddress := "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4"
 	if _, err := store.Create(context.Background(), relay.Leg{
 		ExternalID: externalID, OrderID: order.ID, Direction: relay.TRC20ToBEP20,
 		CustomerID: "cust-refund-exec-fail-1", DestinationAddress: "0xcustomer-bep20-address",
-		DepositAddress:         "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4",
+		DepositAddress:         depositAddress,
 		DepositDerivationIndex: &depositDerivationIndex,
 		AmountIn:               money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
 		AmountOutExpected:      money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
@@ -356,8 +357,10 @@ func TestRefundTRC20_RebuildsAndRetriesAfterAFailedExecution(t *testing.T) {
 	evmChain := &fakeEVMChain{}
 	evmFinality := newFakeEVMFinality()
 	alerter := &fakeAlerter{}
+	tronDepositWatcher := newFakeTronDepositWatcher()
+	tronDepositWatcher.set(order.ID, depositAddress, depositDerivationIndex)
 
-	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alerter, nil, nil, orchestrate.Config{
+	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alerter, nil, tronDepositWatcher, orchestrate.Config{
 		SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH",
 		EnergyPerTransferUnits: 65000,
 		ForwardingTimeout:      time.Millisecond,
@@ -381,14 +384,11 @@ func TestRefundTRC20_RebuildsAndRetriesAfterAFailedExecution(t *testing.T) {
 	if afterTick1.Status != relay.StatusRefundPending {
 		t.Fatalf("after tick 1: expected REFUND_PENDING (broadcast, awaiting its own execution check), got %s", afterTick1.Status)
 	}
-	// The refund transfer's own OwnerAddress is the slot -- see
-	// advanceRefundPendingOneTRC20's own txbuild.BuildTransfer call
-	// (refund.go): it signs FROM o.Cfg.SlotAddress, TO the customer
-	// being refunded, never from the leg's own (here, invalid) deposit
-	// address.
-	firstTxID, ok := chain.TxIDFor("TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH")
+	// The refund is sent FROM the leg's own deposit address -- where the
+	// customer's funds actually are -- never from relayd's own slot.
+	firstTxID, ok := chain.TxIDFor(depositAddress)
 	if !ok {
-		t.Fatal("expected a captured refund broadcast for the slot's own address")
+		t.Fatal("expected a captured refund broadcast from the leg's own deposit address")
 	}
 
 	finality.MarkFailed(firstTxID, "OUT_OF_ENERGY")
@@ -431,9 +431,9 @@ func TestRefundTRC20_RebuildsAndRetriesAfterAFailedExecution(t *testing.T) {
 	if chain.Broadcasts() != 2 {
 		t.Fatalf("expected exactly 2 broadcasts (the failed attempt + the rebuilt retry), got %d", chain.Broadcasts())
 	}
-	secondTxID, ok := chain.TxIDFor("TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH")
+	secondTxID, ok := chain.TxIDFor(depositAddress)
 	if !ok {
-		t.Fatal("expected a second captured refund broadcast for the slot's own address")
+		t.Fatal("expected a second captured refund broadcast from the leg's own deposit address")
 	}
 	if secondTxID == firstTxID {
 		t.Fatal("expected the retry to rebuild with a fresh txid, got the same failed one replayed")
