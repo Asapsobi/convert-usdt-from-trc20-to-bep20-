@@ -54,6 +54,7 @@ import (
 	"relayd/internal/signing"
 	"relayd/internal/txbuild"
 	"relayd/internal/upstream"
+	"relayd/internal/watcherclient"
 )
 
 // DefaultInterval mirrors dispatcher/internal/orchestrate's own default.
@@ -80,6 +81,31 @@ type EnergyClient interface {
 // identical interface.
 type SigningService interface {
 	RequestSignature(ctx context.Context, slotID int, digest [32]byte, estimatedUSD float64, idempotencyKey string) (signing.SigningRequest, error)
+	// RequestDepositSweepSignature signs FROM a specific per-order BSC
+	// deposit key (index, a BIP32 child derived the same way
+	// depositwatcher's own address book derives the matching address)
+	// rather than relayd's own shared slot key -- what
+	// advanceForwardingOneBEP20 uses to sign a BEP20_TO_TRC20 leg's
+	// forward transfer, since that transfer must come from the
+	// customer's own actual deposit address, never the slot.
+	RequestDepositSweepSignature(ctx context.Context, index uint32, digest [32]byte, estimatedUSD float64, idempotencyKey string) (signing.SigningRequest, error)
+	// RequestTronDepositSweepSignature is RequestDepositSweepSignature's
+	// own TRON-deposit counterpart -- what advanceForwardingOneTRC20 uses
+	// to sign a TRC20_TO_BEP20 leg's forward transfer from the customer's
+	// own actual TRON deposit address, never the slot.
+	RequestTronDepositSweepSignature(ctx context.Context, index uint32, digest [32]byte, estimatedUSD float64, idempotencyKey string) (signing.SigningRequest, error)
+}
+
+// DepositAddressLookup is the narrow slice of *watcherclient.Client this
+// package needs for the BEP20_TO_TRC20 forward-signing cross-check
+// (advanceForwardingOneBEP20): an independent, live re-fetch of a leg's
+// own deposit address/derivation index from depositwatcher's own real
+// address book, verified against the leg's own locally-recorded values
+// before ever requesting a signature -- defense in depth, since
+// RequestDepositSweepSignature itself performs no such check (it will
+// derive-and-sign for whatever index it's given).
+type DepositAddressLookup interface {
+	GetAddress(ctx context.Context, orderID int64) (watcherclient.Address, error)
 }
 
 // TRC20Broadcaster is this package's own path to a real TRON node for
@@ -89,9 +115,23 @@ type TRC20Broadcaster interface {
 	BroadcastSigned(ctx context.Context, unsignedTx []byte, signature [65]byte) (txid string, err error)
 }
 
-// TRC20FinalityChecker checks TRC20 forward-transfer finality.
+// TRC20FinalityChecker checks TRC20 forward-transfer finality AND
+// execution success -- CheckExecution is the one this package's own
+// advanceForwardingOneTRC20/advanceRefundPendingOneTRC20 actually rely
+// on before ever marking a leg forwarded/refunded: a real, live
+// broadcast this package accepted (BroadcastSigned returned a txid, no
+// error) still executed with receipt.result "OUT_OF_ENERGY", moving zero
+// funds -- being accepted into a block is not the same fact as having
+// succeeded, and nothing in this package checked the difference before
+// this interface gained CheckExecution.
 type TRC20FinalityChecker interface {
 	IsFinal(ctx context.Context, tronTxID string) (bool, error)
+	// CheckExecution reports whether tronTxID has reached finality
+	// (final) and, only meaningful when final is true, whether its own
+	// on-chain execution actually succeeded (success). failureReason is
+	// the chain's own specific verdict (e.g. "OUT_OF_ENERGY") when final
+	// is true and success is false.
+	CheckExecution(ctx context.Context, tronTxID string) (final, success bool, failureReason string, err error)
 }
 
 // EVMBroadcaster is this package's own path to a real BSC node for the
@@ -178,7 +218,17 @@ type Orchestrator struct {
 	EVMChain    EVMBroadcaster
 	EVMFinality EVMFinalityChecker
 	Alert       alert.Alerter
-	Cfg         Config
+	// BEP20DepositWatcher is depositwatcher's own real address book,
+	// consulted only by advanceForwardingOneBEP20's own defense-in-depth
+	// cross-check before ever requesting a per-order deposit-sweep
+	// signature -- see DepositAddressLookup's own doc comment.
+	BEP20DepositWatcher DepositAddressLookup
+	// TronDepositWatcher is BEP20DepositWatcher's own TRC20-direction
+	// counterpart -- tronwatcher's own real address book, consulted by
+	// advanceForwardingOneTRC20's own identical defense-in-depth
+	// cross-check.
+	TronDepositWatcher DepositAddressLookup
+	Cfg                Config
 
 	mu               sync.Mutex
 	pending          map[string]pendingForward    // externalID -> cached unsigned TRC20 forward tx
@@ -196,8 +246,21 @@ type Orchestrator struct {
 // carries the identical limitation for the BEP20 direction, for the
 // identical reason (nonce/gas price are resolved live, not
 // deterministic from persisted inputs alone).
+//
+// broadcastTxID is set the tick a broadcast actually happens, BEFORE the
+// leg is marked forwarded -- advanceForwardingOneTRC20 (and its refund-
+// direction sibling) check this field first: empty means "not yet
+// broadcast, build/sign/broadcast this tick," non-empty means "broadcast
+// already happened, check ITS OWN execution result via
+// TRC20FinalityChecker.CheckExecution before doing anything else." A
+// leg is marked forwarded only once that check reports success -- never
+// on the mere fact that BroadcastSigned itself returned no error, which
+// only means the network ACCEPTED the transaction into a block, not that
+// it executed successfully (confirmed live: a real, accepted broadcast
+// still failed on-chain with "OUT_OF_ENERGY", moving zero funds).
 type pendingForward struct {
-	unsignedTx []byte
+	unsignedTx    []byte
+	broadcastTxID string
 }
 
 // pendingEVMForward is pendingForward's own BEP20-direction analogue --
@@ -206,18 +269,31 @@ type pendingForward struct {
 // so recomputing would also be correct, but caching is cheaper and avoids
 // a second, redundant construction call on every tick a signature stays
 // PENDING).
+//
+// broadcastTxHash mirrors pendingForward's own broadcastTxID -- set the
+// tick a broadcast actually happens, checked via EVMFinalityChecker.IsFinal
+// (which already distinguishes "not yet mined" from "reverted," unlike
+// TRC20FinalityChecker before it gained CheckExecution) before the leg is
+// ever marked forwarded. A BSC transaction can be mined and still revert
+// (e.g. insufficient gas at execution time), the exact same real risk
+// class TRC20's own OUT_OF_ENERGY incident confirmed live -- a successful
+// Broadcast call only means the node accepted the raw transaction, never
+// that its own execution succeeded.
 type pendingEVMForward struct {
-	unsignedTx *types.Transaction
-	digest     [32]byte
+	unsignedTx      *types.Transaction
+	digest          [32]byte
+	broadcastTxHash string
 }
 
 // New wires an Orchestrator.
 func New(store *relay.Store, ledger LedgerClient, up upstream.SwapProvider, energyClient EnergyClient,
 	signer SigningService, chain TRC20Broadcaster, finality TRC20FinalityChecker,
-	evmChain EVMBroadcaster, evmFinality EVMFinalityChecker, alerter alert.Alerter, cfg Config) *Orchestrator {
+	evmChain EVMBroadcaster, evmFinality EVMFinalityChecker, alerter alert.Alerter,
+	bep20DepositWatcher DepositAddressLookup, tronDepositWatcher DepositAddressLookup, cfg Config) *Orchestrator {
 	return &Orchestrator{
 		Store: store, Ledger: ledger, Upstream: up, Energy: energyClient, Signing: signer,
-		Chain: chain, Finality: finality, EVMChain: evmChain, EVMFinality: evmFinality, Alert: alerter, Cfg: cfg,
+		Chain: chain, Finality: finality, EVMChain: evmChain, EVMFinality: evmFinality, Alert: alerter,
+		BEP20DepositWatcher: bep20DepositWatcher, TronDepositWatcher: tronDepositWatcher, Cfg: cfg,
 		pending:          make(map[string]pendingForward),
 		pendingEVM:       make(map[string]pendingEVMForward),
 		pendingRefund:    make(map[string]pendingForward),

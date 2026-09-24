@@ -142,8 +142,26 @@ func (o *Orchestrator) startOne(ctx context.Context, externalID string) error {
 			return fmt.Errorf("marking forward attempt started: %w", err)
 		}
 
+		ledgerOrder, err := o.Ledger.GetOrder(ctx, leg.ExternalID)
+		if err != nil {
+			return fmt.Errorf("fetching order: %w", err)
+		}
+		// The upstream order must be created for exactly what
+		// advanceForwardingOneTRC20/BEP20 will actually send on-chain
+		// (leg.AmountIn minus our own fee, forwardAmount's own contract)
+		// -- never the raw deposit amount, or the upstream order sits
+		// forever underpaid by our fee, waiting for money that was never
+		// going to arrive. See this session's own real incident: a
+		// FixedFloat order created for the full amount while only the
+		// fee-deducted amount was ever going to be forwarded expired
+		// unfilled.
+		toForward, err := forwardAmount(leg.AmountIn, ledgerOrder.FeeUnits)
+		if err != nil {
+			return fmt.Errorf("computing forward amount: %w", err)
+		}
+
 		pair := upstreamPairFor(leg.Direction)
-		order, err := o.Upstream.CreateOrder(ctx, pair, leg.AmountIn, leg.DestinationAddress)
+		order, err := o.Upstream.CreateOrder(ctx, pair, toForward, leg.DestinationAddress)
 		if err != nil {
 			return fmt.Errorf("creating upstream order: %w", err)
 		}

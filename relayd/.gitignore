@@ -1,0 +1,3 @@
+
+# Local-only credentials for cmd/sideshift-probe -- never commit.
+.env.sideshift-probe

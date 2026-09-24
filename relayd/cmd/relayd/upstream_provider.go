@@ -29,7 +29,7 @@ func upstreamProviderFromEnv() (upstream.SwapProvider, string, error) {
 	switch name {
 	case "":
 		return nil, "", fmt.Errorf("relayd: UPSTREAM_PROVIDER is not set -- set UPSTREAM_PROVIDER=fixedfloat, " +
-			"UPSTREAM_PROVIDER=changenow, or UPSTREAM_PROVIDER=best_rate for a real vendor (or vendors), " +
+			"UPSTREAM_PROVIDER=changenow, UPSTREAM_PROVIDER=sideshift, or UPSTREAM_PROVIDER=best_rate for a real vendor (or vendors), " +
 			"or UPSTREAM_PROVIDER=placeholder and UPSTREAM_ALLOW_PLACEHOLDER=true to run against a placeholder")
 	case "placeholder":
 		if os.Getenv("UPSTREAM_ALLOW_PLACEHOLDER") != "true" {
@@ -49,6 +49,12 @@ func upstreamProviderFromEnv() (upstream.SwapProvider, string, error) {
 			return nil, "", err
 		}
 		return provider, "changenow", nil
+	case "sideshift":
+		provider, err := buildSideshiftProviderFromEnv()
+		if err != nil {
+			return nil, "", err
+		}
+		return provider, "sideshift", nil
 	case "best_rate":
 		provider, err := buildBestRateProviderFromEnv()
 		if err != nil {
@@ -99,6 +105,30 @@ func buildChangeNowProviderFromEnv() (*upstream.ChangeNowProvider, error) {
 	return provider, nil
 }
 
+// buildSideshiftProviderFromEnv wires upstream.SideshiftProvider from
+// SIDESHIFT_* env vars. AffiliateID is SideShift's own account "id" as
+// reported by GET /v2/account (authenticated by Secret alone) -- not a
+// separately-issued value, confirmed live while building this
+// integration (see internal/upstream/sideshift.go's own top-of-file
+// doc comment).
+func buildSideshiftProviderFromEnv() (*upstream.SideshiftProvider, error) {
+	provider, err := upstream.NewSideshiftProvider(upstream.SideshiftConfig{
+		Secret:           os.Getenv("SIDESHIFT_SECRET"),
+		AffiliateID:      os.Getenv("SIDESHIFT_AFFILIATE_ID"),
+		USDTTRC20Coin:    os.Getenv("SIDESHIFT_COIN_USDT_TRC20"),
+		USDTTRC20Network: os.Getenv("SIDESHIFT_NETWORK_USDT_TRC20"),
+		USDTBEP20Coin:    os.Getenv("SIDESHIFT_COIN_USDT_BEP20"),
+		USDTBEP20Network: os.Getenv("SIDESHIFT_NETWORK_USDT_BEP20"),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("relayd: configuring sideshift provider: %w -- set SIDESHIFT_SECRET, "+
+			"SIDESHIFT_AFFILIATE_ID (your account's own \"id\" from GET /v2/account), "+
+			"SIDESHIFT_COIN_USDT_TRC20/SIDESHIFT_NETWORK_USDT_TRC20 (\"USDT\"/\"tron\", verified live), and "+
+			"SIDESHIFT_COIN_USDT_BEP20/SIDESHIFT_NETWORK_USDT_BEP20 (\"USDT\"/\"bsc\", verified live)", err)
+	}
+	return provider, nil
+}
+
 // buildBestRateProviderFromEnv wires upstream.MultiProvider across every
 // vendor named in UPSTREAM_BEST_RATE_PROVIDERS (comma-separated, e.g.
 // "fixedfloat,changenow") -- required with no default, same reasoning
@@ -135,8 +165,14 @@ func buildBestRateProviderFromEnv() (*upstream.MultiProvider, error) {
 				return nil, err
 			}
 			providers = append(providers, upstream.NamedProvider{Name: "changenow", Provider: provider})
+		case "sideshift":
+			provider, err := buildSideshiftProviderFromEnv()
+			if err != nil {
+				return nil, err
+			}
+			providers = append(providers, upstream.NamedProvider{Name: "sideshift", Provider: provider})
 		default:
-			return nil, fmt.Errorf("relayd: UPSTREAM_BEST_RATE_PROVIDERS names unrecognized vendor %q (supported: \"fixedfloat\", \"changenow\")", name)
+			return nil, fmt.Errorf("relayd: UPSTREAM_BEST_RATE_PROVIDERS names unrecognized vendor %q (supported: \"fixedfloat\", \"changenow\", \"sideshift\")", name)
 		}
 	}
 

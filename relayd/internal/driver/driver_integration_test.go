@@ -81,6 +81,14 @@ func testPool(t *testing.T) *db.Pool {
 // internal/watcherclient's own package doc comment), so one fake
 // server shape covers testing against either.
 func fakeWatcherServer(t *testing.T, depositAddress string) *httptest.Server {
+	return fakeWatcherServerWithIndex(t, depositAddress, nil)
+}
+
+// fakeWatcherServerWithIndex is fakeWatcherServer's own variant that
+// also returns a derivation_index -- what a real depositwatcher (never
+// tronwatcher, which has no such field) reports, exercising
+// CreateRelayLeg's own DepositDerivationIndex field-population path.
+func fakeWatcherServerWithIndex(t *testing.T, depositAddress string, derivationIndex *uint32) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
@@ -89,10 +97,14 @@ func fakeWatcherServer(t *testing.T, depositAddress string) *httptest.Server {
 			CustomerID string `json:"customer_id"`
 		}
 		json.NewDecoder(r.Body).Decode(&req)
-		json.NewEncoder(w).Encode(map[string]any{
+		resp := map[string]any{
 			"address": depositAddress, "order_id": req.OrderID, "external_id": req.ExternalID,
 			"customer_id": req.CustomerID, "status": "WATCHING",
-		})
+		}
+		if derivationIndex != nil {
+			resp["derivation_index"] = *derivationIndex
+		}
+		json.NewEncoder(w).Encode(resp)
 	}))
 }
 
@@ -169,6 +181,65 @@ func TestCreateRelayLeg_TRC20ToBEP20(t *testing.T) {
 	}
 	if status.Order.State != "quoted" || status.Leg.Status != relay.StatusAwaitingDeposit {
 		t.Errorf("unexpected status: %+v", status)
+	}
+}
+
+// TestCreateRelayLeg_BEP20ToTRC20 is TestCreateRelayLeg_TRC20ToBEP20's
+// own mirror direction -- previously untested entirely. Specifically
+// proves CreateRelayLeg threads a real depositwatcher AssignAddress
+// response's own derivation_index onto the new leg's
+// DepositDerivationIndex field, the value forward_bep20.go's own fix
+// depends on to sign from this leg's real per-order key rather than
+// relayd's shared slot key.
+func TestCreateRelayLeg_BEP20ToTRC20(t *testing.T) {
+	ledger := startLedger(t)
+	pool := testPool(t)
+	store := relay.NewStore(pool)
+	client := ledgerclient.New(ledger.BaseURL(), ledger.Token())
+
+	tronSrv := fakeWatcherServer(t, "TXshould-not-be-called")
+	defer tronSrv.Close()
+	wantIndex := uint32(99)
+	bep20Srv := fakeWatcherServerWithIndex(t, "0xrelay-bep20-deposit-address", &wantIndex)
+	defer bep20Srv.Close()
+
+	mockProvider := upstream.NewMockProvider("mock-bep20-create", 1)
+
+	d := &driver.Driver{
+		Ledger: client, Upstream: mockProvider,
+		TronWatcher:  watcherclient.New(tronSrv.URL, "tok"),
+		BEP20Watcher: watcherclient.New(bep20Srv.URL, "tok"),
+		Store:        store,
+		Cfg:          driver.Config{FeeBasisPoints: 30, QuoteValidity: 10 * time.Minute},
+	}
+
+	externalID := uniqueExternalID(t)
+	result, err := d.CreateRelayLeg(context.Background(), driver.CreateRelayLegRequest{
+		ExternalID: externalID, CustomerID: "cust-driver-2", Direction: relay.BEP20ToTRC20,
+		DestinationAddress: "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj", AmountIn: "100.000000",
+	})
+	if err != nil {
+		t.Fatalf("CreateRelayLeg: %v", err)
+	}
+	if result.DepositAddress != "0xrelay-bep20-deposit-address" {
+		t.Errorf("expected the BEP20 watcher's own deposit address, got %s", result.DepositAddress)
+	}
+
+	leg, err := store.GetByExternalID(context.Background(), externalID)
+	if err != nil {
+		t.Fatalf("GetByExternalID: %v", err)
+	}
+	if leg.Direction != relay.BEP20ToTRC20 {
+		t.Errorf("expected BEP20_TO_TRC20, got %s", leg.Direction)
+	}
+	if leg.DepositAddress != "0xrelay-bep20-deposit-address" {
+		t.Errorf("expected the BEP20 watcher's own address recorded on the leg, got %s", leg.DepositAddress)
+	}
+	if leg.DepositDerivationIndex == nil {
+		t.Fatal("expected DepositDerivationIndex to be populated from the real AssignAddress response, got nil")
+	}
+	if *leg.DepositDerivationIndex != wantIndex {
+		t.Errorf("expected DepositDerivationIndex %d, got %d", wantIndex, *leg.DepositDerivationIndex)
 	}
 }
 

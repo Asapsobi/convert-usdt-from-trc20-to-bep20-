@@ -23,6 +23,7 @@ package evmbroadcast
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
 
@@ -31,6 +32,18 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 )
+
+// ErrReverted wraps IsFinal's own returned error specifically when a
+// transaction's receipt confirms it reverted on-chain (receipt.Status !=
+// Successful) -- errors.Is(err, ErrReverted) is how a caller distinguishes
+// that CONFIRMED outcome from every other error IsFinal can return (a
+// transient RPC failure fetching the receipt or the finalized height,
+// wrapped plainly, with no ErrReverted in its chain). This distinction
+// matters for real money: a caller that treated any non-nil error as a
+// confirmed failure would, on a merely transient error, abandon and
+// rebuild a transaction that may still go on to succeed on its own --
+// risking two real transfers landing for the same logical send.
+var ErrReverted = errors.New("evmbroadcast: transaction reverted on-chain")
 
 // Client wraps a single real BSC node connection.
 type Client struct {
@@ -107,9 +120,15 @@ func trimHexPrefix(s string) string {
 // IsFinal reports whether txHash has both landed in a mined block (a
 // successful receipt) AND that block is at or below BSC's own current
 // finalized height. A transaction that reverted on-chain (receipt
-// Status == 0) is reported as an error, never silently treated as
-// "not yet final" -- a caller polling this in a loop must not wait
-// forever for a transaction that will never succeed.
+// Status == 0) is reported as an error wrapping ErrReverted, never
+// silently treated as "not yet final" -- a caller polling this in a loop
+// must not wait forever for a transaction that will never succeed. Every
+// OTHER error this returns (fetching the receipt, fetching the finalized
+// height) is a plain wrapped error with no ErrReverted in its chain --
+// deliberately distinguishable via errors.Is, since a caller that cannot
+// tell "confirmed reverted" apart from "transient RPC failure" would risk
+// abandoning and rebuilding a transaction that may still go on to
+// succeed on its own.
 func (c *Client) IsFinal(ctx context.Context, txHash string) (bool, error) {
 	receipt, err := c.eth.TransactionReceipt(ctx, common.HexToHash(txHash))
 	if err != nil {
@@ -119,7 +138,7 @@ func (c *Client) IsFinal(ctx context.Context, txHash string) (bool, error) {
 		return false, fmt.Errorf("evmbroadcast: fetching receipt for %s: %w", txHash, err)
 	}
 	if receipt.Status != types.ReceiptStatusSuccessful {
-		return false, fmt.Errorf("evmbroadcast: transaction %s reverted on-chain (status %d)", txHash, receipt.Status)
+		return false, fmt.Errorf("evmbroadcast: transaction %s reverted on-chain (status %d): %w", txHash, receipt.Status, ErrReverted)
 	}
 
 	finalizedHeight, err := c.latestFinalizedHeight(ctx)

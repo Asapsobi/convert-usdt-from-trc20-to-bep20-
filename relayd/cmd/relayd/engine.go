@@ -203,7 +203,7 @@ func buildDriverAndOrchestrator(ctx context.Context, pool *db.Pool) (*driver.Dri
 	}
 
 	orch := orchestrate.New(store, ledger, swapProvider, energyClient, signer, broadcastClient, finalityReader,
-		evmClient, evmClient, alert.LogAlerter{},
+		evmClient, evmClient, alert.LogAlerter{}, bep20Watcher, tronWatcher,
 		orchestrate.Config{
 			SlotID: slotID, SlotAddress: slotAddress, SlotEVMAddress: slotEVMAddress,
 			EnergyPerTransferUnits: energyPerTransferUnits, ForwardingTimeout: forwardingTimeout,

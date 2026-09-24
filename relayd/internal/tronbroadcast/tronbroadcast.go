@@ -132,33 +132,83 @@ func NewFinalityReader(baseURL string) *FinalityReader {
 	}
 }
 
+// transactionInfoResponse captures both the existence check IsFinal
+// already used (ID) and the execution outcome nothing in this package
+// previously looked at: Receipt.Result is TRON's own canonical
+// per-transaction execution verdict ("SUCCESS", or a specific failure
+// reason like "OUT_OF_ENERGY", "REVERT", etc.) -- confirmed live: a
+// broadcast this package's own Broadcast() accepted (ret.Result == true,
+// meaning the NODE took the transaction into a block) still executed
+// with receipt.result "OUT_OF_ENERGY", moving zero funds, while ID was
+// already populated and non-empty. A transaction being included in a
+// block is not the same fact as it having succeeded; this package's own
+// IsFinal previously only checked the former.
 type transactionInfoResponse struct {
-	ID string `json:"id"`
+	ID      string `json:"id"`
+	Result  string `json:"result"` // present ("FAILED") on failure, absent on success -- not relied on; Receipt.Result is
+	Receipt struct {
+		Result string `json:"result"` // "SUCCESS", or the specific failure reason
+	} `json:"receipt"`
 }
 
-// IsFinal reports whether tronTxID has reached SR finality.
-func (r *FinalityReader) IsFinal(ctx context.Context, tronTxID string) (bool, error) {
+func (r *FinalityReader) fetchTransactionInfo(ctx context.Context, tronTxID string) (transactionInfoResponse, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		r.baseURL+"/walletsolidity/gettransactioninfobyid?value="+tronTxID, nil)
 	if err != nil {
-		return false, fmt.Errorf("tronbroadcast: building finality request: %w", err)
+		return transactionInfoResponse{}, fmt.Errorf("tronbroadcast: building finality request: %w", err)
 	}
 	resp, err := r.http.Do(req)
 	if err != nil {
-		return false, fmt.Errorf("tronbroadcast: checking finality for %s: %w", tronTxID, err)
+		return transactionInfoResponse{}, fmt.Errorf("tronbroadcast: checking finality for %s: %w", tronTxID, err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return false, fmt.Errorf("tronbroadcast: reading finality response for %s: %w", tronTxID, err)
+		return transactionInfoResponse{}, fmt.Errorf("tronbroadcast: reading finality response for %s: %w", tronTxID, err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("tronbroadcast: TRON node returned %d checking finality for %s", resp.StatusCode, tronTxID)
+		return transactionInfoResponse{}, fmt.Errorf("tronbroadcast: TRON node returned %d checking finality for %s", resp.StatusCode, tronTxID)
 	}
 
 	var info transactionInfoResponse
 	if err := json.Unmarshal(body, &info); err != nil {
-		return false, fmt.Errorf("tronbroadcast: decoding finality response for %s: %w", tronTxID, err)
+		return transactionInfoResponse{}, fmt.Errorf("tronbroadcast: decoding finality response for %s: %w", tronTxID, err)
+	}
+	return info, nil
+}
+
+// IsFinal reports whether tronTxID has reached SR finality -- existence
+// only, same as before. Callers that need to know whether the
+// transaction actually SUCCEEDED, not just that it was included, must
+// use CheckExecution instead: a transaction reaching finality with a
+// failed execution result is still "final" in the sense IsFinal answers
+// (it will never be reorged away), it just never moved anything.
+func (r *FinalityReader) IsFinal(ctx context.Context, tronTxID string) (bool, error) {
+	info, err := r.fetchTransactionInfo(ctx, tronTxID)
+	if err != nil {
+		return false, err
 	}
 	return info.ID == tronTxID, nil
+}
+
+// CheckExecution reports whether tronTxID has reached finality AND, if
+// so, whether its own on-chain execution actually succeeded --
+// receipt.result == "SUCCESS" is the one signal this package trusts;
+// anything else (a specific failure reason string, or an empty receipt
+// before the transaction is even indexed) means the transaction moved no
+// funds, no matter how it was broadcast or accepted. failureReason is
+// TRON's own receipt.result string when success is false and final is
+// true (e.g. "OUT_OF_ENERGY"), empty otherwise.
+func (r *FinalityReader) CheckExecution(ctx context.Context, tronTxID string) (final, success bool, failureReason string, err error) {
+	info, err := r.fetchTransactionInfo(ctx, tronTxID)
+	if err != nil {
+		return false, false, "", err
+	}
+	if info.ID != tronTxID {
+		return false, false, "", nil
+	}
+	if info.Receipt.Result == "SUCCESS" {
+		return true, true, "", nil
+	}
+	return true, false, info.Receipt.Result, nil
 }

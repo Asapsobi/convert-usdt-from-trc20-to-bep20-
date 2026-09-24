@@ -21,6 +21,7 @@ import (
 	"relayd/internal/signing"
 	"relayd/internal/txbuild"
 	"relayd/internal/upstream"
+	"relayd/internal/watcherclient"
 )
 
 // trackedLeg is one leg a scenario created, for the FINAL ASSERTIONS to
@@ -122,14 +123,19 @@ func (f *fakeChain) BroadcastSigned(ctx context.Context, unsignedTx []byte, sign
 	return fmt.Sprintf("%x", digest[:8]), nil
 }
 
-// fakeFinality is never actually consulted by internal/orchestrate today
-// (a forward leg is marked FORWARDED on a successful broadcast response,
-// not gated on a separate finality check -- confirmed by grep, not
-// assumed), but Orchestrator still needs something satisfying
-// TRC20FinalityChecker/EVMFinalityChecker to construct.
+// fakeFinality always reports a broadcast TRC20 transfer as final and
+// successful -- this harness's own replay scenarios exercise the happy
+// path, never a real "accepted but execution failed" outcome (see
+// orchestrate.TRC20FinalityChecker's own doc comment for why that
+// distinction now matters: CheckExecution is genuinely consulted before
+// a TRC20 leg is ever marked forwarded).
 type fakeFinality struct{}
 
 func (fakeFinality) IsFinal(ctx context.Context, txID string) (bool, error) { return true, nil }
+
+func (fakeFinality) CheckExecution(ctx context.Context, txID string) (final, success bool, failureReason string, err error) {
+	return true, true, "", nil
+}
 
 // fakeEVMChain is fakeChain's own EVM-direction sibling.
 type fakeEVMChain struct {
@@ -178,16 +184,86 @@ func (f *fakeAlerter) Fired() []alert.Alert {
 	return out
 }
 
+// fakeBEP20DepositWatcher is depositwatcher's own real address book,
+// stood in for -- advanceForwardingOneBEP20's own defense-in-depth
+// cross-check calls GetAddress before ever requesting a deposit-sweep
+// signature, so any scenario exercising a BEP20_TO_TRC20 leg must
+// configure this consistently with that leg's own fixture
+// DepositAddress/DepositDerivationIndex, matching what a real
+// depositwatcher would report.
+type fakeBEP20DepositWatcher struct {
+	mu   sync.Mutex
+	byID map[int64]watcherclient.Address
+}
+
+func newFakeBEP20DepositWatcher() *fakeBEP20DepositWatcher {
+	return &fakeBEP20DepositWatcher{byID: make(map[int64]watcherclient.Address)}
+}
+
+// set configures orderID to resolve to address/index, as if a real
+// depositwatcher had really assigned it.
+func (f *fakeBEP20DepositWatcher) set(orderID int64, address string, index uint32) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.byID[orderID] = watcherclient.Address{Address: address, DerivationIndex: &index, OrderID: orderID}
+}
+
+func (f *fakeBEP20DepositWatcher) GetAddress(ctx context.Context, orderID int64) (watcherclient.Address, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	addr, ok := f.byID[orderID]
+	if !ok {
+		return watcherclient.Address{}, fmt.Errorf("fakeBEP20DepositWatcher: no address configured for order %d", orderID)
+	}
+	return addr, nil
+}
+
+// fakeTronDepositWatcher is fakeBEP20DepositWatcher's own TRC20-direction
+// counterpart -- tronwatcher's own real address book, stood in for.
+// advanceForwardingOneTRC20's own identical defense-in-depth cross-check
+// calls GetAddress before ever requesting a TRON deposit-sweep
+// signature, so any scenario exercising a TRC20_TO_BEP20 leg that
+// reaches FORWARDING must configure this consistently with that leg's
+// own fixture DepositAddress/DepositDerivationIndex.
+type fakeTronDepositWatcher struct {
+	mu   sync.Mutex
+	byID map[int64]watcherclient.Address
+}
+
+func newFakeTronDepositWatcher() *fakeTronDepositWatcher {
+	return &fakeTronDepositWatcher{byID: make(map[int64]watcherclient.Address)}
+}
+
+// set configures orderID to resolve to address/index, as if a real
+// tronwatcher had really assigned it.
+func (f *fakeTronDepositWatcher) set(orderID int64, address string, index uint32) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.byID[orderID] = watcherclient.Address{Address: address, DerivationIndex: &index, OrderID: orderID}
+}
+
+func (f *fakeTronDepositWatcher) GetAddress(ctx context.Context, orderID int64) (watcherclient.Address, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	addr, ok := f.byID[orderID]
+	if !ok {
+		return watcherclient.Address{}, fmt.Errorf("fakeTronDepositWatcher: no address configured for order %d", orderID)
+	}
+	return addr, nil
+}
+
 // scenarioOrchestrator bundles a fresh Orchestrator with its own fakes,
 // so a scenario can both drive RunTick and inspect/force behavior on the
 // exact fakes that Orchestrator is using.
 type scenarioOrchestrator struct {
-	orch     *orchestrate.Orchestrator
-	upstream *upstream.MockProvider
-	signer   *signing.FakeSigningService
-	chain    *fakeChain
-	evmChain *fakeEVMChain
-	alerter  *fakeAlerter
+	orch                *orchestrate.Orchestrator
+	upstream            *upstream.MockProvider
+	signer              *signing.FakeSigningService
+	chain               *fakeChain
+	evmChain            *fakeEVMChain
+	alerter             *fakeAlerter
+	bep20DepositWatcher *fakeBEP20DepositWatcher
+	tronDepositWatcher  *fakeTronDepositWatcher
 }
 
 // newOrchestrator builds a fresh Orchestrator wired with real C1 access
@@ -202,14 +278,17 @@ func (h *harness) newOrchestrator(providerName string, forwardingTimeout time.Du
 	chain := &fakeChain{}
 	evmChain := &fakeEVMChain{}
 	alerter := &fakeAlerter{}
+	bep20DepositWatcher := newFakeBEP20DepositWatcher()
+	tronDepositWatcher := newFakeTronDepositWatcher()
 
 	orch := orchestrate.New(h.store, h.client, up, fakeEnergy{}, signer, chain, fakeFinality{}, evmChain, fakeFinality{}, alerter,
+		bep20DepositWatcher, tronDepositWatcher,
 		orchestrate.Config{
 			SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH", SlotEVMAddress: "0x4192cc99D3Cb95573dCaf8dD76921476E0c7bCAf",
 			EnergyPerTransferUnits: 65000, ForwardingTimeout: forwardingTimeout,
 		})
 
-	return &scenarioOrchestrator{orch: orch, upstream: up, signer: signer, chain: chain, evmChain: evmChain, alerter: alerter}
+	return &scenarioOrchestrator{orch: orch, upstream: up, signer: signer, chain: chain, evmChain: evmChain, alerter: alerter, bep20DepositWatcher: bep20DepositWatcher, tronDepositWatcher: tronDepositWatcher}
 }
 
 // runTicksUntil ticks o up to maxTicks times, stopping early once check

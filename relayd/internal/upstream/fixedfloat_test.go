@@ -122,6 +122,86 @@ func TestQuote_SendsSignedRequestAndParsesResponse(t *testing.T) {
 	}
 }
 
+// TestQuote_ParsesARealShapedResponseWithBareNumericAmount replays the
+// EXACT shape a real, live POST /api/v2/price call returned (captured by
+// the operator, not guessed): "amount" is a bare JSON number
+// (`"amount":10`), never a quoted string. Written as raw JSON text
+// rather than a marshaled Go struct so this test can't accidentally pass
+// by relying on json.Number's own marshaling behavior the way the other
+// tests in this file incidentally do -- this one pins the real,
+// independently-confirmed wire shape directly.
+func TestQuote_ParsesARealShapedResponseWithBareNumericAmount(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"msg":"OK","data":{"from":{"code":"USDTTRC","network":"TRX","coin":"USDT","amount":10,"rate":0.99,"precision":8,"min":1.363,"max":15000,"usd":10,"btc":0.00011642},"to":{"code":"USDTBSC","network":"BSC","coin":"USDT","amount":9.551,"rate":0.99,"precision":8,"min":1,"max":14849.651,"usd":9.55},"errors":[]}}`))
+	}))
+	defer srv.Close()
+
+	p, _ := NewFixedFloatProvider(testConfig(srv.Client()))
+	p.overrideBaseURLForTest(srv.URL)
+
+	pair := Pair{From: money.USDT_TRC20, To: money.USDT_BEP20}
+	amountIn := money.Amount{Asset: money.USDT_TRC20, Units: 10_000000}
+	quote, err := p.Quote(context.Background(), pair, amountIn)
+	if err != nil {
+		t.Fatalf("Quote: %v (this is the exact real-shaped response that broke this integration on its first live call)", err)
+	}
+	if quote.AmountOut.Units != 9_551000 || quote.AmountOut.Asset != money.USDT_BEP20 {
+		t.Errorf("expected amount_out 9_551000 USDT_BEP20, got %d %s", quote.AmountOut.Units, quote.AmountOut.Asset)
+	}
+}
+
+// TestCreateOrder_ParsesARealShapedResponseWith8DecimalAmount replays
+// the exact shape a real, live POST /api/v2/create call returned: an
+// amount_in of "2.00000000" -- 8 decimal places, FixedFloat's own fixed
+// internal precision, regardless of USDT_TRC20/USDT_BEP20 only
+// supporting 6 on-chain. This is the exact real response that broke
+// this integration's first live order-creation call (the /create
+// endpoint has this issue; /price was separately proven fine at typical
+// test amounts, but the same truncation now guards both).
+func TestCreateOrder_ParsesARealShapedResponseWith8DecimalAmount(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"msg":"OK","data":{"id":"aB3xY9","token":"sekrit-token","type":"fixed","status":"NEW","from":{"code":"USDTTRC","address":"Trelayd-fixedfloat-deposit","amount":"2.00000000"},"to":{"code":"USDTBSC","address":"0xcustomer","amount":"1.62700000"}}}`))
+	}))
+	defer srv.Close()
+
+	p, _ := NewFixedFloatProvider(testConfig(srv.Client()))
+	p.overrideBaseURLForTest(srv.URL)
+
+	pair := Pair{From: money.USDT_TRC20, To: money.USDT_BEP20}
+	amountIn := money.Amount{Asset: money.USDT_TRC20, Units: 2_000000}
+	order, err := p.CreateOrder(context.Background(), pair, amountIn, "0xcustomer")
+	if err != nil {
+		t.Fatalf("CreateOrder: %v (this is the exact real-shaped 8-decimal response that broke this integration on its first live order-creation call)", err)
+	}
+	if order.AmountIn.Units != 2_000000 || order.AmountIn.Asset != money.USDT_TRC20 {
+		t.Errorf("expected amount_in 2_000000 USDT_TRC20, got %d %s", order.AmountIn.Units, order.AmountIn.Asset)
+	}
+	if order.AmountOutExpected.Units != 1_627000 || order.AmountOutExpected.Asset != money.USDT_BEP20 {
+		t.Errorf("expected amount_out_expected 1_627000 USDT_BEP20, got %d %s", order.AmountOutExpected.Units, order.AmountOutExpected.Asset)
+	}
+}
+
+// TestTruncateToDecimals_DropsExcessPrecisionOnly confirms the
+// truncation helper only ever drops trailing digits beyond the target
+// precision, never touches a value already within it.
+func TestTruncateToDecimals_DropsExcessPrecisionOnly(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"2.00000000", "2.000000"},
+		{"1.62700000", "1.627000"},
+		{"1.234567891", "1.234567"},
+		{"5", "5"},
+		{"5.5", "5.5"},
+		{"5.123456", "5.123456"},
+	}
+	for _, c := range cases {
+		if got := truncateToDecimals(c.in, 6); got != c.want {
+			t.Errorf("truncateToDecimals(%q, 6) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestQuote_ReturnsErrorWhenPairUnavailable(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(ffEnvelope{

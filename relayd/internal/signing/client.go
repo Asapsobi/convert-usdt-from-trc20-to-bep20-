@@ -164,6 +164,72 @@ func (c *Client) RequestSignature(ctx context.Context, slotID int, digest [32]by
 	return resp.toSigningRequest()
 }
 
+type postDepositSigningRequestBody struct {
+	BSCDepositIndex uint32  `json:"bsc_deposit_index"`
+	Digest          string  `json:"digest"`
+	EstimatedUSD    float64 `json:"estimated_usd"`
+	IdempotencyKey  string  `json:"idempotency_key"`
+}
+
+// RequestDepositSweepSignature calls POST /v1/deposit-signing-requests
+// -- S1's own per-order BSC deposit-key signing path
+// (s1/internal/requests.RequestDepositSweepSignature), an exact sibling
+// of RequestSignature above except that index identifies a specific
+// BIP32-derived deposit key instead of one of relayd's own fixed slots.
+// S1 itself performs no check that index was ever really assigned to a
+// real order -- the caller (advanceForwardingOneBEP20) is responsible
+// for verifying that independently, against depositwatcher's own
+// address book, before ever calling this.
+func (c *Client) RequestDepositSweepSignature(ctx context.Context, index uint32, digest [32]byte, estimatedUSD float64, idempotencyKey string) (SigningRequest, error) {
+	status, body, err := c.do(ctx, http.MethodPost, "/v1/deposit-signing-requests", postDepositSigningRequestBody{
+		BSCDepositIndex: index, Digest: hex.EncodeToString(digest[:]), EstimatedUSD: estimatedUSD, IdempotencyKey: idempotencyKey,
+	})
+	if err != nil {
+		return SigningRequest{}, err
+	}
+	if status != http.StatusCreated {
+		return SigningRequest{}, decodeAPIError(status, body)
+	}
+	var resp signingRequestResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return SigningRequest{}, fmt.Errorf("signing: decoding RequestDepositSweepSignature response: %w", err)
+	}
+	return resp.toSigningRequest()
+}
+
+type postTronDepositSigningRequestBody struct {
+	TronDepositIndex uint32  `json:"tron_deposit_index"`
+	Digest           string  `json:"digest"`
+	EstimatedUSD     float64 `json:"estimated_usd"`
+	IdempotencyKey   string  `json:"idempotency_key"`
+}
+
+// RequestTronDepositSweepSignature calls POST
+// /v1/tron-deposit-signing-requests -- RequestDepositSweepSignature's own
+// TRON-deposit counterpart (s1/internal/requests.RequestTronDepositSweepSignature),
+// a genuinely separate method/route from the BSC one, not an overload:
+// BSC and TRON derivation indices are independent sequences from two
+// different watchers. S1 itself performs no check that index was ever
+// really assigned to a real order -- the caller (advanceForwardingOneTRC20)
+// is responsible for verifying that independently, against tronwatcher's
+// own address book, before ever calling this.
+func (c *Client) RequestTronDepositSweepSignature(ctx context.Context, index uint32, digest [32]byte, estimatedUSD float64, idempotencyKey string) (SigningRequest, error) {
+	status, body, err := c.do(ctx, http.MethodPost, "/v1/tron-deposit-signing-requests", postTronDepositSigningRequestBody{
+		TronDepositIndex: index, Digest: hex.EncodeToString(digest[:]), EstimatedUSD: estimatedUSD, IdempotencyKey: idempotencyKey,
+	})
+	if err != nil {
+		return SigningRequest{}, err
+	}
+	if status != http.StatusCreated {
+		return SigningRequest{}, decodeAPIError(status, body)
+	}
+	var resp signingRequestResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return SigningRequest{}, fmt.Errorf("signing: decoding RequestTronDepositSweepSignature response: %w", err)
+	}
+	return resp.toSigningRequest()
+}
+
 // GetSignature calls GET /v1/signing-requests/{id}.
 func (c *Client) GetSignature(ctx context.Context, id int64) (SigningRequest, error) {
 	status, body, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/v1/signing-requests/%d", id), nil)

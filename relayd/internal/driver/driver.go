@@ -153,7 +153,12 @@ func (d *Driver) CreateRelayLeg(ctx context.Context, req CreateRelayLegRequest) 
 	leg, err := d.Store.Create(ctx, relay.Leg{
 		ExternalID: order.ExternalID, OrderID: order.ID, Direction: req.Direction,
 		CustomerID: req.CustomerID, DestinationAddress: req.DestinationAddress,
-		DepositAddress: addr.Address, AmountIn: amountIn, AmountOutExpected: quote.AmountOut,
+		// DepositDerivationIndex comes straight off the real
+		// AssignAddress response -- naturally nil for a TRC20ToBEP20
+		// leg (TronWatcher's own response never has this field), never
+		// recomputed or guessed.
+		DepositAddress: addr.Address, DepositDerivationIndex: addr.DerivationIndex,
+		AmountIn: amountIn, AmountOutExpected: quote.AmountOut,
 	})
 	if err != nil {
 		return CreateRelayLegResult{}, fmt.Errorf("driver: recording relay leg locally: %w", err)

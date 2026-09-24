@@ -36,6 +36,7 @@ import (
 	"relayd/internal/testledger"
 	"relayd/internal/txbuild"
 	"relayd/internal/upstream"
+	"relayd/internal/watcherclient"
 )
 
 var portSeq int64
@@ -84,19 +85,41 @@ func testPool(t *testing.T) *db.Pool {
 }
 
 // fakeEnergy always confirms immediately -- mirrors
-// dispatcher/internal/orchestrate's own identical fakeEnergy.
+// dispatcher/internal/orchestrate's own identical fakeEnergy. Records
+// targetAddress per call (not just a count) so a test can assert energy
+// was requested for the RIGHT address -- added after a real, live run
+// against actual CatFee/TRON infrastructure found energy being delegated
+// to the vendor's own deposit address instead of the customer's own
+// per-order deposit address (the transaction's real sender, and the only
+// address that actually needs it): the previous version of this fake
+// discarded targetAddress entirely, which is exactly how that bug shipped
+// with no test catching it.
 type fakeEnergy struct {
-	mu    sync.Mutex
-	calls map[string]int
+	mu             sync.Mutex
+	calls          map[string]int
+	targetAddress  map[string]string
+	lastExternalID string
 }
 
-func newFakeEnergy() *fakeEnergy { return &fakeEnergy{calls: make(map[string]int)} }
+func newFakeEnergy() *fakeEnergy {
+	return &fakeEnergy{calls: make(map[string]int), targetAddress: make(map[string]string)}
+}
 
 func (f *fakeEnergy) Reserve(ctx context.Context, externalID, targetAddress string, units int64, tier string, deadline time.Time, idempotencyKey string) (energy.Reservation, error) {
 	f.mu.Lock()
 	f.calls[externalID]++
+	f.targetAddress[externalID] = targetAddress
+	f.lastExternalID = externalID
 	f.mu.Unlock()
 	return energy.Reservation{Status: "CONFIRMED", EnergyUnits: units}, nil
+}
+
+// TargetAddressFor reports which address Reserve was actually asked to
+// delegate energy to for externalID -- test-only visibility.
+func (f *fakeEnergy) TargetAddressFor(externalID string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.targetAddress[externalID]
 }
 
 // fakeChain stands in for a real TRON node -- deterministic block
@@ -126,12 +149,25 @@ func (f *fakeChain) BroadcastSigned(ctx context.Context, unsignedTx []byte, sign
 
 // fakeFinality reports final=true for any txid this test has told it
 // about via MarkFinal -- deterministic, no polling-count flakiness.
+// CheckExecution defaults to a successful execution for any txid: every
+// one of this fake's own construction sites builds it purely to satisfy
+// TRC20FinalityChecker's own required-dependency shape, with no interest
+// in finality-timing or execution-outcome behavior itself. MarkFailed is
+// the opt-in a test would use to exercise the OTHER real outcome
+// CheckExecution exists to distinguish (a confirmed on-chain failure,
+// e.g. OUT_OF_ENERGY) -- as of this writing, no test in this package
+// actually calls it; this is real, missing coverage for
+// checkForwardExecutionAndFinish's/checkRefundExecutionAndFinish's own
+// failure branch, not a completed cross-reference.
 type fakeFinality struct {
-	mu    sync.Mutex
-	final map[string]bool
+	mu     sync.Mutex
+	final  map[string]bool
+	failed map[string]string // txID -> failureReason, only set via MarkFailed
 }
 
-func newFakeFinality() *fakeFinality { return &fakeFinality{final: make(map[string]bool)} }
+func newFakeFinality() *fakeFinality {
+	return &fakeFinality{final: make(map[string]bool), failed: make(map[string]string)}
+}
 
 func (f *fakeFinality) MarkFinal(txID string) {
 	f.mu.Lock()
@@ -139,10 +175,28 @@ func (f *fakeFinality) MarkFinal(txID string) {
 	f.final[txID] = true
 }
 
+// MarkFailed configures CheckExecution to report txID as finalized but
+// with a failed on-chain execution -- opt-in, mirroring the real
+// OUT_OF_ENERGY incident CheckExecution's own doc comment describes.
+func (f *fakeFinality) MarkFailed(txID, reason string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failed[txID] = reason
+}
+
 func (f *fakeFinality) IsFinal(ctx context.Context, txID string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.final[txID], nil
+	return true, nil
+}
+
+func (f *fakeFinality) CheckExecution(ctx context.Context, txID string) (final, success bool, failureReason string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if reason, isFailed := f.failed[txID]; isFailed {
+		return true, false, reason, nil
+	}
+	return true, true, "", nil
 }
 
 // fakeEVMChain stands in for a real BSC node -- deterministic
@@ -175,24 +229,105 @@ func (f *fakeEVMChain) Broadcast(ctx context.Context, signed *gethtypes.Transact
 	return signed.Hash().Hex(), nil
 }
 
-// fakeEVMFinality mirrors fakeFinality above for the BEP20 direction.
-type fakeEVMFinality struct {
-	mu    sync.Mutex
-	final map[string]bool
+// fakeBEP20DepositWatcher stands in for depositwatcher's own real
+// address book -- advanceForwardingOneBEP20's own defense-in-depth
+// cross-check calls GetAddress before ever requesting a deposit-sweep
+// signature, so TestFullHappyPath_BEP20ToTRC20 must configure this
+// consistently with its own fixture leg's DepositAddress/
+// DepositDerivationIndex.
+type fakeBEP20DepositWatcher struct {
+	mu   sync.Mutex
+	byID map[int64]watcherclient.Address
 }
 
-func newFakeEVMFinality() *fakeEVMFinality { return &fakeEVMFinality{final: make(map[string]bool)} }
+func newFakeBEP20DepositWatcher() *fakeBEP20DepositWatcher {
+	return &fakeBEP20DepositWatcher{byID: make(map[int64]watcherclient.Address)}
+}
 
-func (f *fakeEVMFinality) MarkFinal(txHash string) {
+func (f *fakeBEP20DepositWatcher) set(orderID int64, address string, index uint32) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.final[txHash] = true
+	f.byID[orderID] = watcherclient.Address{Address: address, DerivationIndex: &index, OrderID: orderID}
+}
+
+func (f *fakeBEP20DepositWatcher) GetAddress(ctx context.Context, orderID int64) (watcherclient.Address, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	addr, ok := f.byID[orderID]
+	if !ok {
+		return watcherclient.Address{}, fmt.Errorf("fakeBEP20DepositWatcher: no address configured for order %d", orderID)
+	}
+	return addr, nil
+}
+
+// fakeTronDepositWatcher is fakeBEP20DepositWatcher's own TRC20-direction
+// counterpart -- tronwatcher's own real address book, stood in for.
+// advanceForwardingOneTRC20's own identical defense-in-depth cross-check
+// calls GetAddress before ever requesting a TRON deposit-sweep signature,
+// so any test exercising a TRC20_TO_BEP20 leg that reaches FORWARDING
+// must configure this consistently with that leg's own fixture
+// DepositAddress/DepositDerivationIndex.
+type fakeTronDepositWatcher struct {
+	mu   sync.Mutex
+	byID map[int64]watcherclient.Address
+}
+
+func newFakeTronDepositWatcher() *fakeTronDepositWatcher {
+	return &fakeTronDepositWatcher{byID: make(map[int64]watcherclient.Address)}
+}
+
+func (f *fakeTronDepositWatcher) set(orderID int64, address string, index uint32) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.byID[orderID] = watcherclient.Address{Address: address, DerivationIndex: &index, OrderID: orderID}
+}
+
+func (f *fakeTronDepositWatcher) GetAddress(ctx context.Context, orderID int64) (watcherclient.Address, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	addr, ok := f.byID[orderID]
+	if !ok {
+		return watcherclient.Address{}, fmt.Errorf("fakeTronDepositWatcher: no address configured for order %d", orderID)
+	}
+	return addr, nil
+}
+
+// fakeEVMFinality mirrors fakeFinality above for the BEP20 direction.
+// fakeEVMFinality defaults to a successful, final execution for any
+// txHash -- mirroring fakeFinality's own identical default and the same
+// reasoning: before checkForwardEVMExecutionAndFinish/
+// checkRefundEVMExecutionAndFinish existed to consult EVMFinalityChecker
+// at all, every one of this fake's own construction sites (newFakeEVMFinality)
+// built it purely to satisfy EVMBroadcaster/EVMFinalityChecker's own
+// required-dependency shape, with no test relying on IsFinal's return
+// value -- so changing that default here is safe for every existing
+// caller. MarkReverted is the opt-in a test uses to exercise the other
+// real outcome IsFinal exists to distinguish (mirrors fakeFinality's own
+// MarkFailed).
+type fakeEVMFinality struct {
+	mu       sync.Mutex
+	reverted map[string]error
+}
+
+func newFakeEVMFinality() *fakeEVMFinality { return &fakeEVMFinality{reverted: make(map[string]error)} }
+
+// MarkReverted configures IsFinal to report txHash as final but reverted
+// -- err is returned verbatim, matching evmbroadcast.Client.IsFinal's own
+// contract of a non-nil error meaning a confirmed revert, not "not yet
+// mined."
+func (f *fakeEVMFinality) MarkReverted(txHash string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reverted[txHash] = err
 }
 
 func (f *fakeEVMFinality) IsFinal(ctx context.Context, txHash string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.final[txHash], nil
+	if err, ok := f.reverted[txHash]; ok {
+		return false, err
+	}
+	return true, nil
 }
 
 var extIDSeq int64
@@ -221,12 +356,24 @@ func TestFullHappyPath_TRC20ToBEP20(t *testing.T) {
 		t.Fatalf("fixture setup: expected screened, got %s", screened.State)
 	}
 
+	// A real, valid, live-verified TRON address (see internal/txbuild's
+	// own tests), distinct from both the slot's own address and the
+	// upstream platform's own address below -- required because this
+	// test drives a REAL txbuild.BuildTransfer call FROM this leg's own
+	// deposit address, which validates its own base58check checksum,
+	// unlike a placeholder string. depositDerivationIndex mirrors what a
+	// real tronwatcher's own AssignAddress response would have set (this
+	// test creates the leg directly via store.Create, not the real
+	// driver.CreateRelayLeg, so fakeTronDepositWatcher below is
+	// configured to agree with this fixture value).
+	depositDerivationIndex := uint32(11)
 	leg, err := store.Create(context.Background(), relay.Leg{
 		ExternalID: externalID, OrderID: order.ID, Direction: relay.TRC20ToBEP20,
 		CustomerID: "cust-happy-1", DestinationAddress: "0xcustomer-bep20-address",
-		DepositAddress:    "Trelayd-fixture-deposit-address",
-		AmountIn:          money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
-		AmountOutExpected: money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
+		DepositAddress:         "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4",
+		DepositDerivationIndex: &depositDerivationIndex,
+		AmountIn:               money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
+		AmountOutExpected:      money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
 	})
 	if err != nil {
 		t.Fatalf("creating relay leg: %v", err)
@@ -248,8 +395,10 @@ func TestFullHappyPath_TRC20ToBEP20(t *testing.T) {
 	finality := newFakeFinality()
 	evmChain := &fakeEVMChain{}
 	evmFinality := newFakeEVMFinality()
+	tronDepositWatcher := newFakeTronDepositWatcher()
+	tronDepositWatcher.set(order.ID, "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4", depositDerivationIndex)
 
-	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alert.LogAlerter{}, orchestrate.Config{
+	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alert.LogAlerter{}, nil, tronDepositWatcher, orchestrate.Config{
 		SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH",
 		SlotEVMAddress:         "0x4192cc99D3Cb95573dCaf8dD76921476E0c7bCAf",
 		EnergyPerTransferUnits: 65000,
@@ -260,12 +409,17 @@ func TestFullHappyPath_TRC20ToBEP20(t *testing.T) {
 	// Tick 1: RunTick's own phases feed into each other within one call
 	// (phase 2 scans every currently-FORWARDING leg, including one phase
 	// 1 just started this same tick), so a single tick can legitimately
-	// carry this leg all the way from AWAITING_DEPOSIT to FORWARDED --
-	// discover the screened order, start forwarding (create the upstream
-	// order, post relay_forward_start), then immediately reserve energy,
-	// sign, and broadcast. Asserted as one step rather than pinned to an
-	// exact tick, since that inter-phase efficiency is a real, correct
-	// property of RunTick, not something a test should fight.
+	// carry this leg from AWAITING_DEPOSIT all the way to a broadcast
+	// forward transfer -- discover the screened order, start forwarding
+	// (create the upstream order, post relay_forward_start), then
+	// immediately reserve energy, sign, and broadcast. It does NOT yet
+	// reach FORWARDED, though: checkForwardExecutionAndFinish's own
+	// on-chain execution check only ever runs from the NEXT call to
+	// advanceForwardingOneTRC20 (its early-return check, at this
+	// function's own top, is what short-circuits to it) -- see
+	// forward_trc20.go's own doc comment on why a broadcast being
+	// accepted is deliberately never treated as proof it executed
+	// successfully.
 	if err := orch.RunTick(ctx); err != nil {
 		t.Fatalf("RunTick 1: %v", err)
 	}
@@ -282,21 +436,45 @@ func TestFullHappyPath_TRC20ToBEP20(t *testing.T) {
 		t.Errorf("expected asset:relay:leg:forwarding:%d to hold 100_000000, got %d", order.ID, got)
 	}
 
+	afterTick1, err := store.GetByExternalID(ctx, externalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterTick1.Status != relay.StatusForwarding {
+		t.Fatalf("after tick 1: expected still FORWARDING (broadcast, awaiting its own execution check), got %s", afterTick1.Status)
+	}
+	if chain.broadcasts != 1 {
+		t.Errorf("expected exactly 1 broadcast, got %d", chain.broadcasts)
+	}
+	// This leg's forward signing now goes through the per-order
+	// deposit-sweep path (RequestTronDepositSweepSignature), never the
+	// shared-slot RequestSignature -- see forward_trc20.go's own fix.
+	if signer.RequestSignatureCallCount() != 0 {
+		t.Errorf("expected 0 shared-slot signature requests for a TRC20 forward leg, got %d", signer.RequestSignatureCallCount())
+	}
+	if signer.RequestTronDepositSweepSignatureCallCount() != 1 {
+		t.Errorf("expected exactly 1 TRON deposit-sweep signature request, got %d", signer.RequestTronDepositSweepSignatureCallCount())
+	}
+
+	// Tick 2: fakeFinality's own CheckExecution defaults to a successful
+	// execution for any txid (see its own doc comment), so this tick's
+	// early-return check reaches checkForwardExecutionAndFinish and
+	// marks the leg FORWARDED.
+	if err := orch.RunTick(ctx); err != nil {
+		t.Fatalf("RunTick 2: %v", err)
+	}
 	afterTick2, err := store.GetByExternalID(ctx, externalID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if afterTick2.Status != relay.StatusForwarded {
-		t.Fatalf("after tick 1: expected FORWARDED, got %s", afterTick2.Status)
+		t.Fatalf("after tick 2: expected FORWARDED, got %s", afterTick2.Status)
 	}
 	if afterTick2.ForwardTxID == nil || *afterTick2.ForwardTxID == "" {
 		t.Fatal("expected a forward_tx_id to be recorded")
 	}
 	if chain.broadcasts != 1 {
-		t.Errorf("expected exactly 1 broadcast, got %d", chain.broadcasts)
-	}
-	if signer.RequestSignatureCallCount() != 1 {
-		t.Errorf("expected exactly 1 signature request, got %d", signer.RequestSignatureCallCount())
+		t.Errorf("expected still exactly 1 broadcast after tick 2, got %d", chain.broadcasts)
 	}
 
 	// Mark the upstream order complete so tick 3 can settle.
@@ -377,12 +555,14 @@ func TestRefund_StuckForwardingLegGetsRefunded(t *testing.T) {
 		t.Fatalf("fixture setup: expected screened, got %s", screened.State)
 	}
 
+	depositDerivationIndex := uint32(12)
 	leg, err := store.Create(context.Background(), relay.Leg{
 		ExternalID: externalID, OrderID: order.ID, Direction: relay.TRC20ToBEP20,
 		CustomerID: "cust-refund-1", DestinationAddress: "0xcustomer-bep20-address",
-		DepositAddress:    "Trelayd-fixture-deposit-address",
-		AmountIn:          money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
-		AmountOutExpected: money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
+		DepositAddress:         "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4",
+		DepositDerivationIndex: &depositDerivationIndex,
+		AmountIn:               money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
+		AmountOutExpected:      money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
 	})
 	if err != nil {
 		t.Fatalf("creating relay leg: %v", err)
@@ -392,19 +572,27 @@ func TestRefund_StuckForwardingLegGetsRefunded(t *testing.T) {
 	}
 
 	mockProvider := upstream.NewMockProvider("mock-refund", 1)
-	mockProvider.ForceDepositAddress("TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj")
+	// Deliberately do NOT call ForceDepositAddress here -- MockProvider's
+	// own default placeholder ("mock-deposit-addr-<seq>") is not a real
+	// TRON address, so txbuild.BuildTransfer (forward_trc20.go) fails on
+	// every single attempt, before signing or broadcasting is ever
+	// reached. That's what keeps this leg stuck FORWARDING with no
+	// broadcast ever cached (hasPendingBroadcast stays false), the
+	// precondition refundStuckForwardingLegs looks for -- forcing the
+	// SIGNING step to fail instead is not viable here: the real signing
+	// idempotency key is scoped to the unsigned tx's own digest
+	// (forward_trc20.go's own fix), which this test has no way to
+	// predict in advance.
 	signer := signing.NewFakeSigningService()
 	signer.SetSlotAddress(1, "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH")
-	// The forward leg's own signature request must never succeed -- this
-	// is what keeps the leg stuck FORWARDING instead of reaching
-	// FORWARDED, the precondition refundStuckForwardingLegs looks for.
-	signer.ForceError("relayd:sign:"+externalID, fmt.Errorf("simulated: S1 unreachable"))
 	chain := &fakeChain{}
 	finality := newFakeFinality()
 	evmChain := &fakeEVMChain{}
 	evmFinality := newFakeEVMFinality()
+	tronDepositWatcher := newFakeTronDepositWatcher()
+	tronDepositWatcher.set(order.ID, "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4", depositDerivationIndex)
 
-	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alert.LogAlerter{}, orchestrate.Config{
+	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alert.LogAlerter{}, nil, tronDepositWatcher, orchestrate.Config{
 		SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH",
 		EnergyPerTransferUnits: 65000,
 		// A near-zero timeout so this test doesn't need to sleep for a
@@ -418,27 +606,31 @@ func TestRefund_StuckForwardingLegGetsRefunded(t *testing.T) {
 	ctx := context.Background()
 
 	// One tick is enough to carry this leg all the way from
-	// AWAITING_DEPOSIT to REFUNDED: startScreenedLegs creates the
-	// upstream order and posts relay_forward_start (screened ->
-	// dispatching); advanceForwardingLegs tries and fails to sign the
-	// forward transfer; by the time refundStuckForwardingLegs runs later
-	// in this SAME tick, the leg's own MarkForwarding timestamp is
-	// already older than the 1ms ForwardingTimeout (a handful of real
-	// HTTP round trips to ledgerd take far longer than that), so it
-	// immediately posts relay_forward_abandon + relay_refund and marks
-	// REFUND_PENDING; advanceRefundPendingLegs, later still in the same
-	// tick, signs and broadcasts the actual refund and marks REFUNDED --
-	// the same one-tick-carries-multiple-phases behavior
-	// TestFullHappyPath_TRC20ToBEP20 already documents for the forward
-	// path, just carried one phase further. Asserted as one step rather
-	// than pinned to an exact tick count, for the same reason that
-	// test's own comment gives.
+	// AWAITING_DEPOSIT to REFUND_PENDING with the refund transfer itself
+	// already broadcast: startScreenedLegs creates the upstream order and
+	// posts relay_forward_start (screened -> dispatching);
+	// advanceForwardingLegs tries and fails to build the forward transfer
+	// (this leg's forced-invalid upstream deposit address, above); by the
+	// time refundStuckForwardingLegs runs later in this SAME tick, the
+	// leg's own MarkForwarding timestamp is already older than the 1ms
+	// ForwardingTimeout (a handful of real HTTP round trips to ledgerd
+	// take far longer than that) and hasPendingBroadcast correctly
+	// reports no broadcast ever happened, so it immediately posts
+	// relay_forward_abandon + relay_refund and marks REFUND_PENDING;
+	// advanceRefundPendingLegs, later still in the same tick, signs and
+	// broadcasts the actual refund transfer -- but, mirroring the forward
+	// path's own two-phase execution-check fix, does NOT yet mark
+	// REFUNDED: that only happens from a LATER tick's own early-return
+	// check into checkRefundExecutionAndFinish. The defensive second tick
+	// below is what actually reaches REFUNDED, not a fallback for a
+	// slower environment.
 	if err := orch.RunTick(ctx); err != nil {
 		t.Fatalf("RunTick 1: %v", err)
 	}
-	// Defensive: if a slower environment ever needs a second tick to
-	// finish signing/broadcasting the refund, give it one rather than
-	// pinning this test to exact tick-count timing.
+	// The refund transfer broadcasts on tick 1 (above) but is only marked
+	// REFUNDED once a later tick's own execution check confirms it (see
+	// checkRefundExecutionAndFinish) -- expected to still be REFUND_PENDING
+	// here, not a "slower environment" edge case.
 	afterTick, err := store.GetByExternalID(ctx, externalID)
 	if err != nil {
 		t.Fatal(err)
@@ -534,12 +726,14 @@ func TestUnrecoverable_PostForwardedUpstreamFailure(t *testing.T) {
 		t.Fatalf("fixture setup: expected screened, got %s", screened.State)
 	}
 
+	depositDerivationIndex := uint32(13)
 	if _, err := store.Create(context.Background(), relay.Leg{
 		ExternalID: externalID, OrderID: order.ID, Direction: relay.TRC20ToBEP20,
 		CustomerID: "cust-unrecoverable-1", DestinationAddress: "0xcustomer-bep20-address",
-		DepositAddress:    "Trelayd-fixture-deposit-address",
-		AmountIn:          money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
-		AmountOutExpected: money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
+		DepositAddress:         "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4",
+		DepositDerivationIndex: &depositDerivationIndex,
+		AmountIn:               money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
+		AmountOutExpected:      money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
 	}); err != nil {
 		t.Fatalf("creating relay leg: %v", err)
 	}
@@ -553,15 +747,18 @@ func TestUnrecoverable_PostForwardedUpstreamFailure(t *testing.T) {
 	evmChain := &fakeEVMChain{}
 	evmFinality := newFakeEVMFinality()
 	alerter := &fakeAlerter{}
+	tronDepositWatcher := newFakeTronDepositWatcher()
+	tronDepositWatcher.set(order.ID, "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4", depositDerivationIndex)
 
-	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alerter, orchestrate.Config{
+	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alerter, nil, tronDepositWatcher, orchestrate.Config{
 		SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH",
 		EnergyPerTransferUnits: 65000,
 	})
 
 	ctx := context.Background()
 
-	// Tick 1: reaches FORWARDED, same as the happy path.
+	// Tick 1: broadcasts the forward transfer but does not yet mark it
+	// FORWARDED -- see checkForwardExecutionAndFinish's own doc comment.
 	if err := orch.RunTick(ctx); err != nil {
 		t.Fatalf("RunTick 1: %v", err)
 	}
@@ -569,17 +766,13 @@ func TestUnrecoverable_PostForwardedUpstreamFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if afterTick1.Status != relay.StatusForwarded {
-		t.Fatalf("after tick 1: expected FORWARDED, got %s", afterTick1.Status)
+	if afterTick1.Status != relay.StatusForwarding {
+		t.Fatalf("after tick 1: expected still FORWARDING (broadcast, awaiting its own execution check), got %s", afterTick1.Status)
 	}
 
-	if err := mockProvider.SetOrderStatus(*afterTick1.UpstreamOrderID, upstream.StatusFailed, nil); err != nil {
-		t.Fatalf("SetOrderStatus: %v", err)
-	}
-
-	// Tick 2: the upstream order reports FAILED -- no on-chain lever left
-	// (the forward transfer already confirmed), so this must land
-	// UNRECOVERABLE and fire an alert, never REFUND_PENDING/REFUNDED.
+	// Tick 2: fakeFinality's own CheckExecution defaults to success, so
+	// this tick's early-return check confirms the broadcast and marks
+	// the leg FORWARDED, same as the happy path.
 	if err := orch.RunTick(ctx); err != nil {
 		t.Fatalf("RunTick 2: %v", err)
 	}
@@ -587,8 +780,26 @@ func TestUnrecoverable_PostForwardedUpstreamFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if afterTick2.Status != relay.StatusUnrecoverable {
-		t.Fatalf("after tick 2: expected UNRECOVERABLE, got %s", afterTick2.Status)
+	if afterTick2.Status != relay.StatusForwarded {
+		t.Fatalf("after tick 2: expected FORWARDED, got %s", afterTick2.Status)
+	}
+
+	if err := mockProvider.SetOrderStatus(*afterTick2.UpstreamOrderID, upstream.StatusFailed, nil); err != nil {
+		t.Fatalf("SetOrderStatus: %v", err)
+	}
+
+	// Tick 3: the upstream order reports FAILED -- no on-chain lever left
+	// (the forward transfer already confirmed), so this must land
+	// UNRECOVERABLE and fire an alert, never REFUND_PENDING/REFUNDED.
+	if err := orch.RunTick(ctx); err != nil {
+		t.Fatalf("RunTick 3: %v", err)
+	}
+	afterTick3, err := store.GetByExternalID(ctx, externalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterTick3.Status != relay.StatusUnrecoverable {
+		t.Fatalf("after tick 3: expected UNRECOVERABLE, got %s", afterTick3.Status)
 	}
 
 	fired := alerter.Fired()
@@ -602,14 +813,14 @@ func TestUnrecoverable_PostForwardedUpstreamFailure(t *testing.T) {
 		t.Errorf("expected alert for %s, got %s", externalID, fired[0].ExternalID)
 	}
 
-	// Idempotency: a 3rd tick must not fire a second alert -- the leg is
+	// Idempotency: a 4th tick must not fire a second alert -- the leg is
 	// no longer FORWARDED, so it no longer appears in that phase's own
 	// ListByStatus scan.
 	if err := orch.RunTick(ctx); err != nil {
-		t.Fatalf("RunTick 3 (idempotent replay): %v", err)
+		t.Fatalf("RunTick 4 (idempotent replay): %v", err)
 	}
 	if len(alerter.Fired()) != 1 {
-		t.Errorf("expected still exactly 1 alert after a 3rd tick, got %d", len(alerter.Fired()))
+		t.Errorf("expected still exactly 1 alert after a 4th tick, got %d", len(alerter.Fired()))
 	}
 }
 
@@ -633,12 +844,20 @@ func TestFullHappyPath_BEP20ToTRC20(t *testing.T) {
 		t.Fatalf("fixture setup: expected screened, got %s", screened.State)
 	}
 
+	// This test creates the leg directly via store.Create rather than the
+	// real driver.CreateRelayLeg (no real depositwatcher instance runs
+	// here), so there is no real AssignAddress response to take a
+	// derivation index from -- fakeBEP20DepositWatcher below is
+	// configured to agree with this fixture value, standing in for what
+	// a real depositwatcher would report.
+	depositDerivationIndex := uint32(7)
 	leg, err := store.Create(context.Background(), relay.Leg{
 		ExternalID: externalID, OrderID: order.ID, Direction: relay.BEP20ToTRC20,
 		CustomerID: "cust-happy-2", DestinationAddress: "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj",
-		DepositAddress:    "0xrelayd-fixture-deposit-address",
-		AmountIn:          money.Amount{Asset: money.USDT_BEP20, Units: 100_000000},
-		AmountOutExpected: money.Amount{Asset: money.USDT_TRC20, Units: 99_700000},
+		DepositAddress:         "0xrelayd-fixture-deposit-address",
+		DepositDerivationIndex: &depositDerivationIndex,
+		AmountIn:               money.Amount{Asset: money.USDT_BEP20, Units: 100_000000},
+		AmountOutExpected:      money.Amount{Asset: money.USDT_TRC20, Units: 99_700000},
 	})
 	if err != nil {
 		t.Fatalf("creating relay leg: %v", err)
@@ -665,18 +884,24 @@ func TestFullHappyPath_BEP20ToTRC20(t *testing.T) {
 	finality := newFakeFinality()
 	evmChain := &fakeEVMChain{}
 	evmFinality := newFakeEVMFinality()
+	bep20DepositWatcher := newFakeBEP20DepositWatcher()
+	bep20DepositWatcher.set(order.ID, "0xrelayd-fixture-deposit-address", depositDerivationIndex)
 
-	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alert.LogAlerter{}, orchestrate.Config{
-		SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH",
-		SlotEVMAddress:         "0x1111111111111111111111111111111111abcd",
-		EnergyPerTransferUnits: 65000,
-	})
+	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alert.LogAlerter{},
+		bep20DepositWatcher, nil, orchestrate.Config{
+			SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH",
+			SlotEVMAddress:         "0x1111111111111111111111111111111111abcd",
+			EnergyPerTransferUnits: 65000,
+		})
 
 	ctx := context.Background()
 
 	// Tick 1: same inter-phase efficiency as the TRC20 direction's own
-	// test -- can carry this leg from AWAITING_DEPOSIT all the way to
-	// FORWARDED in one tick.
+	// test -- can carry this leg from AWAITING_DEPOSIT all the way to a
+	// broadcast forward transfer in one tick, but not yet to FORWARDED:
+	// checkForwardEVMExecutionAndFinish's own on-chain execution check
+	// only ever runs from the NEXT call to advanceForwardingOneBEP20 (see
+	// forward_bep20.go's own doc comment, mirroring forward_trc20.go's).
 	if err := orch.RunTick(ctx); err != nil {
 		t.Fatalf("RunTick 1: %v", err)
 	}
@@ -695,11 +920,8 @@ func TestFullHappyPath_BEP20ToTRC20(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if afterTick1.Status != relay.StatusForwarded {
-		t.Fatalf("after tick 1: expected FORWARDED, got %s", afterTick1.Status)
-	}
-	if afterTick1.ForwardTxID == nil || *afterTick1.ForwardTxID == "" {
-		t.Fatal("expected a forward_tx_id to be recorded")
+	if afterTick1.Status != relay.StatusForwarding {
+		t.Fatalf("after tick 1: expected still FORWARDING (broadcast, awaiting its own execution check), got %s", afterTick1.Status)
 	}
 	if evmChain.broadcasts != 1 {
 		t.Errorf("expected exactly 1 EVM broadcast, got %d", evmChain.broadcasts)
@@ -707,14 +929,20 @@ func TestFullHappyPath_BEP20ToTRC20(t *testing.T) {
 	if chain.broadcasts != 0 {
 		t.Errorf("expected 0 TRC20 broadcasts for a BEP20-direction leg, got %d", chain.broadcasts)
 	}
-	if signer.RequestSignatureCallCount() != 1 {
-		t.Errorf("expected exactly 1 signature request, got %d", signer.RequestSignatureCallCount())
+	// This leg's forward signing now goes through the per-order
+	// deposit-sweep path (RequestDepositSweepSignature), never the
+	// shared-slot RequestSignature -- see forward_bep20.go's own fix.
+	if signer.RequestSignatureCallCount() != 0 {
+		t.Errorf("expected 0 shared-slot signature requests for a BEP20 forward leg, got %d", signer.RequestSignatureCallCount())
+	}
+	if signer.RequestDepositSweepSignatureCallCount() != 1 {
+		t.Errorf("expected exactly 1 deposit-sweep signature request, got %d", signer.RequestDepositSweepSignatureCallCount())
 	}
 
-	if err := mockProvider.SetOrderStatus(*afterTick1.UpstreamOrderID, upstream.StatusComplete, ptrAmount(money.Amount{Asset: money.USDT_TRC20, Units: 99_650000})); err != nil {
-		t.Fatalf("SetOrderStatus: %v", err)
-	}
-
+	// Tick 2: fakeEVMFinality's own IsFinal defaults to (true, nil) for
+	// any txHash (mirroring fakeFinality's own default), so this tick's
+	// early-return check reaches checkForwardEVMExecutionAndFinish and
+	// marks the leg FORWARDED.
 	if err := orch.RunTick(ctx); err != nil {
 		t.Fatalf("RunTick 2: %v", err)
 	}
@@ -722,11 +950,32 @@ func TestFullHappyPath_BEP20ToTRC20(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if afterTick2.Status != relay.StatusSettled {
-		t.Fatalf("after tick 2: expected SETTLED, got %s", afterTick2.Status)
+	if afterTick2.Status != relay.StatusForwarded {
+		t.Fatalf("after tick 2: expected FORWARDED, got %s", afterTick2.Status)
 	}
-	if afterTick2.AmountOutActual == nil || afterTick2.AmountOutActual.Units != 99_650000 {
-		t.Errorf("expected amount_out_actual 99650000, got %v", afterTick2.AmountOutActual)
+	if afterTick2.ForwardTxID == nil || *afterTick2.ForwardTxID == "" {
+		t.Fatal("expected a forward_tx_id to be recorded")
+	}
+	if evmChain.broadcasts != 1 {
+		t.Errorf("expected still exactly 1 EVM broadcast after tick 2, got %d", evmChain.broadcasts)
+	}
+
+	if err := mockProvider.SetOrderStatus(*afterTick2.UpstreamOrderID, upstream.StatusComplete, ptrAmount(money.Amount{Asset: money.USDT_TRC20, Units: 99_650000})); err != nil {
+		t.Fatalf("SetOrderStatus: %v", err)
+	}
+
+	if err := orch.RunTick(ctx); err != nil {
+		t.Fatalf("RunTick 3: %v", err)
+	}
+	afterTick3, err := store.GetByExternalID(ctx, externalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterTick3.Status != relay.StatusSettled {
+		t.Fatalf("after tick 3: expected SETTLED, got %s", afterTick3.Status)
+	}
+	if afterTick3.AmountOutActual == nil || afterTick3.AmountOutActual.Units != 99_650000 {
+		t.Errorf("expected amount_out_actual 99650000, got %v", afterTick3.AmountOutActual)
 	}
 
 	settledOrder := ledger.GetOrder(externalID)
@@ -745,10 +994,10 @@ func TestFullHappyPath_BEP20ToTRC20(t *testing.T) {
 	}
 
 	if err := orch.RunTick(ctx); err != nil {
-		t.Fatalf("RunTick 3 (idempotent replay): %v", err)
+		t.Fatalf("RunTick 4 (idempotent replay): %v", err)
 	}
 	if evmChain.broadcasts != 1 {
-		t.Errorf("expected still exactly 1 EVM broadcast after a 3rd tick, got %d", evmChain.broadcasts)
+		t.Errorf("expected still exactly 1 EVM broadcast after a 4th tick, got %d", evmChain.broadcasts)
 	}
 }
 
@@ -828,7 +1077,7 @@ func TestExternalRefund_ManuallyRejectedHoldGetsRefunded(t *testing.T) {
 	evmFinality := newFakeEVMFinality()
 	mockProvider := upstream.NewMockProvider("mock-external-refund", 1)
 
-	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alert.LogAlerter{}, orchestrate.Config{
+	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alert.LogAlerter{}, nil, nil, orchestrate.Config{
 		SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH",
 		EnergyPerTransferUnits: 65000,
 	})
@@ -902,12 +1151,14 @@ func TestStaleLegAlarm_FiresOnceThenNeverAgain(t *testing.T) {
 		t.Fatalf("fixture setup: expected screened, got %s", screened.State)
 	}
 
+	depositDerivationIndex := uint32(14)
 	if _, err := store.Create(context.Background(), relay.Leg{
 		ExternalID: externalID, OrderID: order.ID, Direction: relay.TRC20ToBEP20,
 		CustomerID: "cust-stale-1", DestinationAddress: "0xcustomer-bep20-address",
-		DepositAddress:    "Trelayd-fixture-deposit-address",
-		AmountIn:          money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
-		AmountOutExpected: money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
+		DepositAddress:         "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4",
+		DepositDerivationIndex: &depositDerivationIndex,
+		AmountIn:               money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
+		AmountOutExpected:      money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
 	}); err != nil {
 		t.Fatalf("creating relay leg: %v", err)
 	}
@@ -924,12 +1175,17 @@ func TestStaleLegAlarm_FiresOnceThenNeverAgain(t *testing.T) {
 
 	// StaleLegAlertAfter starts at 0 (disabled) so driving to FORWARDED
 	// below is deterministic and produces no alarm noise of its own.
-	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alerter, orchestrate.Config{
+	tronDepositWatcher := newFakeTronDepositWatcher()
+	tronDepositWatcher.set(order.ID, "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4", depositDerivationIndex)
+
+	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alerter, nil, tronDepositWatcher, orchestrate.Config{
 		SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH",
 		EnergyPerTransferUnits: 65000,
 	})
 
 	ctx := context.Background()
+	// Tick 1: broadcasts the forward transfer but does not yet mark it
+	// FORWARDED -- see checkForwardExecutionAndFinish's own doc comment.
 	if err := orch.RunTick(ctx); err != nil {
 		t.Fatalf("RunTick 1: %v", err)
 	}
@@ -937,8 +1193,22 @@ func TestStaleLegAlarm_FiresOnceThenNeverAgain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if afterTick1.Status != relay.StatusForwarded {
-		t.Fatalf("after tick 1: expected FORWARDED, got %s", afterTick1.Status)
+	if afterTick1.Status != relay.StatusForwarding {
+		t.Fatalf("after tick 1: expected still FORWARDING (broadcast, awaiting its own execution check), got %s", afterTick1.Status)
+	}
+
+	// Tick 2: fakeFinality's own CheckExecution defaults to success, so
+	// this tick's early-return check confirms the broadcast and marks
+	// the leg FORWARDED.
+	if err := orch.RunTick(ctx); err != nil {
+		t.Fatalf("RunTick 2: %v", err)
+	}
+	afterTick1b, err := store.GetByExternalID(ctx, externalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterTick1b.Status != relay.StatusForwarded {
+		t.Fatalf("after tick 2: expected FORWARDED, got %s", afterTick1b.Status)
 	}
 	if len(alerter.Fired()) != 0 {
 		t.Fatalf("expected no alerts yet (StaleLegAlertAfter was disabled), got %d", len(alerter.Fired()))
@@ -951,7 +1221,7 @@ func TestStaleLegAlarm_FiresOnceThenNeverAgain(t *testing.T) {
 	time.Sleep(5 * time.Millisecond)
 
 	if err := orch.RunTick(ctx); err != nil {
-		t.Fatalf("RunTick 2: %v", err)
+		t.Fatalf("RunTick 3: %v", err)
 	}
 	fired := alerter.Fired()
 	if len(fired) != 1 {
@@ -1034,7 +1304,7 @@ func TestRefund_StuckAwaitingDepositLegGetsRefunded(t *testing.T) {
 	// records forward_attempt_started_at and fails CreateOrder -- is
 	// deterministic, matching TestStaleLegAlarm_FiresOnceThenNeverAgain's
 	// own construction.
-	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alerter, orchestrate.Config{
+	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alerter, nil, nil, orchestrate.Config{
 		SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH",
 		EnergyPerTransferUnits: 65000,
 	})
@@ -1062,6 +1332,12 @@ func TestRefund_StuckAwaitingDepositLegGetsRefunded(t *testing.T) {
 	orch.Cfg.ForwardingTimeout = time.Millisecond
 	time.Sleep(5 * time.Millisecond)
 
+	// Tick 2: refundStuckAwaitingDepositLegs commits the refund on C1 and
+	// marks REFUND_PENDING; advanceRefundPendingLegs, later the same
+	// tick, signs and broadcasts the refund transfer -- but, mirroring
+	// the forward path's own two-phase execution-check fix, does NOT yet
+	// mark REFUNDED: that only happens from a LATER tick's own
+	// early-return check into checkRefundExecutionAndFinish.
 	if err := orch.RunTick(ctx); err != nil {
 		t.Fatalf("RunTick 2: %v", err)
 	}
@@ -1069,10 +1345,24 @@ func TestRefund_StuckAwaitingDepositLegGetsRefunded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if afterTick2.Status != relay.StatusRefunded {
-		t.Fatalf("after tick 2: expected REFUNDED, got %s", afterTick2.Status)
+	if afterTick2.Status != relay.StatusRefundPending {
+		t.Fatalf("after tick 2: expected still REFUND_PENDING (broadcast, awaiting its own execution check), got %s", afterTick2.Status)
 	}
-	if afterTick2.RefundTxID == nil || *afterTick2.RefundTxID == "" {
+
+	// Tick 3: fakeFinality's own CheckExecution defaults to success, so
+	// this tick's early-return check confirms the broadcast and marks
+	// the leg REFUNDED.
+	if err := orch.RunTick(ctx); err != nil {
+		t.Fatalf("RunTick 3: %v", err)
+	}
+	afterTick2b, err := store.GetByExternalID(ctx, externalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterTick2b.Status != relay.StatusRefunded {
+		t.Fatalf("after tick 3: expected REFUNDED, got %s", afterTick2b.Status)
+	}
+	if afterTick2b.RefundTxID == nil || *afterTick2b.RefundTxID == "" {
 		t.Fatal("expected a refund_tx_id to be recorded")
 	}
 	if chain.broadcasts != 1 {
@@ -1100,7 +1390,7 @@ func TestRefund_StuckAwaitingDepositLegGetsRefunded(t *testing.T) {
 	// must not try CreateOrder again either.
 	createOrderCallsBefore := mockProvider.CreateOrderCallCount()
 	if err := orch.RunTick(ctx); err != nil {
-		t.Fatalf("RunTick 3 (idempotent replay): %v", err)
+		t.Fatalf("RunTick 4 (idempotent replay): %v", err)
 	}
 	if chain.broadcasts != 1 {
 		t.Errorf("expected still exactly 1 broadcast after one more tick, got %d", chain.broadcasts)

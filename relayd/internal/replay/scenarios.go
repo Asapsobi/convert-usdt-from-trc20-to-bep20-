@@ -52,16 +52,26 @@ func (h *harness) scenarioFullHappyPath_TRC20ToBEP20() Result {
 	if err != nil {
 		return fail(name, err)
 	}
+	// A fixture derivation index -- this harness creates legs directly
+	// via h.store.Create rather than the real driver.CreateRelayLeg (no
+	// real tronwatcher instance runs in this harness), so there is no
+	// real AssignAddress response to take it from. The TRC20 forward
+	// signing cross-check (advanceForwardingOneTRC20) requires a non-nil
+	// index for this direction; so's own fakeTronDepositWatcher (below)
+	// is configured to answer consistently with it.
+	depositDerivationIndex := uint32(11)
 	if _, err := h.store.Create(h.ctx, relay.Leg{
 		ExternalID: externalID, OrderID: screened.ID, Direction: relay.TRC20ToBEP20,
-		CustomerID: customerID, DestinationAddress: "0xcustomer-bep20-address", DepositAddress: "Trelayd-fixture-deposit-address",
-		AmountIn: money.Amount{Asset: money.USDT_TRC20, Units: 100_000000}, AmountOutExpected: money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
+		CustomerID: customerID, DestinationAddress: "0xcustomer-bep20-address", DepositAddress: "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4",
+		DepositDerivationIndex: &depositDerivationIndex,
+		AmountIn:               money.Amount{Asset: money.USDT_TRC20, Units: 100_000000}, AmountOutExpected: money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
 	}); err != nil {
 		return fail(name, err)
 	}
 
 	so := h.newOrchestrator(h.nextID("provider"), 0)
 	so.upstream.ForceDepositAddress("TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj")
+	so.tronDepositWatcher.set(screened.ID, "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4", depositDerivationIndex)
 
 	if err := h.runTicksUntil(so.orch, 3, func() (bool, error) {
 		st, err := h.legStatus(externalID)
@@ -115,16 +125,26 @@ func (h *harness) scenarioFullHappyPath_BEP20ToTRC20() Result {
 	if err != nil {
 		return fail(name, err)
 	}
+	// A fixture derivation index -- this harness creates legs directly
+	// via h.store.Create rather than the real driver.CreateRelayLeg (no
+	// real depositwatcher instance runs in this harness), so there is no
+	// real AssignAddress response to take it from. The new BEP20 forward
+	// signing cross-check (advanceForwardingOneBEP20) requires a
+	// non-nil index for this direction; so's own fakeBEP20DepositWatcher
+	// (below) is configured to answer consistently with it.
+	depositDerivationIndex := uint32(42)
 	if _, err := h.store.Create(h.ctx, relay.Leg{
 		ExternalID: externalID, OrderID: screened.ID, Direction: relay.BEP20ToTRC20,
 		CustomerID: customerID, DestinationAddress: "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj", DepositAddress: "0xrelayd-fixture-deposit-address",
-		AmountIn: money.Amount{Asset: money.USDT_BEP20, Units: 100_000000}, AmountOutExpected: money.Amount{Asset: money.USDT_TRC20, Units: 99_700000},
+		DepositDerivationIndex: &depositDerivationIndex,
+		AmountIn:               money.Amount{Asset: money.USDT_BEP20, Units: 100_000000}, AmountOutExpected: money.Amount{Asset: money.USDT_TRC20, Units: 99_700000},
 	}); err != nil {
 		return fail(name, err)
 	}
 
 	so := h.newOrchestrator(h.nextID("provider"), 0)
 	so.upstream.ForceDepositAddress("0x4192cc99D3Cb95573dCaf8dD76921476E0c7bCAf")
+	so.bep20DepositWatcher.set(screened.ID, "0xrelayd-fixture-deposit-address", depositDerivationIndex)
 
 	if err := h.runTicksUntil(so.orch, 3, func() (bool, error) {
 		st, err := h.legStatus(externalID)
@@ -187,16 +207,24 @@ func (h *harness) scenarioStuckForwardingTimeoutRefund() Result {
 	if err != nil {
 		return fail(name, err)
 	}
+	// See scenarioFullHappyPath_TRC20ToBEP20's own comment on why this
+	// fixture index/address pair (and so.tronDepositWatcher.set below) are
+	// needed: without them the new defense-in-depth cross-check would
+	// reject this leg before ever reaching the forced signing failure
+	// below, and this scenario would stop proving what its name says.
+	depositDerivationIndex := uint32(12)
 	if _, err := h.store.Create(h.ctx, relay.Leg{
 		ExternalID: externalID, OrderID: screened.ID, Direction: relay.TRC20ToBEP20,
-		CustomerID: customerID, DestinationAddress: "0xcustomer-bep20-address", DepositAddress: "Trelayd-fixture-deposit-address",
-		AmountIn: money.Amount{Asset: money.USDT_TRC20, Units: 100_000000}, AmountOutExpected: money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
+		CustomerID: customerID, DestinationAddress: "0xcustomer-bep20-address", DepositAddress: "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4",
+		DepositDerivationIndex: &depositDerivationIndex,
+		AmountIn:               money.Amount{Asset: money.USDT_TRC20, Units: 100_000000}, AmountOutExpected: money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
 	}); err != nil {
 		return fail(name, err)
 	}
 
 	so := h.newOrchestrator(h.nextID("provider"), time.Millisecond)
 	so.upstream.ForceDepositAddress("TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj")
+	so.tronDepositWatcher.set(screened.ID, "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4", depositDerivationIndex)
 	so.signer.ForceError("relayd:sign:"+externalID, errors.New("replay: simulated permanent signing failure"))
 
 	if err := h.runTicksUntil(so.orch, 4, func() (bool, error) {
@@ -317,10 +345,12 @@ func (h *harness) scenarioStaleLegAlarmFires() Result {
 	if err != nil {
 		return fail(name, err)
 	}
+	depositDerivationIndex := uint32(13)
 	if _, err := h.store.Create(h.ctx, relay.Leg{
 		ExternalID: externalID, OrderID: screened.ID, Direction: relay.TRC20ToBEP20,
-		CustomerID: customerID, DestinationAddress: "0xcustomer-bep20-address", DepositAddress: "Trelayd-fixture-deposit-address",
-		AmountIn: money.Amount{Asset: money.USDT_TRC20, Units: 100_000000}, AmountOutExpected: money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
+		CustomerID: customerID, DestinationAddress: "0xcustomer-bep20-address", DepositAddress: "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4",
+		DepositDerivationIndex: &depositDerivationIndex,
+		AmountIn:               money.Amount{Asset: money.USDT_TRC20, Units: 100_000000}, AmountOutExpected: money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
 	}); err != nil {
 		return fail(name, err)
 	}
@@ -329,6 +359,7 @@ func (h *harness) scenarioStaleLegAlarmFires() Result {
 	// deterministic, matching every other scenario's own construction.
 	so := h.newOrchestrator(h.nextID("provider"), 0)
 	so.upstream.ForceDepositAddress("TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj")
+	so.tronDepositWatcher.set(screened.ID, "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4", depositDerivationIndex)
 
 	if err := h.runTicksUntil(so.orch, 3, func() (bool, error) {
 		st, err := h.legStatus(externalID)
@@ -478,16 +509,19 @@ func (h *harness) scenarioPostForwardUnrecoverable() Result {
 	if err != nil {
 		return fail(name, err)
 	}
+	depositDerivationIndex := uint32(14)
 	if _, err := h.store.Create(h.ctx, relay.Leg{
 		ExternalID: externalID, OrderID: screened.ID, Direction: relay.TRC20ToBEP20,
-		CustomerID: customerID, DestinationAddress: "0xcustomer-bep20-address", DepositAddress: "Trelayd-fixture-deposit-address",
-		AmountIn: money.Amount{Asset: money.USDT_TRC20, Units: 100_000000}, AmountOutExpected: money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
+		CustomerID: customerID, DestinationAddress: "0xcustomer-bep20-address", DepositAddress: "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4",
+		DepositDerivationIndex: &depositDerivationIndex,
+		AmountIn:               money.Amount{Asset: money.USDT_TRC20, Units: 100_000000}, AmountOutExpected: money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
 	}); err != nil {
 		return fail(name, err)
 	}
 
 	so := h.newOrchestrator(h.nextID("provider"), 0)
 	so.upstream.ForceDepositAddress("TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj")
+	so.tronDepositWatcher.set(screened.ID, "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4", depositDerivationIndex)
 
 	if err := h.runTicksUntil(so.orch, 3, func() (bool, error) {
 		st, err := h.legStatus(externalID)

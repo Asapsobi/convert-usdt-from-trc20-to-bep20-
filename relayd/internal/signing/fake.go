@@ -12,15 +12,17 @@ import (
 // used by relayd's own state-machine/orchestrate tests that care about
 // forward-leg logic, not S1's own cryptography.
 type FakeSigningService struct {
-	mu                    sync.Mutex
-	seq                   int64
-	byID                  map[int64]*SigningRequest
-	byIdemKey             map[string]int64
-	addresses             map[int]string
-	evmAddresses          map[int]string
-	forceErr              map[string]error
-	forceDuplicateOf      map[string]string
-	requestSignatureCalls int64
+	mu                                    sync.Mutex
+	seq                                   int64
+	byID                                  map[int64]*SigningRequest
+	byIdemKey                             map[string]int64
+	addresses                             map[int]string
+	evmAddresses                          map[int]string
+	forceErr                              map[string]error
+	forceDuplicateOf                      map[string]string
+	requestSignatureCalls                 int64
+	requestDepositSweepSignatureCalls     int64
+	requestTronDepositSweepSignatureCalls int64
 }
 
 // NewFakeSigningService returns an empty FakeSigningService -- every
@@ -107,6 +109,107 @@ func (f *FakeSigningService) RequestSignature(ctx context.Context, slotID int, d
 	f.byID[id] = req
 	f.byIdemKey[idempotencyKey] = id
 	return *req, nil
+}
+
+// RequestDepositSweepSignature implements the same shape as
+// signing.Client's own method -- shares byID/byIdemKey/forceErr/
+// forceDuplicateOf with RequestSignature, mirroring the real S1's own
+// dedup-by-idempotency-key behavior regardless of slot-vs-deposit ref
+// (s1/internal/requests/store.go), with its own separate call counter.
+// Deliberately does NOT produce a real recoverable ECDSA signature (same
+// SHA256-derived fake bytes as RequestSignature) -- this fake exists for
+// state-machine/orchestrate-logic tests, never for verifying real
+// signer-recovery correctness, which is exactly why the new E2E test for
+// this fix drives a real S1 instead of this fake.
+func (f *FakeSigningService) RequestDepositSweepSignature(ctx context.Context, index uint32, digest [32]byte, estimatedUSD float64, idempotencyKey string) (SigningRequest, error) {
+	if err := ctx.Err(); err != nil {
+		return SigningRequest{}, err
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.requestDepositSweepSignatureCalls++
+
+	if id, ok := f.byIdemKey[idempotencyKey]; ok {
+		return *f.byID[id], nil
+	}
+	if err, ok := f.forceErr[idempotencyKey]; ok {
+		return SigningRequest{}, err
+	}
+
+	f.seq++
+	id := f.seq
+	signedTx := fakeSignedTx(idempotencyKey, digest)
+	if reuseKey, ok := f.forceDuplicateOf[idempotencyKey]; ok {
+		if reuseID, ok := f.byIdemKey[reuseKey]; ok {
+			signedTx = f.byID[reuseID].SignedTx
+		}
+	}
+
+	req := &SigningRequest{ID: id, Status: StatusSigned, SignedTx: signedTx}
+	f.byID[id] = req
+	f.byIdemKey[idempotencyKey] = id
+	return *req, nil
+}
+
+// RequestTronDepositSweepSignature implements the same shape as
+// signing.Client's own method -- RequestDepositSweepSignature's own
+// TRON-deposit counterpart, sharing byID/byIdemKey/forceErr/
+// forceDuplicateOf, with its own separate call counter. Same fake-bytes
+// posture as RequestDepositSweepSignature: never a real recoverable
+// signature, so real signer-recovery correctness is proven only by the
+// E2E test driving a real S1 instead of this fake.
+func (f *FakeSigningService) RequestTronDepositSweepSignature(ctx context.Context, index uint32, digest [32]byte, estimatedUSD float64, idempotencyKey string) (SigningRequest, error) {
+	if err := ctx.Err(); err != nil {
+		return SigningRequest{}, err
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.requestTronDepositSweepSignatureCalls++
+
+	if id, ok := f.byIdemKey[idempotencyKey]; ok {
+		return *f.byID[id], nil
+	}
+	if err, ok := f.forceErr[idempotencyKey]; ok {
+		return SigningRequest{}, err
+	}
+
+	f.seq++
+	id := f.seq
+	signedTx := fakeSignedTx(idempotencyKey, digest)
+	if reuseKey, ok := f.forceDuplicateOf[idempotencyKey]; ok {
+		if reuseID, ok := f.byIdemKey[reuseKey]; ok {
+			signedTx = f.byID[reuseID].SignedTx
+		}
+	}
+
+	req := &SigningRequest{ID: id, Status: StatusSigned, SignedTx: signedTx}
+	f.byID[id] = req
+	f.byIdemKey[idempotencyKey] = id
+	return *req, nil
+}
+
+// RequestTronDepositSweepSignatureCallCount returns how many times
+// RequestTronDepositSweepSignature has been called (regardless of
+// idempotent-replay outcome) -- the counter TestFullHappyPath_TRC20ToBEP20
+// now asserts against, since that leg type no longer calls
+// RequestSignature at all.
+func (f *FakeSigningService) RequestTronDepositSweepSignatureCallCount() int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.requestTronDepositSweepSignatureCalls
+}
+
+// RequestDepositSweepSignatureCallCount returns how many times
+// RequestDepositSweepSignature has been called (regardless of
+// idempotent-replay outcome) -- the counter
+// TestFullHappyPath_BEP20ToTRC20 now asserts against, since that leg
+// type no longer calls RequestSignature at all.
+func (f *FakeSigningService) RequestDepositSweepSignatureCallCount() int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.requestDepositSweepSignatureCalls
 }
 
 // GetSignature implements the same shape as signing.Client's own

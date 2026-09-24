@@ -67,14 +67,24 @@ const (
 
 // Leg is a relay_legs row.
 type Leg struct {
-	ID                      int64
-	ExternalID              string
-	OrderID                 int64
-	Direction               Direction
-	Status                  Status
-	CustomerID              string
-	DestinationAddress      string
-	DepositAddress          string
+	ID                 int64
+	ExternalID         string
+	OrderID            int64
+	Direction          Direction
+	Status             Status
+	CustomerID         string
+	DestinationAddress string
+	DepositAddress     string
+	// DepositDerivationIndex is the BIP32 child index the leg's own
+	// watcher (depositwatcher for BEP20_TO_TRC20, tronwatcher for
+	// TRC20_TO_BEP20) used to derive DepositAddress -- set once, at
+	// Create, straight from the real AssignAddress response
+	// (internal/driver.CreateRelayLeg), never recomputed. Required for a
+	// leg's own forward signing to request a signature from THIS leg's
+	// own per-order key instead of relayd's shared slot key
+	// (internal/orchestrate, advanceForwardingOneBEP20/
+	// advanceForwardingOneTRC20).
+	DepositDerivationIndex  *uint32
 	AmountIn                money.Amount
 	AmountOutExpected       money.Amount
 	AmountOutActual         *money.Amount
@@ -109,7 +119,7 @@ func NewStore(pool *db.Pool) *Store {
 
 const selectSQL = `
 	SELECT id, external_id, order_id, direction, status, customer_id, destination_address,
-		deposit_address, amount_in, amount_in_asset, amount_out_expected, amount_out_expected_asset,
+		deposit_address, deposit_derivation_index, amount_in, amount_in_asset, amount_out_expected, amount_out_expected_asset,
 		amount_out_actual, upstream_provider_name, upstream_order_id, upstream_deposit_address,
 		forward_tx_id, refund_tx_id, stale_alerted_at, forward_attempt_started_at, created_at, updated_at
 	FROM relay_legs`
@@ -120,17 +130,27 @@ const selectSQL = `
 // succeeding and this INSERT" recovery case every sibling Store's own
 // Create is built around).
 func (s *Store) Create(ctx context.Context, l Leg) (Leg, error) {
+	// bigint column; pgx's own parameter encoding wants a matching
+	// width, same reasoning as this package's own scanLeg -- convert
+	// here rather than pass *uint32 directly, mirroring how
+	// depositwatcher's own store.go passes its identical column's index
+	// as int64, never uint32.
+	var depositDerivationIndex *int64
+	if l.DepositDerivationIndex != nil {
+		v := int64(*l.DepositDerivationIndex)
+		depositDerivationIndex = &v
+	}
 	row := s.pool.QueryRow(ctx, `
 		INSERT INTO relay_legs
-			(external_id, order_id, direction, status, customer_id, destination_address, deposit_address,
+			(external_id, order_id, direction, status, customer_id, destination_address, deposit_address, deposit_derivation_index,
 			 amount_in, amount_in_asset, amount_out_expected, amount_out_expected_asset)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		ON CONFLICT (external_id) DO NOTHING
 		RETURNING id, external_id, order_id, direction, status, customer_id, destination_address,
-			deposit_address, amount_in, amount_in_asset, amount_out_expected, amount_out_expected_asset,
+			deposit_address, deposit_derivation_index, amount_in, amount_in_asset, amount_out_expected, amount_out_expected_asset,
 			amount_out_actual, upstream_provider_name, upstream_order_id, upstream_deposit_address,
 			forward_tx_id, refund_tx_id, stale_alerted_at, forward_attempt_started_at, created_at, updated_at
-	`, l.ExternalID, l.OrderID, string(l.Direction), string(StatusAwaitingDeposit), l.CustomerID, l.DestinationAddress, l.DepositAddress,
+	`, l.ExternalID, l.OrderID, string(l.Direction), string(StatusAwaitingDeposit), l.CustomerID, l.DestinationAddress, l.DepositAddress, depositDerivationIndex,
 		l.AmountIn.Units, string(l.AmountIn.Asset), l.AmountOutExpected.Units, string(l.AmountOutExpected.Asset))
 
 	leg, err := scanLeg(row)
@@ -416,9 +436,10 @@ func scanLeg(row scanRow) (Leg, error) {
 	var amountInUnits, amountOutExpectedUnits int64
 	var amountInAsset, amountOutExpectedAsset string
 	var amountOutActualUnits *int64
+	var depositDerivationIndex *int64 // bigint column; converted to *uint32 below, same pattern depositwatcher's own store.go uses for the identical column type
 	err := row.Scan(
 		&l.ID, &l.ExternalID, &l.OrderID, &direction, &status, &l.CustomerID, &l.DestinationAddress,
-		&l.DepositAddress, &amountInUnits, &amountInAsset, &amountOutExpectedUnits, &amountOutExpectedAsset,
+		&l.DepositAddress, &depositDerivationIndex, &amountInUnits, &amountInAsset, &amountOutExpectedUnits, &amountOutExpectedAsset,
 		&amountOutActualUnits, &l.UpstreamProviderName, &l.UpstreamOrderID, &l.UpstreamDepositAddress,
 		&l.ForwardTxID, &l.RefundTxID, &l.StaleAlertedAt, &l.ForwardAttemptStartedAt, &l.CreatedAt, &l.UpdatedAt,
 	)
@@ -427,6 +448,10 @@ func scanLeg(row scanRow) (Leg, error) {
 	}
 	l.Direction = Direction(direction)
 	l.Status = Status(status)
+	if depositDerivationIndex != nil {
+		index := uint32(*depositDerivationIndex)
+		l.DepositDerivationIndex = &index
+	}
 	l.AmountIn = money.Amount{Asset: money.Asset(amountInAsset), Units: amountInUnits}
 	l.AmountOutExpected = money.Amount{Asset: money.Asset(amountOutExpectedAsset), Units: amountOutExpectedUnits}
 	if amountOutActualUnits != nil {

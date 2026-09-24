@@ -24,6 +24,7 @@ type Server struct {
 // NewRouter builds the full route table.
 func NewRouter(s *Server) http.Handler {
 	r := chi.NewRouter()
+	r.Use(corsMiddleware)
 	r.Get("/healthz", s.healthz)
 	r.Route("/v1", func(r chi.Router) {
 		r.Post("/relay-legs", s.postRelayLeg)

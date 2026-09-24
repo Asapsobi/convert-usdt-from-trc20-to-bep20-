@@ -43,6 +43,40 @@ func TestBuildTransfer_CalldataHasCorrectSelectorAndShape(t *testing.T) {
 	}
 }
 
+// TestBuildTransfer_AmountIsScaledToOnChainDecimals guards against a
+// real bug this exact test would have caught: buildCalldata once
+// encoded amount.Units (money.Amount's own 6-decimal minor units)
+// directly as the on-chain uint256, with no scaling to this contract's
+// real 18 decimals -- moving 1e-12 of the intended amount on a real
+// broadcast (confirmed live: a 2 USDT deposit sent as 1_995000 forward
+// Units moved 0.000000000001995 real USDT, not ~1.995). 2_000000 Units
+// (2 USDT.6dp) must encode as exactly 0x1bc16d674ec80000 (2e18) -- the
+// same raw hex independently confirmed against this contract's own real
+// Transfer log for a genuine 2 USDT transfer.
+func TestBuildTransfer_AmountIsScaledToOnChainDecimals(t *testing.T) {
+	tx, _, err := BuildTransfer("0x4192cc99D3Cb95573dCaf8dD76921476E0c7bCAf", mustAmount(t, 2_000000), testParams())
+	if err != nil {
+		t.Fatalf("BuildTransfer: %v", err)
+	}
+	data := tx.Data()
+	amountWord := data[4+32 : 4+64]
+	want, ok := new(big.Int).SetString("2000000000000000000", 10) // 2 USDT at this contract's real 18 decimals
+	if !ok {
+		t.Fatalf("bad test fixture")
+	}
+	got := new(big.Int).SetBytes(amountWord)
+	if got.Cmp(want) != 0 {
+		t.Fatalf("2_000000 Units (2 USDT) should encode on-chain as %s (2e18), got %s", want, got)
+	}
+}
+
+func TestBuildTransfer_RejectsWrongAsset(t *testing.T) {
+	wrongAsset := money.Amount{Asset: money.USDT_TRC20, Units: 1_000000}
+	if _, _, err := BuildTransfer("0x4192cc99D3Cb95573dCaf8dD76921476E0c7bCAf", wrongAsset, testParams()); !errors.Is(err, ErrUnsupportedAsset) {
+		t.Fatalf("expected ErrUnsupportedAsset for a non-USDT_BEP20 amount, got %v", err)
+	}
+}
+
 func TestBuildTransfer_Deterministic(t *testing.T) {
 	params := testParams()
 	tx1, digest1, err := BuildTransfer("0x4192cc99D3Cb95573dCaf8dD76921476E0c7bCAf", mustAmount(t, 100_500000), params)

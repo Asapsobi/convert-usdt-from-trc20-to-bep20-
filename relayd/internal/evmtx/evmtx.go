@@ -46,6 +46,21 @@ import (
 // BscScan per that file's own doc comment.
 const USDTContractAddress = "0x55d398326f99059fF775485246999027B3197955"
 
+// usdtBEP20OnChainDecimals is this contract's own real on-chain decimal
+// precision -- confirmed live against its actual Transfer log data
+// (2 USDT deposit encoded as 0x1bc16d674ec80000 = 2e18). This is
+// independent of money.Amount's own internal minor-unit convention
+// (money.Asset.Decimals(), 6 for USDT_BEP20, mirrored from
+// depositwatcher/internal/money's own 6-decimal Amount type) -- the two
+// happen to coincide for TRC20 USDT (also 6 on-chain, which is why
+// internal/txbuild's own identically-shaped buildCalldata never needed
+// this scaling), but not for BEP20 USDT, which buildCalldata below must
+// scale up to before encoding, or the resulting transfer moves 1e-12 of
+// the intended amount. See this package's own header comment: this file
+// is the first BEP20 transfer this codebase has ever built or
+// broadcast, which is how this went uncaught until a real one ran.
+const usdtBEP20OnChainDecimals = 18
+
 // BSCChainID is BSC mainnet's own EIP-155 chain id -- required for
 // transaction replay protection; a signature valid on one EVM chain
 // must not be replayable on another.
@@ -70,6 +85,15 @@ var (
 	// never a reachable "zero gas price" real value (a real node's own
 	// eth_gasPrice never returns nil).
 	ErrNilGasPrice = errors.New("evmtx: gas price must not be nil")
+
+	// ErrUnsupportedAsset means amount.Asset was not USDT_BEP20 --
+	// USDTContractAddress is one specific, fixed contract, and
+	// onChainAmount's own decimal scaling is only verified correct for
+	// that contract's own 18 decimals. Silently encoding some other
+	// asset's Units through this scale would build a transfer moving the
+	// wrong amount without any error at all -- exactly the failure class
+	// this whole check exists to rule out.
+	ErrUnsupportedAsset = errors.New("evmtx: unsupported asset")
 )
 
 // TxParams is the chain state a caller resolved elsewhere (a real
@@ -106,6 +130,9 @@ func BuildTransfer(recipientAddress string, amount money.Amount, params TxParams
 	if amount.Units <= 0 {
 		return nil, [32]byte{}, fmt.Errorf("%w: got %d", ErrNonPositiveAmount, amount.Units)
 	}
+	if amount.Asset != money.USDT_BEP20 {
+		return nil, [32]byte{}, fmt.Errorf("%w: %q", ErrUnsupportedAsset, amount.Asset)
+	}
 	if params.GasPrice == nil {
 		return nil, [32]byte{}, ErrNilGasPrice
 	}
@@ -135,9 +162,22 @@ func buildCalldata(recipient common.Address, amount money.Amount) []byte {
 	data := make([]byte, 4+32+32)
 	copy(data[0:4], transferMethodID)
 	copy(data[4+12:4+32], recipient.Bytes()) // last 20 of 32 bytes, per EVM's own address-as-word convention
-	amountBytes := new(big.Int).SetInt64(amount.Units).Bytes()
+	onChainUnits := onChainAmount(amount)
+	amountBytes := onChainUnits.Bytes()
 	copy(data[4+64-len(amountBytes):4+64], amountBytes)
 	return data
+}
+
+// onChainAmount converts amount.Units (money.Amount's own internal
+// minor units, money.USDT_BEP20.Decimals() places -- guaranteed 6 by
+// BuildTransfer's own asset check above, which every caller of this
+// unexported helper goes through) to this contract's real 18-decimal
+// on-chain units -- see usdtBEP20OnChainDecimals's own doc comment for
+// why this scaling exists at all.
+func onChainAmount(amount money.Amount) *big.Int {
+	internalDecimals, _ := money.USDT_BEP20.Decimals() // static, always valid -- see money.Asset.Decimals()
+	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(usdtBEP20OnChainDecimals-int64(internalDecimals)), nil)
+	return new(big.Int).Mul(big.NewInt(amount.Units), scale)
 }
 
 // WithSignature reconstructs the final, broadcast-ready signed

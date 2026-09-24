@@ -99,19 +99,27 @@ func (c *Client) do(ctx context.Context, method, path, idempotencyKey string, bo
 // Address is the subset of the watcher's own addressResponse this
 // client reads.
 type Address struct {
-	Address    string
-	OrderID    int64
-	ExternalID string
-	CustomerID string
-	Status     string
+	Address string
+	// DerivationIndex is only ever populated when the underlying watcher
+	// is depositwatcher (C2, BSC) -- tronwatcher's (C2', TRON) own
+	// identically-shaped response has no such field, so it decodes to
+	// nil there. A pointer, deliberately, rather than a bare uint32: a
+	// real BSC derivation index can legitimately be 0, so nil is the
+	// only way to distinguish "not present" from "index zero."
+	DerivationIndex *uint32
+	OrderID         int64
+	ExternalID      string
+	CustomerID      string
+	Status          string
 }
 
 type addressResponse struct {
-	Address    string `json:"address"`
-	OrderID    int64  `json:"order_id"`
-	ExternalID string `json:"external_id"`
-	CustomerID string `json:"customer_id"`
-	Status     string `json:"status"`
+	Address         string  `json:"address"`
+	DerivationIndex *uint32 `json:"derivation_index,omitempty"`
+	OrderID         int64   `json:"order_id"`
+	ExternalID      string  `json:"external_id"`
+	CustomerID      string  `json:"customer_id"`
+	Status          string  `json:"status"`
 }
 
 type postAddressRequest struct {
@@ -141,7 +149,7 @@ func (c *Client) AssignAddress(ctx context.Context, orderID int64, externalID, c
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return Address{}, fmt.Errorf("watcherclient: decoding AssignAddress response: %w", err)
 	}
-	return Address{Address: resp.Address, OrderID: resp.OrderID, ExternalID: resp.ExternalID, CustomerID: resp.CustomerID, Status: resp.Status}, nil
+	return Address{Address: resp.Address, DerivationIndex: resp.DerivationIndex, OrderID: resp.OrderID, ExternalID: resp.ExternalID, CustomerID: resp.CustomerID, Status: resp.Status}, nil
 }
 
 // GetAddress calls GET /v1/addresses/{orderID}.
@@ -157,5 +165,5 @@ func (c *Client) GetAddress(ctx context.Context, orderID int64) (Address, error)
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return Address{}, fmt.Errorf("watcherclient: decoding GetAddress response: %w", err)
 	}
-	return Address{Address: resp.Address, OrderID: resp.OrderID, ExternalID: resp.ExternalID, CustomerID: resp.CustomerID, Status: resp.Status}, nil
+	return Address{Address: resp.Address, DerivationIndex: resp.DerivationIndex, OrderID: resp.OrderID, ExternalID: resp.ExternalID, CustomerID: resp.CustomerID, Status: resp.Status}, nil
 }

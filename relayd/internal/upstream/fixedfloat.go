@@ -38,6 +38,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -173,6 +174,33 @@ func unpackOrderRef(ref string) (id, token string, err error) {
 	return parts[0], parts[1], nil
 }
 
+// truncateToDecimals drops any fractional digits beyond maxDecimals from
+// a plain decimal string -- confirmed live that FixedFloat's own /price
+// and /create responses report amounts at a fixed 8-decimal precision
+// regardless of the actual asset (USDT_TRC20/USDT_BEP20 only support 6
+// on-chain), which money.ParseDecimal's own "never rounds, rejects
+// outright" contract correctly refuses rather than silently
+// misinterpreting. This is the one place that contract should be
+// softened: these fields are FixedFloat's own informational echo of an
+// amount (never the value actually used to build the on-chain transfer,
+// which always comes from this system's own stored leg/order data -- see
+// this file's own top-of-file doc comment on why relayd re-quotes rather
+// than trusting a stale quote), so truncating excess vendor-side
+// precision to what the asset can even represent loses nothing that was
+// ever real. Truncates (rounds toward zero) rather than rounding, the
+// same conservative direction every other money-shaped value in this
+// codebase defaults to.
+func truncateToDecimals(s string, maxDecimals int) string {
+	intPart, fracPart, hasDot := strings.Cut(s, ".")
+	if !hasDot || len(fracPart) <= maxDecimals {
+		return s
+	}
+	if maxDecimals == 0 {
+		return intPart
+	}
+	return intPart + "." + fracPart[:maxDecimals]
+}
+
 // sign computes FixedFloat's own required X-API-SIGN header: HMAC-SHA256
 // over the exact JSON body bytes sent, keyed by the account's own API
 // secret, hex-encoded. Per their own API docs: an empty body signs the
@@ -187,9 +215,33 @@ func sign(secret string, body []byte) string {
 // or failure: code 0 means success, any other code is an error with msg
 // carrying the human-readable reason.
 type ffEnvelope struct {
-	Code int             `json:"code"`
+	Code ffCode          `json:"code"`
 	Msg  string          `json:"msg"`
 	Data json.RawMessage `json:"data"`
+}
+
+// ffCode unmarshals from either a bare JSON number or a quoted numeric
+// string -- FixedFloat's own API returns code as a bare number on success
+// paths but as a quoted string on at least one real error path (confirmed
+// live: POST /create's permission-denied response is `"code":"501"`).
+type ffCode int
+
+func (c *ffCode) UnmarshalJSON(b []byte) error {
+	var n int
+	if err := json.Unmarshal(b, &n); err == nil {
+		*c = ffCode(n)
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	parsed, err := strconv.Atoi(s)
+	if err != nil {
+		return fmt.Errorf("ffCode: not a number or numeric string: %q", s)
+	}
+	*c = ffCode(parsed)
+	return nil
 }
 
 // APIError is a structured error response from FixedFloat.
@@ -238,10 +290,10 @@ func (p *FixedFloatProvider) do(ctx context.Context, path string, body any, out 
 
 	var envelope ffEnvelope
 	if err := json.Unmarshal(respBody, &envelope); err != nil {
-		return fmt.Errorf("upstream: fixedfloat: %w: decoding envelope for POST %s: %v", ErrMalformedResponse, path, err)
+		return fmt.Errorf("upstream: fixedfloat: %w: decoding envelope for POST %s: %v (body: %s)", ErrMalformedResponse, path, err, respBody)
 	}
 	if envelope.Code != 0 {
-		return &APIError{Code: envelope.Code, Msg: envelope.Msg}
+		return &APIError{Code: int(envelope.Code), Msg: envelope.Msg}
 	}
 	if out != nil {
 		if err := json.Unmarshal(envelope.Data, out); err != nil {
@@ -260,9 +312,15 @@ type ffPriceRequest struct {
 	RefCode   string `json:"refcode,omitempty"`
 }
 
+// ffPriceSide.Amount is json.Number, not string -- FixedFloat's real API
+// returns this field as a bare JSON number (e.g. `"amount":10`, confirmed
+// live), not a quoted string as this file originally assumed. json.Number
+// (not float64) preserves the exact decimal text FixedFloat sent, so a
+// real amount is never rounded through floating point before
+// money.ParseDecimal gets it.
 type ffPriceSide struct {
-	Code   string `json:"code"`
-	Amount string `json:"amount"`
+	Code   string      `json:"code"`
+	Amount json.Number `json:"amount"`
 }
 
 type ffPriceData struct {
@@ -297,7 +355,11 @@ func (p *FixedFloatProvider) Quote(ctx context.Context, pair Pair, amountIn mone
 		return Quote{}, fmt.Errorf("upstream: fixedfloat: price unavailable for pair: %s", strings.Join(data.Errors, ", "))
 	}
 
-	amountOut, err := money.ParseDecimal(data.To.Amount, pair.To)
+	toDecimals, err := pair.To.Decimals()
+	if err != nil {
+		return Quote{}, fmt.Errorf("upstream: fixedfloat: %w", err)
+	}
+	amountOut, err := money.ParseDecimal(truncateToDecimals(data.To.Amount.String(), toDecimals), pair.To)
 	if err != nil {
 		return Quote{}, fmt.Errorf("upstream: fixedfloat: %w: parsing quoted amount %q: %v", ErrMalformedResponse, data.To.Amount, err)
 	}
@@ -323,10 +385,14 @@ type ffCreateRequest struct {
 	RefCode   string `json:"refcode,omitempty"`
 }
 
+// ffOrderSide.Amount is json.Number for the same real reason as
+// ffPriceSide.Amount above -- FixedFloat's /create and /order responses
+// share the same bare-number shape as /price, confirmed by the same live
+// investigation.
 type ffOrderSide struct {
-	Code    string `json:"code"`
-	Address string `json:"address"`
-	Amount  string `json:"amount"`
+	Code    string      `json:"code"`
+	Address string      `json:"address"`
+	Amount  json.Number `json:"amount"`
 }
 
 type ffOrderData struct {
@@ -381,11 +447,19 @@ func (p *FixedFloatProvider) toSwapOrder(data ffOrderData, destinationAddress st
 	if err != nil {
 		return SwapOrder{}, err
 	}
-	amountIn, err := money.ParseDecimal(data.From.Amount, fromAsset)
+	fromDecimals, err := fromAsset.Decimals()
+	if err != nil {
+		return SwapOrder{}, fmt.Errorf("upstream: fixedfloat: %w", err)
+	}
+	toDecimals, err := toAsset.Decimals()
+	if err != nil {
+		return SwapOrder{}, fmt.Errorf("upstream: fixedfloat: %w", err)
+	}
+	amountIn, err := money.ParseDecimal(truncateToDecimals(data.From.Amount.String(), fromDecimals), fromAsset)
 	if err != nil {
 		return SwapOrder{}, fmt.Errorf("upstream: fixedfloat: %w: parsing order amount_in %q: %v", ErrMalformedResponse, data.From.Amount, err)
 	}
-	amountOutExpected, err := money.ParseDecimal(data.To.Amount, toAsset)
+	amountOutExpected, err := money.ParseDecimal(truncateToDecimals(data.To.Amount.String(), toDecimals), toAsset)
 	if err != nil {
 		return SwapOrder{}, fmt.Errorf("upstream: fixedfloat: %w: parsing order amount_out %q: %v", ErrMalformedResponse, data.To.Amount, err)
 	}
