@@ -80,6 +80,46 @@ func TestNewPool_RefusesFewerThanTwoProviders(t *testing.T) {
 	}
 }
 
+func TestNewPool_AllowSingleProvider_PermitsExactlyOneNeverZero(t *testing.T) {
+	node, srv := newFakeNode().client()
+	defer srv.Close()
+
+	pool, err := NewPool([]Provider{{Name: "solo", Client: node}}, Config{AllowSingleProvider: true})
+	if err != nil {
+		t.Fatalf("expected AllowSingleProvider to permit exactly one provider, got %v", err)
+	}
+	if pool.minAgreement != 1 {
+		t.Fatalf("expected MinAgreement to default to 1 for a single allowed provider, got %d", pool.minAgreement)
+	}
+
+	// Still refuses zero providers -- AllowSingleProvider permits exactly
+	// one, not "no minimum at all".
+	_, err = NewPool(nil, Config{AllowSingleProvider: true})
+	if !errors.Is(err, ErrTooFewProviders) {
+		t.Fatalf("expected ErrTooFewProviders for zero providers even with AllowSingleProvider, got %v", err)
+	}
+}
+
+func TestLatestFinalized_SingleAllowedProvider_TrustsItAlone(t *testing.T) {
+	fake := newFakeNode()
+	client, srv := fake.client()
+	defer srv.Close()
+
+	pool, err := NewPool([]Provider{{Name: "solo", Client: client}}, Config{AllowSingleProvider: true})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	fake.setFinalized(1000, hash(1))
+
+	height, agreedHash, err := pool.LatestFinalized(context.Background())
+	if err != nil {
+		t.Fatalf("expected success trusting the single allowed provider, got %v", err)
+	}
+	if height != 1000 || agreedHash != hash(1) {
+		t.Fatalf("got (%d, %s), want (1000, %s)", height, agreedHash, hash(1))
+	}
+}
+
 func TestNewPool_RejectsBadConfiguration(t *testing.T) {
 	nodeA, srvA := newFakeNode().client()
 	defer srvA.Close()
@@ -338,6 +378,27 @@ func TestLogsAt_ProvidersAgree_Succeeds(t *testing.T) {
 		common.HexToAddress("0x55d398326f99059fF775485246999027B3197955"), nil)
 	if err != nil {
 		t.Fatalf("expected success, got %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 logs, got %d", len(got))
+	}
+}
+
+func TestLogsAt_SingleAllowedProvider_TrustsItAlone(t *testing.T) {
+	fake := newFakeNode()
+	client, srv := fake.client()
+	defer srv.Close()
+
+	pool, err := NewPool([]Provider{{Name: "solo", Client: client}}, Config{AllowSingleProvider: true})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	fake.setLogs([]types.Log{sampleLog(100, 0), sampleLog(100, 1)})
+
+	got, err := pool.LogsAt(context.Background(), 100, 100,
+		common.HexToAddress("0x55d398326f99059fF775485246999027B3197955"), nil)
+	if err != nil {
+		t.Fatalf("expected success trusting the single allowed provider, got %v", err)
 	}
 	if len(got) != 2 {
 		t.Fatalf("expected 2 logs, got %d", len(got))

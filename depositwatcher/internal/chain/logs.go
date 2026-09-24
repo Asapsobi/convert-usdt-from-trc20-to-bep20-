@@ -68,11 +68,13 @@ func logsAgreementKey(logs []types.Log) logsKey {
 // than sampling costs nothing, so that's what this does rather than the
 // sampling this chunk's own spec allows as an alternative.
 func (p *Pool) LogsAt(ctx context.Context, fromBlock, toBlock uint64, contractAddress common.Address, topics [][]common.Hash) ([]types.Log, error) {
-	if len(p.providers) < 2 {
-		// NewPool already refuses fewer than 2 providers, so this is
-		// unreachable in practice.
-		return nil, ErrTooFewProviders
-	}
+	// NewPool already refuses fewer than 2 providers, UNLESS the operator
+	// explicitly set Config.AllowSingleProvider -- exactly one provider is
+	// then legitimate, not a bug to guard against here too. Provider-count
+	// validation belongs solely to NewPool; duplicating it here would only
+	// let this check drift out of sync with that one, as it briefly did
+	// (this exact line used to hard-block the single-provider case
+	// NewPool was updated to allow).
 
 	query := ethereum.FilterQuery{
 		FromBlock: new(big.Int).SetUint64(fromBlock),

@@ -36,13 +36,28 @@ type Config struct {
 	// provider must fail or disagree before ProviderHealthSnapshot marks
 	// it unhealthy. Defaults to 3 if zero or negative.
 	UnhealthyAfterConsecutiveFailures int
+
+	// AllowSingleProvider is an explicit, deliberate override of
+	// invariant 5, for a deployment that has decided (operator's own
+	// informed choice, not this package's default) to trust exactly one
+	// RPC provider rather than get a second one. With exactly one
+	// provider and this set, MinAgreement defaults to 1 instead of the
+	// usual 2 -- there is no second provider left to agree with. False
+	// (the default) preserves invariant 5 exactly as before: fewer than
+	// 2 providers is always ErrTooFewProviders. See
+	// cmd/watcherd/engine.go's own WATCHER_ALLOW_SINGLE_PROVIDER gate,
+	// the same double-gate convention WATCHER_ALLOW_ASYNC_FINALITY
+	// already uses for an equally deliberate, non-default posture.
+	AllowSingleProvider bool
 }
 
-// ErrTooFewProviders is returned by NewPool for fewer than 2 providers --
-// refusing to even construct a Pool, per the spec: "this isn't a
+// ErrTooFewProviders is returned by NewPool for fewer than 2 providers,
+// unless Config.AllowSingleProvider was explicitly set -- refusing to
+// even construct a Pool by default, per the spec: "this isn't a
 // runtime-degradable feature, it's invariant 5." A caller cannot obtain a
 // Pool that would silently trust a single provider.
-var ErrTooFewProviders = errors.New("chain: at least 2 providers are required (no single-provider finality)")
+var ErrTooFewProviders = errors.New("chain: at least 2 providers are required (no single-provider finality) -- " +
+	"set AllowSingleProvider to explicitly override")
 
 // Pool fans a query out to every configured provider and reports a
 // result only when enough of them agree. It never speaks for a single
@@ -63,7 +78,7 @@ type Pool struct {
 // nil client. All of these are configuration mistakes worth failing loud
 // on at construction, not discovering on the first call.
 func NewPool(providers []Provider, cfg Config) (*Pool, error) {
-	if len(providers) < 2 {
+	if len(providers) < 2 && !(cfg.AllowSingleProvider && len(providers) == 1) {
 		return nil, ErrTooFewProviders
 	}
 	seen := make(map[string]bool, len(providers))
@@ -83,6 +98,9 @@ func NewPool(providers []Provider, cfg Config) (*Pool, error) {
 	minAgreement := cfg.MinAgreement
 	if minAgreement <= 0 {
 		minAgreement = 2
+		if cfg.AllowSingleProvider && len(providers) == 1 {
+			minAgreement = 1
+		}
 	}
 	if minAgreement > len(providers) {
 		return nil, fmt.Errorf("chain: MinAgreement (%d) exceeds the number of configured providers (%d)",

@@ -113,7 +113,18 @@ func newEngineFromEnv(pool *db.Pool) (*engine, error) {
 		}
 		minAgreement = parsed
 	}
-	chainPool, err := chain.NewPool(providers, chain.Config{MinAgreement: minAgreement})
+	// WATCHER_ALLOW_SINGLE_PROVIDER=true is an explicit, operator-chosen
+	// override of invariant 5 ("no single RPC provider is trusted alone
+	// for a finality decision" -- chain.Config's own AllowSingleProvider
+	// doc comment). Same double-gate posture as WATCHER_ALLOW_ASYNC_FINALITY
+	// below: a safety-relevant, non-default mode must never be reachable
+	// through one mistyped env var, so this alone doesn't relax anything
+	// -- it's a single bool with no second gate because, unlike async
+	// finality, there is no separate "is this proven yet" axis here: the
+	// operator is choosing to trust one specific provider, a decision
+	// this env var alone fully captures.
+	allowSingleProvider := os.Getenv("WATCHER_ALLOW_SINGLE_PROVIDER") == "true"
+	chainPool, err := chain.NewPool(providers, chain.Config{MinAgreement: minAgreement, AllowSingleProvider: allowSingleProvider})
 	if err != nil {
 		return nil, fmt.Errorf("watcherd: building RPC provider pool: %w", err)
 	}
