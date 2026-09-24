@@ -8,6 +8,7 @@ import (
 	"gateway/internal/c1client"
 	"gateway/internal/money"
 	"gateway/internal/pricing"
+	"gateway/internal/quotes"
 )
 
 type postQuoteRequest struct {
@@ -71,7 +72,7 @@ func (s *Server) postQuote(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	q, err := s.Quotes.Create(r.Context(), customer.ID, priced, req.RecipientAddress, now, s.quoteValidity())
 	if err != nil {
-		writeAPIError(w, errInternal)
+		writeQuoteCreateErr(w, err)
 		return
 	}
 
@@ -100,4 +101,22 @@ func writeErr(w http.ResponseWriter, err error) {
 	default:
 		writeAPIError(w, errUpstreamError)
 	}
+}
+
+// writeQuoteCreateErr maps a Quotes.Create/CreateForRetail error --
+// internal/tronaddr's own validation failure (via
+// quotes.ErrInvalidRecipientAddress) gets its own clear, distinct 400,
+// never lumped in with a generic internal-error or the c1client/pricing
+// cases writeErr above handles (this call never reaches either of
+// those). Anything else is a real, unexpected failure in this
+// service's own DB layer -- errInternal (500), not errUpstreamError
+// (502): no upstream service was involved in a Quotes.Create call.
+// Shared by both postQuote and postRetailQuote so the two never drift
+// on how this is mapped.
+func writeQuoteCreateErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, quotes.ErrInvalidRecipientAddress) {
+		writeAPIError(w, errInvalidDestinationAddress)
+		return
+	}
+	writeAPIError(w, errInternal)
 }

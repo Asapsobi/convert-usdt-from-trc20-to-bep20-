@@ -16,6 +16,21 @@ import (
 	"gateway/internal/db"
 )
 
+// validTronRecipient is a real, checksum-valid TRON base58check address
+// -- shared across this package's own integration tests wherever a
+// syntactically-real (not necessarily meaningful) TRC20 destination is
+// needed. This is dispatcher/internal/txbuild's own USDTContractAddress
+// constant, reused here purely because it's already independently
+// verified real (see that package's own doc comment), not because
+// these tests care about USDT's own contract -- picking an
+// already-proven-correct address removes any risk of a hand-typed
+// checksum being wrong. internal/tronaddr now validates every
+// recipient_address for real (base58check, not a prefix guess), so a
+// placeholder string like the old "TRecipient"/"TAddr" no longer
+// passes -- these tests intentionally do not use fake addresses to
+// avoid weakening that check to make themselves pass.
+const validTronRecipient = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+
 // testPool applies every migration against GATEWAY_TEST_DATABASE_URL
 // and returns a real, connected *db.Pool -- same convention every
 // sibling component's own integration suite uses.

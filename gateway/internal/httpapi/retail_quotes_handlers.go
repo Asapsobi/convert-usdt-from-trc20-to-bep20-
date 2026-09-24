@@ -49,7 +49,7 @@ func (s *Server) postRetailQuote(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	q, err := s.Quotes.CreateForRetail(r.Context(), rc.ID, priced, req.RecipientAddress, now, s.quoteValidity())
 	if err != nil {
-		writeAPIError(w, errInternal)
+		writeQuoteCreateErr(w, err)
 		return
 	}
 

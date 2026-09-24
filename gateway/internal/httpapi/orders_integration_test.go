@@ -78,7 +78,7 @@ func newFakeC1Full(t *testing.T, f *fakeC1Full) *httptest.Server {
 		json.NewEncoder(w).Encode(map[string]any{
 			"id": 1, "external_id": externalID, "customer_id": "1", "tier": "STANDARD", "state": f.getState.Load().(string),
 			"amount_in": "3000.000000", "amount_out": "2990.700000", "fee_units": "7.500000", "network_fee_units": "1.800000",
-			"recipient_address": "TRecipient", "quoted_at": time.Now().UTC().Format(time.RFC3339), "quote_expires_at": time.Now().UTC().Format(time.RFC3339), "version": 0,
+			"recipient_address": validTronRecipient, "quoted_at": time.Now().UTC().Format(time.RFC3339), "quote_expires_at": time.Now().UTC().Format(time.RFC3339), "version": 0,
 		})
 	})
 	srv := httptest.NewServer(mux)
@@ -144,7 +144,7 @@ func uniqueExternalID(prefix string) string {
 
 func issueQuote(t *testing.T, router http.Handler, rawKey string) map[string]any {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/v1/quotes", strings.NewReader(`{"tier":"STANDARD","amount_in":"3000.000000","recipient_address":"TRecipient"}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/quotes", strings.NewReader(`{"tier":"STANDARD","amount_in":"3000.000000","recipient_address":"`+validTronRecipient+`"}`))
 	req.Header.Set("Authorization", "Bearer "+rawKey)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)

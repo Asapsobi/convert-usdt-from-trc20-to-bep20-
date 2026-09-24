@@ -21,6 +21,15 @@ import (
 	"gateway/internal/quotes"
 )
 
+// validTronRecipient mirrors internal/httpapi's own identical constant
+// (same value, same reasoning -- see that package's own doc comment):
+// internal/quotes.Store.Create now validates recipient_address for real
+// (internal/tronaddr, base58check), so a placeholder string like the
+// old "TRecipient" no longer passes even called directly as an internal
+// Go caller, which is exactly this file's own call shape -- proof the
+// invariant holds for internal callers, not just HTTP handlers.
+const validTronRecipient = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+
 // fakeC2 stands in for C2's own address-assignment endpoints, toggled
 // between failing and succeeding so a test can prove a stuck row
 // resolves the moment the fake starts succeeding.
@@ -76,7 +85,7 @@ func TestTick_RetriesUntilFakeSucceeds(t *testing.T) {
 	q, err := quotesStore.Create(t.Context(), cust.ID, pricing.Quote{
 		Tier: pricing.Standard, AmountIn: money.Amount(3000_000000), FeeUnits: money.Amount(7_500000),
 		NetworkFeeUnits: money.Amount(1_800000), AmountOut: money.Amount(2990_700000),
-	}, "TRecipient", time.Now().UTC(), time.Hour)
+	}, validTronRecipient, time.Now().UTC(), time.Hour)
 	if err != nil {
 		t.Fatalf("Create quote: %v", err)
 	}
@@ -144,7 +153,7 @@ func TestTick_AlertsExactlyOncePastThreshold(t *testing.T) {
 	q, err := quotesStore.Create(t.Context(), cust.ID, pricing.Quote{
 		Tier: pricing.Standard, AmountIn: money.Amount(3000_000000), FeeUnits: money.Amount(7_500000),
 		NetworkFeeUnits: money.Amount(1_800000), AmountOut: money.Amount(2990_700000),
-	}, "TRecipient", time.Now().UTC(), time.Hour)
+	}, validTronRecipient, time.Now().UTC(), time.Hour)
 	if err != nil {
 		t.Fatalf("Create quote: %v", err)
 	}

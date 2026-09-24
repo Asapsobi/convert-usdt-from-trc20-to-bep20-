@@ -35,6 +35,15 @@ var (
 	errQuoteAlreadyConsumed = newAPIError(http.StatusConflict, "quote_already_consumed", "this quote was already used by a different order")
 	errIdempotencyConflict  = newAPIError(http.StatusConflict, "idempotency_conflict", "the same Idempotency-Key was already used with a different request body")
 
+	// errInvalidDestinationAddress is quotes.ErrInvalidRecipientAddress's
+	// own HTTP shape -- Model D is a fixed-direction corridor (deposit
+	// BSC/BEP20, payout TRON/TRC20), so recipient_address must be a real,
+	// checksum-valid TRON address (see internal/tronaddr). Distinct from
+	// errInvalidRequest specifically so a caller can tell "this field's
+	// own value is wrong" from "the request shape itself is malformed."
+	errInvalidDestinationAddress = newAPIError(http.StatusBadRequest, "invalid_destination_address",
+		"recipient_address must be a valid TRON (TRC20) address")
+
 	// errSandboxOnly/errProductionOnly enforce C6.7's own invariant 4 at
 	// the API boundary: a sandbox key and a production key are never
 	// interchangeable, on any route, ever.

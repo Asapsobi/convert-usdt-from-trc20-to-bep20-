@@ -3,6 +3,18 @@
 // internal/pricing exactly once, at issuance -- this package never
 // recomputes a price, only stores and later reads back what
 // internal/pricing already decided.
+//
+// This is also the one, structurally-unbypassable place Model D's own
+// fixed-direction invariant (deposit BSC/BEP20, payout TRON/TRC20,
+// never the reverse) is enforced on the destination side: create/
+// createForRetail both validate recipientAddress via internal/tronaddr
+// BEFORE the row is ever persisted (see create's own doc comment for
+// why here and not in each HTTP handler separately). An order is always
+// created FROM an already-persisted quote (postOrder/postRetailOrder
+// never accept a recipient address of their own -- they read it back
+// off the quote row), so validating it here, once, covers every order
+// derived from it too, by construction, not by a second matching check
+// downstream.
 package quotes
 
 import (
@@ -16,6 +28,7 @@ import (
 	"gateway/internal/db"
 	"gateway/internal/money"
 	"gateway/internal/pricing"
+	"gateway/internal/tronaddr"
 )
 
 // Quote is one row of the quotes table. Exactly one of CustomerID
@@ -57,6 +70,14 @@ var ErrNotFound = errors.New("quotes: no such quote")
 // distinction).
 var ErrAlreadyConsumed = errors.New("quotes: already consumed by a different order")
 
+// ErrInvalidRecipientAddress means Create/CreateForRetail's own
+// recipientAddress failed internal/tronaddr's own real base58check
+// validation -- wraps tronaddr.ErrInvalidAddress (errors.Is against
+// either sentinel matches), kept as this package's own name so callers
+// of this package never need to import internal/tronaddr directly just
+// to recognize the failure.
+var ErrInvalidRecipientAddress = tronaddr.ErrInvalidAddress
+
 // Store is the quotes table's own entry point.
 type Store struct {
 	pool *db.Pool
@@ -84,6 +105,14 @@ func (s *Store) CreateForRetail(ctx context.Context, retailCustomerID int64, pri
 }
 
 func (s *Store) create(ctx context.Context, customerID, retailCustomerID *int64, priced pricing.Quote, recipientAddress string, now time.Time, validity time.Duration) (Quote, error) {
+	// Model D's own fixed-direction invariant (deposit BSC/BEP20, payout
+	// TRON/TRC20) enforced here, once, before any row exists -- see this
+	// package's own top-of-file doc comment for why this is the correct
+	// boundary rather than a per-HTTP-handler check.
+	if err := tronaddr.Validate(recipientAddress); err != nil {
+		return Quote{}, err
+	}
+
 	expiresAt := now.Add(validity)
 	row := s.pool.QueryRow(ctx, `
 		INSERT INTO quotes (customer_id, retail_customer_id, tier, amount_in, amount_out, fee_units, network_fee_units, recipient_address, created_at, expires_at)

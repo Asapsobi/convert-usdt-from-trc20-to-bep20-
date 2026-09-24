@@ -36,7 +36,7 @@ func newSandboxServer(t *testing.T, pool *db.Pool) (*Server, *customers.Store) {
 
 func postSandboxOrder(t *testing.T, router http.Handler, rawKey, trigger string) *httptest.ResponseRecorder {
 	t.Helper()
-	body := `{"tier":"STANDARD","amount_in":"3000.000000","recipient_address":"TRecipient","trigger":"` + trigger + `"}`
+	body := `{"tier":"STANDARD","amount_in":"3000.000000","recipient_address":"` + validTronRecipient + `","trigger":"` + trigger + `"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/sandbox/orders", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+rawKey)
 	rec := httptest.NewRecorder()
@@ -173,7 +173,7 @@ func TestSandbox_KeyIsolationBothDirections(t *testing.T) {
 	}
 
 	// Sandbox key against a production route.
-	quoteReq := httptest.NewRequest(http.MethodPost, "/v1/quotes", strings.NewReader(`{"tier":"STANDARD","amount_in":"3000.000000","recipient_address":"TRecipient"}`))
+	quoteReq := httptest.NewRequest(http.MethodPost, "/v1/quotes", strings.NewReader(`{"tier":"STANDARD","amount_in":"3000.000000","recipient_address":"`+validTronRecipient+`"}`))
 	quoteReq.Header.Set("Authorization", "Bearer "+sandboxRawKey)
 	quoteRec := httptest.NewRecorder()
 	router.ServeHTTP(quoteRec, quoteReq)
@@ -182,7 +182,7 @@ func TestSandbox_KeyIsolationBothDirections(t *testing.T) {
 	}
 
 	// Production key against a sandbox route.
-	sandboxReq := httptest.NewRequest(http.MethodPost, "/v1/sandbox/orders", strings.NewReader(`{"tier":"STANDARD","amount_in":"3000.000000","recipient_address":"TRecipient","trigger":"reorg"}`))
+	sandboxReq := httptest.NewRequest(http.MethodPost, "/v1/sandbox/orders", strings.NewReader(`{"tier":"STANDARD","amount_in":"3000.000000","recipient_address":"`+validTronRecipient+`","trigger":"reorg"}`))
 	sandboxReq.Header.Set("Authorization", "Bearer "+prodRawKey)
 	sandboxRec := httptest.NewRecorder()
 	router.ServeHTTP(sandboxRec, sandboxReq)

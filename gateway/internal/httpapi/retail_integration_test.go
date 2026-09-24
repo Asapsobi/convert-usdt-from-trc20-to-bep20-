@@ -58,7 +58,7 @@ func retailRegister(t *testing.T, router http.Handler, email, password string) (
 func retailIssueQuote(t *testing.T, router http.Handler, sessionToken string) map[string]any {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/v1/retail/quotes",
-		strings.NewReader(`{"tier":"STANDARD","amount_in":"3000.000000","recipient_address":"TRecipient"}`))
+		strings.NewReader(`{"tier":"STANDARD","amount_in":"3000.000000","recipient_address":"`+validTronRecipient+`"}`))
 	req.Header.Set("Authorization", "Bearer "+sessionToken)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -178,6 +178,51 @@ func TestRetailQuoteAndOrder_FullFlow(t *testing.T) {
 	json.Unmarshal(rec.Body.Bytes(), &status)
 	if status.ExternalID != externalID {
 		t.Errorf("status external_id = %q, want %q", status.ExternalID, externalID)
+	}
+}
+
+// TestPostRetailQuote_RejectsInvalidDestinationAddress is
+// TestPostQuote_RejectsInvalidDestinationAddress's own B2C counterpart
+// -- proves the SAME invariant (internal/quotes' own domain-boundary
+// validation, not a per-handler check) protects the retail path too,
+// not just the B2B one.
+func TestPostRetailQuote_RejectsInvalidDestinationAddress(t *testing.T) {
+	c1 := &fakeC1Full{}
+	c1Srv := newFakeC1Full(t, c1)
+	c2Srv := newFakeC2(t, &fakeC2{})
+	s, _, _ := newRetailServer(t, c1Srv.URL, c2Srv.URL)
+	router := NewRouter(s)
+
+	token, _ := retailRegister(t, router, uniqueExternalID("retail-badaddr")+"@example.com", "correct-horse-battery")
+
+	cases := []struct {
+		name    string
+		address string
+	}{
+		{"EVM address", "0xAE2166bd7901Ea67c1E2Bc4179418fC228108F07"},
+		{"malformed string", "not-an-address"},
+		{"corrupted checksum", validTronRecipient[:len(validTronRecipient)-1] + "x"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			body := `{"tier":"STANDARD","amount_in":"3000.000000","recipient_address":"` + c.address + `"}`
+			req := httptest.NewRequest(http.MethodPost, "/v1/retail/quotes", strings.NewReader(body))
+			req.Header.Set("Authorization", "Bearer "+token)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s, want 400", rec.Code, rec.Body.String())
+			}
+			var resp struct {
+				Error struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			}
+			json.Unmarshal(rec.Body.Bytes(), &resp)
+			if resp.Error.Code != "invalid_destination_address" {
+				t.Errorf("error code = %q, want invalid_destination_address", resp.Error.Code)
+			}
+		})
 	}
 }
 
