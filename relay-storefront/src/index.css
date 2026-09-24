@@ -1,0 +1,178 @@
+:root {
+  color-scheme: light dark;
+  --bg: #0b0f14;
+  --surface: #141a22;
+  --surface-2: #1c2531;
+  --border: #2a3441;
+  --text: #e7edf3;
+  --text-dim: #9aa8b8;
+  --accent: #4f8cff;
+  --accent-2: #35d18f;
+  --danger: #ff5f5f;
+  --warn: #f5b942;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+#root {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+a { color: var(--accent); }
+
+.container {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 24px 20px 64px;
+  width: 100%;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.header .brand {
+  font-weight: 700;
+  font-size: 18px;
+  letter-spacing: -0.02em;
+  text-decoration: none;
+  color: var(--text);
+}
+
+.header nav { display: flex; gap: 16px; align-items: center; font-size: 14px; }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px;
+  margin-bottom: 20px;
+}
+
+h1 { font-size: 26px; margin: 0 0 8px; }
+h2 { font-size: 18px; margin: 0 0 16px; }
+p.lede { color: var(--text-dim); margin: 0 0 24px; }
+
+label { display: block; font-size: 13px; color: var(--text-dim); margin: 14px 0 6px; }
+label:first-child { margin-top: 0; }
+
+input, select {
+  width: 100%;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  color: var(--text);
+  font-size: 15px;
+}
+input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+button {
+  background: var(--accent);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  padding: 11px 18px;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  margin-top: 18px;
+}
+button:disabled { opacity: 0.5; cursor: default; }
+button.secondary { background: var(--surface-2); border: 1px solid var(--border); }
+button.link { background: none; padding: 0; margin: 0; color: var(--accent); font-weight: 500; }
+
+.error-banner {
+  background: rgba(255, 95, 95, 0.12);
+  border: 1px solid rgba(255, 95, 95, 0.35);
+  color: #ffb3b3;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 14px;
+  margin-bottom: 16px;
+}
+
+.field-row { display: flex; gap: 12px; }
+.field-row > div { flex: 1; }
+
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+.deposit-box {
+  background: var(--surface-2);
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  padding: 18px;
+  text-align: center;
+  margin: 12px 0 20px;
+}
+.deposit-box .addr {
+  font-size: 15px;
+  word-break: break-all;
+  margin: 10px 0;
+}
+
+.status-badge {
+  display: inline-block;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.status-pending { background: rgba(245, 185, 66, 0.15); color: var(--warn); }
+.status-progress { background: rgba(79, 140, 255, 0.15); color: var(--accent); }
+.status-done { background: rgba(53, 209, 143, 0.15); color: var(--accent-2); }
+.status-failed { background: rgba(255, 95, 95, 0.15); color: var(--danger); }
+
+.summary-row { display: flex; justify-content: space-between; padding: 6px 0; font-size: 14px; }
+.summary-row .k { color: var(--text-dim); }
+
+.order-list-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+  text-decoration: none;
+  color: var(--text);
+}
+.order-list-item:last-child { border-bottom: none; }
+.order-list-item .id { font-size: 13px; color: var(--text-dim); }
+
+.hint { font-size: 12px; color: var(--text-dim); margin-top: 6px; }
+
+.direction-banner {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 18px;
+  margin-bottom: 20px;
+}
+.direction-arrow { font-size: 20px; color: var(--text-dim); }
+.net-badge {
+  display: inline-block;
+  margin-top: 2px;
+  padding: 3px 10px;
+  border-radius: 6px;
+  font-weight: 700;
+  font-size: 13px;
+}
+.net-bsc { background: rgba(240, 185, 11, 0.15); color: #f0b90b; }
+.net-tron { background: rgba(255, 6, 1, 0.15); color: #ff5c58; }

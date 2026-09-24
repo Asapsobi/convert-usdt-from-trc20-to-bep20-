@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "storefront",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": ["-c", "cd storefront && npm run dev -- --host --port 5180 --strictPort"],
+      "port": 5180
+    },
+    {
+      "name": "relay-storefront",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": ["-c", "cd relay-storefront && npm run dev -- --host --port 5181 --strictPort"],
+      "port": 5181
+    }
+  ]
+}
