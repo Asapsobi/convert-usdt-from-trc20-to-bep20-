@@ -110,8 +110,10 @@ func (o *Orchestrator) dispatchOne(ctx context.Context, externalID string) error
 	if order.State != "screened" {
 		return nil // raced past us between the list call and here
 	}
-	if order.Tier == "SWEEP" {
-		return nil // this package's own doc comment: Sweep is out of scope
+	if !dispatch.DispatchableTier(order.Tier) {
+		// SWEEP is out of this package's scope; RELAY belongs to relayd,
+		// which pays those customers itself.
+		return nil
 	}
 
 	existing, err := o.Dispatcher.Store.Get(ctx, order.ID)
