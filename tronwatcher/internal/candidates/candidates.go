@@ -37,81 +37,81 @@ type Config struct {
 	DustFloor       money.Amount
 }
 
-// ScanWatchedAddress scans wa's own address for new inbound TRC20
-// transfers (since wa.LastScannedAt, or wa.AssignedAt on a never-
-// scanned address -- never from the epoch) via pool.ScanAddress
-// (2-provider agreement), classifies each against the order's quoted
-// amount, and hands trackable ones to tracker.OnTransferObserved. A
-// transfer landing on an already-RETIRED address is routed to
-// orphaned.Record instead -- real money, nowhere to put it, never
-// silently dropped.
-//
-// On success, advances the address's own last_scanned_at cursor to the
-// scan's start time (not "now" -- see this function's own call site for
-// why: a transfer that lands between when the scan started and when
-// this call returns must not be skipped by an overly-optimistic cursor
-// advance).
-func ScanWatchedAddress(ctx context.Context, pool *chain.Pool, database db.Queryer, quotes QuotedAmountFetcher,
-	tracker *finality.Tracker, cfg Config, wa addresses.WatchedAddress) error {
+// ScanAddress finds deposits to one of our wallets. Each scan re-reads an
+// overlap window behind the wallet's cursor (addresses.ScanFrom), because
+// TronGrid's confirmed-only index trails the chain: a deposit confirmed
+// after an earlier scan passed its block time is still found. Every
+// deposit is recorded (by the tracker) before the cursor moves, and one
+// already recorded is skipped, so re-reading is harmless.
+func ScanAddress(ctx context.Context, pool *chain.Pool, database db.Queryer, quotes QuotedAmountFetcher,
+	tracker *finality.Tracker, cfg Config, addr addresses.Address) error {
 	scanStart := time.Now().UTC()
-
-	since := wa.AssignedAt
-	if wa.LastScannedAt != nil {
-		since = *wa.LastScannedAt
-	}
-
-	transfers, err := pool.ScanAddress(ctx, string(wa.Address), cfg.ContractAddress, since.UnixMilli())
+	firstSeen, err := addresses.FirstSeen(ctx, database, addr)
 	if err != nil {
-		return fmt.Errorf("candidates: scanning %s (order %d): %w", wa.Address, wa.OrderID, err)
+		return err
 	}
-
+	since, err := addresses.ScanFrom(ctx, database, addr, firstSeen)
+	if err != nil {
+		return err
+	}
+	transfers, err := pool.ScanAddress(ctx, string(addr), cfg.ContractAddress, since.UnixMilli())
+	if err != nil {
+		return fmt.Errorf("candidates: scanning %s: %w", addr, err)
+	}
 	for _, t := range transfers {
-		if err := processTransfer(ctx, database, quotes, tracker, cfg, wa, t); err != nil {
+		if err := processTransfer(ctx, database, quotes, tracker, cfg, addr, t); err != nil {
 			return fmt.Errorf("candidates: processing transfer %s: %w", t.TxID, err)
 		}
 	}
-
-	if err := addresses.UpdateLastScannedAt(ctx, database, wa.OrderID, scanStart); err != nil {
-		return fmt.Errorf("candidates: advancing scan cursor for order %d: %w", wa.OrderID, err)
-	}
-	return nil
+	return addresses.SetScanCursor(ctx, database, addr, scanStart)
 }
 
+// processTransfer attributes one transfer to the lease that was open on
+// its wallet at its block time, then hands it to the tracker. A payment
+// outside any lease, after its lease ended, or too small to be a real
+// deposit (dust) is recorded as orphaned and never funds an order.
 func processTransfer(ctx context.Context, database db.Queryer, quotes QuotedAmountFetcher,
-	tracker *finality.Tracker, cfg Config, wa addresses.WatchedAddress, t chain.Transfer) error {
+	tracker *finality.Tracker, cfg Config, addr addresses.Address, t chain.Transfer) error {
 	amount, err := chain.ParseTransferValue(t)
 	if err != nil {
 		return err
 	}
-
-	if wa.Status == addresses.StatusRetired {
-		return recordLateDeposit(ctx, database, wa, t, amount)
+	lease, found, err := addresses.LeaseAt(ctx, database, string(addr), t.BlockTimestamp)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return recordOrphan(ctx, database, addresses.WatchedAddress{Address: addr}, t, amount, "no_lease")
+	}
+	// Block times are whole seconds: a payment in the same second the
+	// lease ended counts as late.
+	if lease.Status == addresses.StatusRetired && lease.RetiredAt != nil && !t.BlockTimestamp.Before(lease.RetiredAt.Truncate(time.Second)) {
+		return recordOrphan(ctx, database, lease, t, amount, "address_retired")
 	}
 
-	quoted, err := quotes.QuotedAmount(ctx, wa.ExternalID)
+	quoted, err := quotes.QuotedAmount(ctx, lease.ExternalID)
 	if err != nil {
-		return fmt.Errorf("fetching quoted amount for %s: %w", wa.ExternalID, err)
+		return fmt.Errorf("fetching quoted amount for %s: %w", lease.ExternalID, err)
 	}
 	classification := chain.ClassifyAgainstOrder(amount, quoted, cfg.DustFloor)
-
+	if classification == chain.Dust {
+		return recordOrphan(ctx, database, lease, t, amount, "dust")
+	}
 	observed := finality.ObservedTransfer{
 		TxID: t.TxID, BlockTimestamp: t.BlockTimestamp,
-		OrderID: wa.OrderID, ExternalID: wa.ExternalID, CustomerID: wa.CustomerID, Amount: amount,
-		SenderAddress: t.From,
+		OrderID: lease.OrderID, ExternalID: lease.ExternalID, CustomerID: lease.CustomerID, Amount: amount,
+		SenderAddress: t.From, Address: string(addr),
 	}
 	return tracker.OnTransferObserved(ctx, observed, classification)
 }
 
-// recordLateDeposit handles a transfer landing on an address already
-// RETIRED -- real money, nowhere to put it, never silently dropped and
-// never silently credited. order_state_at_detection is a fixed marker
-// rather than an actual C1 state, since this path never asks C1
-// anything, mirroring depositwatcher's own identical reasoning.
-func recordLateDeposit(ctx context.Context, database db.Queryer, wa addresses.WatchedAddress, t chain.Transfer, amount money.Amount) error {
-	slog.Error("candidates: LATE DEPOSIT -- a transfer landed on a retired address; recorded for manual reconciliation",
-		"tx_id", t.TxID, "order_id", wa.OrderID, "external_id", wa.ExternalID, "amount", amount)
+// recordOrphan records a payment that funds no order, for an operator to
+// resolve (usually a refund). Idempotent on tx_id.
+func recordOrphan(ctx context.Context, database db.Queryer, lease addresses.WatchedAddress, t chain.Transfer, amount money.Amount, reason string) error {
+	slog.Error("candidates: ORPHANED DEPOSIT -- a payment to one of our wallets funds no order; recorded for manual reconciliation",
+		"reason", reason, "tx_id", t.TxID, "address", lease.Address, "order_id", lease.OrderID, "external_id", lease.ExternalID, "amount", amount)
 	return orphaned.Record(ctx, database, orphaned.Deposit{
-		OrderID: wa.OrderID, ExternalID: wa.ExternalID, TxID: t.TxID,
-		Amount: int64(amount), DetectedAt: time.Now().UTC(), OrderStateAtDetection: "address_retired",
+		OrderID: lease.OrderID, ExternalID: lease.ExternalID, TxID: t.TxID,
+		Amount: int64(amount), DetectedAt: time.Now().UTC(), OrderStateAtDetection: reason, Address: string(lease.Address),
 	})
 }

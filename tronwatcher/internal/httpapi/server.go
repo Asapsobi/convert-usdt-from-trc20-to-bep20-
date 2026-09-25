@@ -46,6 +46,14 @@ func NewRouter(s *Server) http.Handler {
 
 		r.With(requireIdempotencyKey).Post("/addresses", s.postAddress)
 		r.Get("/addresses/{order_id}", s.getAddress)
+		r.Get("/addresses/{order_id}/deposits", s.getOrderDeposits)
+
+		r.Get("/wallets", s.getWallets)
+		r.Post("/wallets", s.postWallet)
+		r.Post("/wallets/{address}/enable", s.postWalletStatus(true))
+		r.Post("/wallets/{address}/disable", s.postWalletStatus(false))
+		r.Get("/pool/settings", s.getPoolSettings)
+		r.Put("/pool/settings", s.putPoolSettings)
 		r.With(requireIdempotencyKey).Post("/addresses/{order_id}/retire", s.postRetireAddress)
 
 		r.Get("/orphaned-deposits", s.getOrphanedDeposits)

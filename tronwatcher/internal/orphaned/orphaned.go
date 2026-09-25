@@ -38,6 +38,8 @@ type Deposit struct {
 	Resolution            *string
 	ResolvedAt            *time.Time
 	ResolvedBy            *string
+	// Address is the deposit wallet the payment landed in.
+	Address string
 }
 
 // Queryer is db.Queryer under this package's own name.
@@ -48,10 +50,10 @@ type Queryer = db.Queryer
 func Record(ctx context.Context, q Queryer, d Deposit) error {
 	_, err := q.Exec(ctx, `
 		INSERT INTO orphaned_deposits
-			(order_id, external_id, tx_id, amount, detected_at, order_state_at_detection)
-		VALUES ($1, $2, $3, $4, $5, $6)
+			(order_id, external_id, tx_id, amount, detected_at, order_state_at_detection, address)
+		VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''))
 		ON CONFLICT (tx_id) DO NOTHING
-	`, d.OrderID, d.ExternalID, d.TxID, d.Amount, d.DetectedAt, d.OrderStateAtDetection)
+	`, d.OrderID, d.ExternalID, d.TxID, d.Amount, d.DetectedAt, d.OrderStateAtDetection, d.Address)
 	if err != nil {
 		return fmt.Errorf("orphaned: recording %s: %w", d.TxID, err)
 	}

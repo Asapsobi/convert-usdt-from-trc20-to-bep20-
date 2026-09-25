@@ -49,6 +49,14 @@ func run() error {
 	}
 	defer pool.Close()
 
+	// Exactly one tronwatcherd may drive this database: two would report the same
+	// deposits and race on the scan cursor.
+	lock, err := db.AcquireInstanceLock(ctx, pool, "tronwatcherd", 30*time.Second)
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+
 	if err := configureAddressingFromEnv(); err != nil {
 		return err
 	}
@@ -101,6 +109,8 @@ func run() error {
 		slog.Info("shutdown signal received")
 	case err := <-serveErr:
 		return err
+	case <-lock.Lost():
+		return errors.New("tronwatcherd: lost the instance lock -- exiting so a second instance never runs alongside this one")
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

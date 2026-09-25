@@ -95,8 +95,11 @@ func (h *harness) prepareOrder(amountIn string, quoteExpiresIn time.Duration) (p
 	}, nil
 }
 
-// scenarioCleanDeposits: exact, over, under, and dust amounts, each
-// reaching finality via the finalized-tag path.
+// scenarioCleanDeposits: exact, over, and under amounts each reach
+// finality via the finalized-tag path and fund their order. Dust never
+// does: a payment below the dust floor (address poisoning, a stray
+// transfer) is recorded as orphaned and leaves the order waiting for its
+// real deposit.
 func (h *harness) scenarioCleanDeposits() Result {
 	const name = "CleanDeposits"
 	cases := []struct {
@@ -127,10 +130,12 @@ func (h *harness) scenarioCleanDeposits() Result {
 		if err != nil {
 			return fail(name, fmt.Errorf("%s: %w", tc.label, err))
 		}
-		if updated.State != "funded" {
-			return fail(name, fmt.Errorf("%s: order state = %q, want funded (this run's own C2.4/C2.5 implementation "+
-				"tracks Dust to finality same as any other classification -- see this package's own README note on "+
-				"the spec's two, inconsistent framings of Dust)", tc.label, updated.State))
+		want := "funded"
+		if tc.want == chain.Dust {
+			want = "quoted"
+		}
+		if updated.State != want {
+			return fail(name, fmt.Errorf("%s: order state = %q, want %s", tc.label, updated.State, want))
 		}
 	}
 	return pass(name)

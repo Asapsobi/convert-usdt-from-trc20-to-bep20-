@@ -58,6 +58,11 @@ func testPool(t *testing.T) *db.Pool {
 	if err := goose.Up(sqlDB, migrationsDir); err != nil {
 		t.Fatalf("running migrations: %v", err)
 	}
+	// The pool limit and cooldowns are exercised by their own tests; here
+	// every order simply gets a free wallet, as with one wallet per order.
+	if _, err := sqlDB.Exec(`UPDATE pool_settings SET max_wallets = 1000000, cooldown_after_use = '0', cooldown_after_expiry = '0'`); err != nil {
+		t.Fatalf("relaxing pool settings for tests: %v", err)
+	}
 
 	pgxPool, err := pgxpool.New(context.Background(), dbURL)
 	if err != nil {

@@ -31,7 +31,7 @@ type fakeProvisioner struct {
 
 func (f *fakeProvisioner) ProvisionBSCDepositKey(ctx context.Context, index uint32) (string, error) {
 	f.calls++
-	return fmt.Sprintf("0xFakeProvisioned%d", index), nil
+	return fmt.Sprintf("0x%040x", 0xfa4e0000+uint64(index)), nil
 }
 
 // TestAssign_UsesProvisionerWhenConfigured confirms Assign calls out to
@@ -45,7 +45,8 @@ func TestAssign_UsesProvisionerWhenConfigured(t *testing.T) {
 	// deployment never configures both (cmd/watcherd's own fail-loud
 	// startup check), but Assign itself doesn't need xpub unset to prove
 	// its own dispatch here.
-	pool := testPool(t)
+	// An empty pool, so this order needs a brand-new wallet.
+	pool := freshPool(t, 10, 0, 0)
 	fake := &fakeProvisioner{}
 	addresses.ConfigureS1Provisioning(fake)
 	t.Cleanup(func() { addresses.ConfigureS1Provisioning(nil) })

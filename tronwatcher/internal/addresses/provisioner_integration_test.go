@@ -9,6 +9,8 @@
 package addresses_test
 
 import (
+	"github.com/tyler-smith/go-bip32"
+
 	"context"
 	"fmt"
 	"testing"
@@ -28,7 +30,14 @@ type fakeProvisioner struct {
 
 func (f *fakeProvisioner) ProvisionTronDepositKey(ctx context.Context, index uint32) (string, error) {
 	f.calls++
-	return fmt.Sprintf("TFakeProvisioned%d", index), nil
+	// A real, valid TRON address (the pool rejects anything else),
+	// derived from a throwaway fixture key.
+	master, err := bip32.NewMasterKey([]byte("tronwatcher fake provisioner fixture -- never use"))
+	if err != nil {
+		return "", err
+	}
+	addr, err := addresses.DeriveAddress(master.PublicKey().B58Serialize(), index)
+	return string(addr), err
 }
 
 // TestAssign_UsesProvisionerWhenConfigured confirms Assign calls out to
@@ -43,7 +52,8 @@ func TestAssign_UsesProvisionerWhenConfigured(t *testing.T) {
 	// deployment never configures both (cmd/tronwatcherd's own fail-loud
 	// startup check), but Assign itself doesn't need xpub unset to prove
 	// its own dispatch here.
-	pool := testPool(t)
+	// An empty pool, so this order needs a brand-new wallet.
+	pool := freshPool(t, 10, 0, 0)
 	fake := &fakeProvisioner{}
 	addresses.ConfigureS1Provisioning(fake)
 	t.Cleanup(func() { addresses.ConfigureS1Provisioning(nil) })

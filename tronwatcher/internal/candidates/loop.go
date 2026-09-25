@@ -57,16 +57,15 @@ func RunLoop(ctx context.Context, pool *chain.Pool, database *db.Pool, quotes Qu
 // stall every other order's own progress.
 func runTick(ctx context.Context, pool *chain.Pool, database *db.Pool, quotes QuotedAmountFetcher,
 	tracker *finality.Tracker, checker finality.FinalityChecker, cfg Config) {
-	active, err := addresses.ListActive(ctx, database)
+	watch, err := addresses.WatchSet(ctx, database)
 	if err != nil {
-		slog.Error("candidates: listing active addresses failed, will retry next tick", "error", err)
+		slog.Error("candidates: listing watched wallets failed, will retry next tick", "error", err)
 		return
 	}
 
-	for _, wa := range active {
-		if err := ScanWatchedAddress(ctx, pool, database, quotes, tracker, cfg, wa); err != nil {
-			slog.Error("candidates: scanning address failed, will retry next tick",
-				"order_id", wa.OrderID, "address", wa.Address, "error", err)
+	for _, addr := range watch {
+		if err := ScanAddress(ctx, pool, database, quotes, tracker, cfg, addr); err != nil {
+			slog.Error("candidates: scanning wallet failed, will retry next tick", "address", addr, "error", err)
 		}
 	}
 
