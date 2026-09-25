@@ -719,3 +719,49 @@ func TestApprove_KMSFailureOnSecondApprovalKeepsBothApprovalsForARetry(t *testin
 		t.Fatalf("Status after retry = %s, want SIGNED", got2.Status)
 	}
 }
+
+// An auto-signed request whose signing call failed (the signer briefly
+// unreachable) is signed by the caller's retry -- it must not stay
+// PENDING forever. A request above the approval threshold is never
+// signed by a retry, and a retry with a different digest is refused.
+func TestRequestSignature_RetryFinishesAFailedAutoSign(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	store, signer, _ := newTestStore(t, pool, 10000)
+
+	signer.forceFailNext(1)
+	if _, err := store.RequestSignature(ctx, 1, [32]byte{7}, 50, "idem-retry-autosign"); err == nil {
+		t.Fatal("RequestSignature with a failing signer: want an error, got nil")
+	}
+	retried, err := store.RequestSignature(ctx, 1, [32]byte{7}, 50, "idem-retry-autosign")
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if retried.Status != requests.StatusSigned {
+		t.Fatalf("retry status = %s, want SIGNED", retried.Status)
+	}
+	again, err := store.RequestSignature(ctx, 1, [32]byte{7}, 50, "idem-retry-autosign")
+	if err != nil || again.Status != requests.StatusSigned || again.SignedTx != retried.SignedTx {
+		t.Fatalf("a replay after signing must return the same signature, got %+v (%v)", again, err)
+	}
+	if _, err := store.RequestSignature(ctx, 1, [32]byte{8}, 50, "idem-retry-autosign"); err != nil {
+		t.Fatalf("a replay of a SIGNED request returns it as is: %v", err)
+	}
+
+	signer.forceFailNext(1)
+	if _, err := store.RequestSignature(ctx, 1, [32]byte{9}, 50, "idem-retry-mismatch"); err == nil {
+		t.Fatal("want the first signing call to fail")
+	}
+	if _, err := store.RequestSignature(ctx, 1, [32]byte{10}, 50, "idem-retry-mismatch"); err == nil {
+		t.Fatal("a retry with a different digest must be refused, not signed")
+	}
+
+	big, err := store.RequestSignature(ctx, 1, [32]byte{11}, 50000, "idem-retry-approval")
+	if err != nil || big.Status != requests.StatusPending {
+		t.Fatalf("an above-threshold request waits for approvers, got %+v (%v)", big, err)
+	}
+	replayed, err := store.RequestSignature(ctx, 1, [32]byte{11}, 50000, "idem-retry-approval")
+	if err != nil || replayed.Status != requests.StatusPending {
+		t.Fatalf("a retry must never sign an above-threshold request, got %+v (%v)", replayed, err)
+	}
+}
