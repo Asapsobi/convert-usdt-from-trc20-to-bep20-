@@ -16,8 +16,8 @@ import (
 // docs/03-build/model-f-relay-build-prompts.md's own "Open items"), not
 // a button this console could correctly offer. This page's job is
 // purely to make that state visible, not to act on it.
-const relayLegsContent = `
-<h1>Relay legs</h1>
+const relayLegsContent = relaydNav + `
+<h1>Relay orders</h1>
 {{ if .Error }}<div class="flash flash-error">{{ .Error }}</div>{{ end }}
 <p>
   <a href="/relayd/legs">all</a> &middot;
@@ -25,16 +25,17 @@ const relayLegsContent = `
   <a href="/relayd/legs?status=REFUND_PENDING">refund pending</a> &middot;
   <a href="/relayd/legs?status=UNRECOVERABLE">unrecoverable</a> &middot;
   <a href="/relayd/legs?status=SETTLED">settled</a> &middot;
-  <a href="/relayd/legs?status=REFUNDED">refunded</a>
+  <a href="/relayd/legs?status=REFUNDED">refunded</a> &middot;
+  <a href="/relayd/legs?status=EXPIRED">expired</a>
 </p>
 <table>
 <tr><th>External ID</th><th>Order</th><th>Direction</th><th>Status</th><th>Customer</th>
-    <th>Amount in</th><th>Amount out</th><th>Upstream order</th><th>Tx</th><th>Updated</th></tr>
+    <th>Quoted</th><th>Received</th><th>Our profit</th><th>Amount out</th><th>Upstream order</th><th>Tx</th><th>Updated</th></tr>
 {{ range .Legs }}
 <tr{{ if eq .Status "UNRECOVERABLE" }} class="row-alert"{{ end }}>
-  <td>{{ .ExternalID }}</td><td>{{ .OrderID }}</td><td>{{ .Direction }}</td>
+  <td><a href="/relayd/legs/{{ .ExternalID }}">{{ .ExternalID }}</a></td><td>{{ .OrderID }}</td><td>{{ .Direction }}</td>
   <td>{{ .Status }}</td><td>{{ .CustomerID }}</td>
-  <td>{{ .AmountIn }}</td><td>{{ .AmountOut }}</td>
+  <td>{{ .AmountIn }}</td><td>{{ .Received }}</td><td>{{ .Profit }}</td><td>{{ .AmountOut }}</td>
   <td>{{ .UpstreamOrder }}</td><td>{{ .Tx }}</td><td>{{ .UpdatedAt }}</td>
 </tr>
 {{ end }}
@@ -48,6 +49,8 @@ type relayLegRow struct {
 	Status        string
 	CustomerID    string
 	AmountIn      string
+	Received      string
+	Profit        string
 	AmountOut     string
 	UpstreamOrder string
 	Tx            string
@@ -75,7 +78,15 @@ func relayLegRowFrom(l opclient.RelayLeg) relayLegRow {
 	} else if l.ForwardTxID != nil {
 		tx = "forward: " + *l.ForwardTxID
 	}
+	received, profit := "-", "-"
+	if l.ReceivedAmount != nil {
+		received = *l.ReceivedAmount
+	}
+	if l.ProfitAmount != nil {
+		profit = *l.ProfitAmount
+	}
 	return relayLegRow{
+		Received: received, Profit: profit,
 		ExternalID: l.ExternalID, OrderID: l.OrderID, Direction: l.Direction, Status: l.Status,
 		CustomerID: l.CustomerID, AmountIn: l.AmountIn, AmountOut: amountOut,
 		UpstreamOrder: upstreamOrder, Tx: tx, UpdatedAt: l.UpdatedAt,
