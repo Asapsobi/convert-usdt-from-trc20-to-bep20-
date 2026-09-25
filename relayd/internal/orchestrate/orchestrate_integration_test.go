@@ -36,6 +36,8 @@ import (
 	"relayd/internal/relay"
 	"relayd/internal/signing"
 	"relayd/internal/testledger"
+	"relayd/internal/transfers"
+	"relayd/internal/tronbroadcast"
 	"relayd/internal/txbuild"
 	"relayd/internal/upstream"
 	"relayd/internal/watcherclient"
@@ -146,7 +148,24 @@ func (f *fakeChain) BroadcastSigned(ctx context.Context, unsignedTx []byte, sign
 	f.broadcasts++
 	f.mu.Unlock()
 	digest := txbuild.Digest(unsignedTx)
-	return fmt.Sprintf("%x", digest[:8]), nil
+	return fmt.Sprintf("%x", digest[:]), nil
+}
+
+// TokenBalance reports plenty of USDT for every holder -- balance
+// shortfalls are exercised by tests that configure them explicitly.
+func (f *fakeChain) TokenBalance(ctx context.Context, holder string) (*big.Int, error) {
+	return new(big.Int).Exp(big.NewInt(10), big.NewInt(30), nil), nil
+}
+
+// AccountResources reports an activated account with plenty of energy,
+// bandwidth, and TRX -- resource shortfalls are exercised by tests that
+// configure them explicitly.
+func (f *fakeChain) AccountResources(ctx context.Context, holder string) (tronbroadcast.Resources, error) {
+	return tronbroadcast.Resources{Exists: true, Energy: 1_000_000_000, Bandwidth: 1_000_000, BalanceSun: 1_000_000_000}, nil
+}
+
+func (f *fakeChain) EstimateTransferEnergy(ctx context.Context, from, to string, raw *big.Int) (int64, error) {
+	return 64_285, nil
 }
 
 // fakeFinality reports final=true for any txid this test has told it
@@ -238,6 +257,27 @@ func (f *fakeEVMChain) Broadcast(ctx context.Context, signed *gethtypes.Transact
 	f.last = signed
 	f.mu.Unlock()
 	return signed.Hash().Hex(), nil
+}
+
+// ConfirmedNonce never passes a sent transaction's nonce, so nothing is
+// ever treated as dropped unless a test says so.
+func (f *fakeEVMChain) ConfirmedNonce(ctx context.Context, address string) (uint64, error) {
+	return 0, nil
+}
+
+func (f *fakeEVMChain) TransactionMined(ctx context.Context, txHash string) (bool, error) {
+	return true, nil
+}
+
+// TokenBalance and NativeBalance report plenty of USDT and BNB for every
+// holder -- balance shortfalls are exercised by tests that configure them
+// explicitly.
+func (f *fakeEVMChain) TokenBalance(ctx context.Context, holder string) (*big.Int, error) {
+	return new(big.Int).Exp(big.NewInt(10), big.NewInt(30), nil), nil
+}
+
+func (f *fakeEVMChain) NativeBalance(ctx context.Context, holder string) (*big.Int, error) {
+	return new(big.Int).Exp(big.NewInt(10), big.NewInt(30), nil), nil
 }
 
 // fakeBEP20DepositWatcher stands in for depositwatcher's own real
@@ -381,7 +421,7 @@ func TestFullHappyPath_TRC20ToBEP20(t *testing.T) {
 	leg, err := store.Create(context.Background(), relay.Leg{
 		ExternalID: externalID, OrderID: order.ID, Direction: relay.TRC20ToBEP20,
 		CustomerID: "cust-happy-1", DestinationAddress: "0xcustomer-bep20-address",
-		DepositAddress:         "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4",
+		DepositAddress:         signing.FakeTronDepositAddress(depositDerivationIndex),
 		DepositDerivationIndex: &depositDerivationIndex,
 		AmountIn:               money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
 		AmountOutExpected:      money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
@@ -407,7 +447,7 @@ func TestFullHappyPath_TRC20ToBEP20(t *testing.T) {
 	evmChain := &fakeEVMChain{}
 	evmFinality := newFakeEVMFinality()
 	tronDepositWatcher := newFakeTronDepositWatcher()
-	tronDepositWatcher.set(order.ID, "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4", depositDerivationIndex)
+	tronDepositWatcher.set(order.ID, signing.FakeTronDepositAddress(depositDerivationIndex), depositDerivationIndex)
 
 	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alert.LogAlerter{}, nil, tronDepositWatcher, orchestrate.Config{
 		SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH",
@@ -570,7 +610,7 @@ func TestRefund_StuckForwardingLegGetsRefunded(t *testing.T) {
 	leg, err := store.Create(context.Background(), relay.Leg{
 		ExternalID: externalID, OrderID: order.ID, Direction: relay.TRC20ToBEP20,
 		CustomerID: "cust-refund-1", DestinationAddress: "0xcustomer-bep20-address",
-		DepositAddress:         "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4",
+		DepositAddress:         signing.FakeTronDepositAddress(depositDerivationIndex),
 		DepositDerivationIndex: &depositDerivationIndex,
 		AmountIn:               money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
 		AmountOutExpected:      money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
@@ -601,7 +641,7 @@ func TestRefund_StuckForwardingLegGetsRefunded(t *testing.T) {
 	evmChain := &fakeEVMChain{}
 	evmFinality := newFakeEVMFinality()
 	tronDepositWatcher := newFakeTronDepositWatcher()
-	tronDepositWatcher.set(order.ID, "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4", depositDerivationIndex)
+	tronDepositWatcher.set(order.ID, signing.FakeTronDepositAddress(depositDerivationIndex), depositDerivationIndex)
 
 	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alert.LogAlerter{}, nil, tronDepositWatcher, orchestrate.Config{
 		SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH",
@@ -741,7 +781,7 @@ func TestUnrecoverable_PostForwardedUpstreamFailure(t *testing.T) {
 	if _, err := store.Create(context.Background(), relay.Leg{
 		ExternalID: externalID, OrderID: order.ID, Direction: relay.TRC20ToBEP20,
 		CustomerID: "cust-unrecoverable-1", DestinationAddress: "0xcustomer-bep20-address",
-		DepositAddress:         "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4",
+		DepositAddress:         signing.FakeTronDepositAddress(depositDerivationIndex),
 		DepositDerivationIndex: &depositDerivationIndex,
 		AmountIn:               money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
 		AmountOutExpected:      money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
@@ -759,7 +799,7 @@ func TestUnrecoverable_PostForwardedUpstreamFailure(t *testing.T) {
 	evmFinality := newFakeEVMFinality()
 	alerter := &fakeAlerter{}
 	tronDepositWatcher := newFakeTronDepositWatcher()
-	tronDepositWatcher.set(order.ID, "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4", depositDerivationIndex)
+	tronDepositWatcher.set(order.ID, signing.FakeTronDepositAddress(depositDerivationIndex), depositDerivationIndex)
 
 	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alerter, nil, tronDepositWatcher, orchestrate.Config{
 		SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH",
@@ -844,6 +884,9 @@ func TestUnrecoverable_PostForwardedUpstreamFailure(t *testing.T) {
 // the piece that proves the signature hand-off itself works).
 func TestFullHappyPath_BEP20ToTRC20(t *testing.T) {
 	ledger := startLedger(t)
+	// Every BEP20 leg books its commission to this one account, and the
+	// ledger is shared across tests: measure this leg's own contribution.
+	revenueBefore := ledger.AccountBalance("revenue:relay_commission:USDT_BEP20")
 	pool := testPool(t)
 	store := relay.NewStore(pool)
 	client := ledgerclient.New(ledger.BaseURL(), ledger.Token())
@@ -1003,8 +1046,8 @@ func TestFullHappyPath_BEP20ToTRC20(t *testing.T) {
 	if got := ledger.AccountBalance(fmt.Sprintf("asset:relay:leg:forwarding:%d", order.ID)); got != 0 {
 		t.Errorf("expected forwarding suspense account to close to 0, got %d", got)
 	}
-	if got := ledger.AccountBalance("revenue:relay_commission:USDT_BEP20"); got != -300000 {
-		t.Errorf("expected commission revenue of -300000 (credit-normal), got %d", got)
+	if got := ledger.AccountBalance("revenue:relay_commission:USDT_BEP20") - revenueBefore; got != -300000 {
+		t.Errorf("expected this leg's commission revenue of -300000 (credit-normal), got %d", got)
 	}
 
 	if err := orch.RunTick(ctx); err != nil {
@@ -1176,7 +1219,7 @@ func TestStaleLegAlarm_FiresOnceThenNeverAgain(t *testing.T) {
 	if _, err := store.Create(context.Background(), relay.Leg{
 		ExternalID: externalID, OrderID: order.ID, Direction: relay.TRC20ToBEP20,
 		CustomerID: "cust-stale-1", DestinationAddress: "0xcustomer-bep20-address",
-		DepositAddress:         "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4",
+		DepositAddress:         signing.FakeTronDepositAddress(depositDerivationIndex),
 		DepositDerivationIndex: &depositDerivationIndex,
 		AmountIn:               money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
 		AmountOutExpected:      money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
@@ -1197,7 +1240,7 @@ func TestStaleLegAlarm_FiresOnceThenNeverAgain(t *testing.T) {
 	// StaleLegAlertAfter starts at 0 (disabled) so driving to FORWARDED
 	// below is deterministic and produces no alarm noise of its own.
 	tronDepositWatcher := newFakeTronDepositWatcher()
-	tronDepositWatcher.set(order.ID, "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4", depositDerivationIndex)
+	tronDepositWatcher.set(order.ID, signing.FakeTronDepositAddress(depositDerivationIndex), depositDerivationIndex)
 
 	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alerter, nil, tronDepositWatcher, orchestrate.Config{
 		SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH",
@@ -1393,10 +1436,16 @@ func TestRefund_StuckAwaitingDepositLegGetsRefunded(t *testing.T) {
 		t.Fatal("expected a refund_tx_id to be recorded")
 	}
 	// The customer's funds never left the deposit address, so the refund
-	// is sent (and energy delegated) from there, signed with its own
-	// per-order key -- relayd's own slot key is never involved.
-	if got := energy.TargetAddressFor(externalID); got != depositAddress {
-		t.Errorf("expected refund energy delegated to the deposit address %s, got %s", depositAddress, got)
+	// is sent from there, signed with its own per-order key -- relayd's
+	// own slot key is never involved.
+	attempts, err := transfers.NewStore(pool).ListForLeg(context.Background(), externalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range attempts {
+		if a.Purpose == transfers.Refund && a.FromAddress != depositAddress {
+			t.Errorf("expected the refund sent from the deposit address %s, got %s", depositAddress, a.FromAddress)
+		}
 	}
 	if signer.RequestTronDepositSweepSignatureCallCount() == 0 {
 		t.Error("expected the refund to be signed with the deposit address's own key")

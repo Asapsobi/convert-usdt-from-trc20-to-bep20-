@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -155,23 +156,26 @@ type Order struct {
 	// fact.
 	SenderAddress *string
 	Version       int32
+	// QuoteExpiresAt is the deposit deadline this order was created with.
+	QuoteExpiresAt time.Time
 }
 
 type orderResponse struct {
-	ID               int64   `json:"id"`
-	ExternalID       string  `json:"external_id"`
-	CustomerID       string  `json:"customer_id"`
-	Tier             string  `json:"tier"`
-	State            string  `json:"state"`
-	AmountIn         string  `json:"amount_in"`
-	AmountOut        string  `json:"amount_out"`
-	FeeUnits         string  `json:"fee_units"`
-	NetworkFeeUnits  string  `json:"network_fee_units"`
-	RecipientAddress string  `json:"recipient_address"`
-	SenderAddress    *string `json:"sender_address"`
-	Version          int32   `json:"version"`
-	AmountInAsset    string  `json:"amount_in_asset"`
-	AmountOutAsset   string  `json:"amount_out_asset"`
+	ID               int64     `json:"id"`
+	ExternalID       string    `json:"external_id"`
+	CustomerID       string    `json:"customer_id"`
+	Tier             string    `json:"tier"`
+	State            string    `json:"state"`
+	AmountIn         string    `json:"amount_in"`
+	AmountOut        string    `json:"amount_out"`
+	FeeUnits         string    `json:"fee_units"`
+	NetworkFeeUnits  string    `json:"network_fee_units"`
+	RecipientAddress string    `json:"recipient_address"`
+	SenderAddress    *string   `json:"sender_address"`
+	Version          int32     `json:"version"`
+	AmountInAsset    string    `json:"amount_in_asset"`
+	AmountOutAsset   string    `json:"amount_out_asset"`
+	QuoteExpiresAt   time.Time `json:"quote_expires_at"`
 }
 
 func (r orderResponse) toOrder() (Order, error) {
@@ -211,6 +215,7 @@ func (r orderResponse) toOrder() (Order, error) {
 		ID: r.ID, ExternalID: r.ExternalID, CustomerID: r.CustomerID, Tier: r.Tier, State: r.State,
 		AmountIn: amountIn, AmountOut: amountOut, FeeUnits: feeUnits, NetworkFeeUnits: networkFeeUnits,
 		RecipientAddress: r.RecipientAddress, SenderAddress: r.SenderAddress, Version: r.Version,
+		QuoteExpiresAt: r.QuoteExpiresAt,
 	}, nil
 }
 
@@ -322,4 +327,27 @@ func (c *Client) EnsureAccount(ctx context.Context, code string, accountType Acc
 		return classify(decodeAPIError(status, body))
 	}
 	return nil
+}
+
+type balanceResponse struct {
+	AccountCode string `json:"account_code"`
+	Asset       string `json:"asset"`
+	Balance     string `json:"balance"`
+}
+
+// AccountBalance calls GET /v1/accounts/{code}/balance -- the ledger's
+// current balance of one account.
+func (c *Client) AccountBalance(ctx context.Context, code string) (money.Amount, error) {
+	status, body, err := c.do(ctx, http.MethodGet, "/v1/accounts/"+url.PathEscape(code)+"/balance", "", nil)
+	if err != nil {
+		return money.Amount{}, err
+	}
+	if status != http.StatusOK {
+		return money.Amount{}, classify(decodeAPIError(status, body))
+	}
+	var resp balanceResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return money.Amount{}, fmt.Errorf("ledgerclient: decoding balance of %s: %w", code, err)
+	}
+	return money.ParseDecimal(resp.Balance, money.Asset(resp.Asset))
 }

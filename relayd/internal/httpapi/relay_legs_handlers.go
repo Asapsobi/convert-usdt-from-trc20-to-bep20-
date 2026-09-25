@@ -11,14 +11,90 @@ import (
 	"relayd/internal/driver"
 	"relayd/internal/money"
 	"relayd/internal/relay"
+	"relayd/internal/watcherclient"
 )
 
 func formatAmount(a money.Amount) (string, error) {
 	return money.Format(a)
 }
 
+// breakdown is the money a customer sees: amount_in = our_fee +
+// vendor_fee + amount_out (USDT, the same scale on both networks).
+type breakdown struct {
+	AmountIn  string `json:"amount_in"`
+	OurFee    string `json:"our_fee"`
+	VendorFee string `json:"vendor_fee"`
+	AmountOut string `json:"amount_out"`
+	Vendor    string `json:"vendor"`
+}
+
+func breakdownFrom(q driver.Quote) (breakdown, error) {
+	var b breakdown
+	var err error
+	for _, f := range []struct {
+		dst *string
+		a   money.Amount
+	}{{&b.AmountIn, q.AmountIn}, {&b.OurFee, q.OurFee}, {&b.VendorFee, q.VendorFee}, {&b.AmountOut, q.AmountOut}} {
+		if *f.dst, err = formatAmount(f.a); err != nil {
+			return breakdown{}, err
+		}
+	}
+	b.Vendor = q.Vendor
+	return b, nil
+}
+
+// writeDriverError maps a driver failure to a status: the customer's own
+// mistake is a 400, anything else is ours or a vendor's.
+func writeDriverError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, driver.ErrBadRequest):
+		writeError(w, http.StatusBadRequest, err)
+	case errors.Is(err, driver.ErrConflict):
+		writeError(w, http.StatusConflict, errors.New("external_id is already used by a different order"))
+	case errors.Is(err, watcherclient.ErrNoWalletAvailable):
+		writeError(w, http.StatusServiceUnavailable, errors.New("all deposit wallets are busy right now -- please try again in a few minutes"))
+	default:
+		writeError(w, http.StatusBadGateway, err)
+	}
+}
+
+type postQuoteRequest struct {
+	Direction string `json:"direction"`
+	AmountIn  string `json:"amount_in"`
+}
+
+type postQuoteResponse struct {
+	breakdown
+	Direction  string `json:"direction"`
+	ValidUntil string `json:"valid_until"`
+}
+
+// postQuote prices a conversion without creating anything -- what the
+// customer sees before committing.
+func (s *Server) postQuote(w http.ResponseWriter, r *http.Request) {
+	var req postQuoteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	q, err := s.Driver.Quote(r.Context(), driver.QuoteRequest{Direction: relay.Direction(req.Direction), AmountIn: req.AmountIn})
+	if err != nil {
+		writeDriverError(w, err)
+		return
+	}
+	b, err := breakdownFrom(q)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, postQuoteResponse{breakdown: b, Direction: req.Direction, ValidUntil: q.ValidUntil.Format(time.RFC3339)})
+}
+
 type postRelayLegRequest struct {
-	ExternalID         string `json:"external_id"`
+	ExternalID string `json:"external_id"`
+	// CustomerLabel is how the customer identifies themselves (a name or
+	// email). customer_id is accepted as an older name for the same field.
+	CustomerLabel      string `json:"customer_label"`
 	CustomerID         string `json:"customer_id"`
 	Direction          string `json:"direction"` // "TRC20_TO_BEP20" | "BEP20_TO_TRC20"
 	DestinationAddress string `json:"destination_address"`
@@ -26,46 +102,48 @@ type postRelayLegRequest struct {
 }
 
 type postRelayLegResponse struct {
+	breakdown
 	ExternalID      string `json:"external_id"`
 	OrderID         int64  `json:"order_id"`
 	DepositAddress  string `json:"deposit_address"`
-	AmountIn        string `json:"amount_in"`
+	DepositDeadline string `json:"deposit_deadline"`
+	// Older names, kept for existing clients.
 	AmountOutQuoted string `json:"amount_out_quoted"`
 	FeeUnits        string `json:"fee_units"`
 	QuoteExpiresAt  string `json:"quote_expires_at"`
 }
 
-// postRelayLeg is POST /v1/relay-legs -- this service's own quote-then-
-// create entrypoint, mirroring proofrun's identical postPayout shape.
 func (s *Server) postRelayLeg(w http.ResponseWriter, r *http.Request) {
 	var req postRelayLegRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if req.ExternalID == "" || req.CustomerID == "" || req.DestinationAddress == "" || req.AmountIn == "" {
-		writeError(w, http.StatusBadRequest, errors.New("external_id, customer_id, destination_address, and amount_in are all required"))
+	label := req.CustomerLabel
+	if label == "" {
+		label = req.CustomerID
+	}
+	if req.ExternalID == "" || label == "" || req.DestinationAddress == "" || req.AmountIn == "" {
+		writeError(w, http.StatusBadRequest, errors.New("external_id, customer_label, destination_address, and amount_in are all required"))
 		return
 	}
-	direction := relay.Direction(req.Direction)
-	if direction != relay.TRC20ToBEP20 && direction != relay.BEP20ToTRC20 {
-		writeError(w, http.StatusBadRequest, errors.New("direction must be TRC20_TO_BEP20 or BEP20_TO_TRC20"))
-		return
-	}
-
 	result, err := s.Driver.CreateRelayLeg(r.Context(), driver.CreateRelayLegRequest{
-		ExternalID: req.ExternalID, CustomerID: req.CustomerID, Direction: direction,
+		ExternalID: req.ExternalID, CustomerLabel: label, Direction: relay.Direction(req.Direction),
 		DestinationAddress: req.DestinationAddress, AmountIn: req.AmountIn,
 	})
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err)
+		writeDriverError(w, err)
 		return
 	}
-
+	b, err := breakdownFrom(result.Quote)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	deadline := result.DepositDeadline.Format(time.RFC3339)
 	respondJSON(w, http.StatusCreated, postRelayLegResponse{
-		ExternalID: result.ExternalID, OrderID: result.OrderID, DepositAddress: result.DepositAddress,
-		AmountIn: result.AmountIn, AmountOutQuoted: result.AmountOutQuoted, FeeUnits: result.FeeUnits,
-		QuoteExpiresAt: result.QuoteExpiresAt.Format("2006-01-02T15:04:05Z07:00"),
+		breakdown: b, ExternalID: result.ExternalID, OrderID: result.OrderID, DepositAddress: result.DepositAddress,
+		DepositDeadline: deadline, AmountOutQuoted: b.AmountOut, FeeUnits: b.OurFee, QuoteExpiresAt: deadline,
 	})
 }
 
@@ -80,47 +158,67 @@ type getRelayLegResponse struct {
 	AmountIn           string  `json:"amount_in"`
 	AmountOutExpected  string  `json:"amount_out_expected"`
 	AmountOutActual    *string `json:"amount_out_actual,omitempty"`
+	ReceivedAmount     *string `json:"received_amount,omitempty"`
+	OurFee             *string `json:"our_fee,omitempty"`
+	ForwardAmount      *string `json:"forward_amount,omitempty"`
+	VendorFee          *string `json:"vendor_fee,omitempty"`
+	Vendor             *string `json:"vendor,omitempty"`
+	DepositDeadline    string  `json:"deposit_deadline"`
 	ForwardTxID        *string `json:"forward_tx_id,omitempty"`
+	RefundTxID         *string `json:"refund_tx_id,omitempty"`
 }
 
-// getRelayLeg is GET /v1/relay-legs/{external_id} -- this service's own
-// status entrypoint, reconstructing the lifecycle from both C1's order
-// state and this service's own finer-grained relay status.
+func formatOptional(a *money.Amount) (*string, error) {
+	if a == nil {
+		return nil, nil
+	}
+	s, err := formatAmount(*a)
+	return &s, err
+}
+
 func (s *Server) getRelayLeg(w http.ResponseWriter, r *http.Request) {
 	externalID := chi.URLParam(r, "external_id")
 	status, err := s.Driver.GetStatus(r.Context(), externalID)
 	if err != nil {
+		if errors.Is(err, relay.ErrLegNotFound) {
+			writeError(w, http.StatusNotFound, err)
+			return
+		}
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
-
-	amountIn, err := formatAmount(status.Leg.AmountIn)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	amountOutExpected, err := formatAmount(status.Leg.AmountOutExpected)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
+	leg := status.Leg
 	resp := getRelayLegResponse{
 		ExternalID: externalID, OrderID: status.Order.ID, OrderState: status.Order.State,
-		RelayStatus: string(status.Leg.Status), Direction: string(status.Leg.Direction),
-		DepositAddress: status.Leg.DepositAddress, DestinationAddress: status.Leg.DestinationAddress,
-		AmountIn: amountIn, AmountOutExpected: amountOutExpected,
-		ForwardTxID: status.Leg.ForwardTxID,
+		RelayStatus: string(leg.Status), Direction: string(leg.Direction),
+		DepositAddress: leg.DepositAddress, DestinationAddress: leg.DestinationAddress,
+		Vendor: leg.UpstreamProviderName, DepositDeadline: status.Order.QuoteExpiresAt.Format(time.RFC3339),
+		ForwardTxID: leg.ForwardTxID, RefundTxID: leg.RefundTxID,
 	}
-	if status.Leg.AmountOutActual != nil {
-		actual, err := formatAmount(*status.Leg.AmountOutActual)
-		if err != nil {
+	var vendorFee *money.Amount
+	if leg.VendorFeeAmount != nil {
+		vendorFee = &money.Amount{Asset: leg.AmountIn.Asset, Units: *leg.VendorFeeAmount}
+	}
+	for _, f := range []struct {
+		dst **string
+		a   *money.Amount
+	}{
+		{&resp.AmountOutActual, leg.AmountOutActual}, {&resp.ReceivedAmount, leg.ReceivedAmount},
+		{&resp.OurFee, leg.ProfitAmount}, {&resp.ForwardAmount, leg.ForwardAmount}, {&resp.VendorFee, vendorFee},
+	} {
+		if *f.dst, err = formatOptional(f.a); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		resp.AmountOutActual = &actual
 	}
-
+	if resp.AmountIn, err = formatAmount(leg.AmountIn); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if resp.AmountOutExpected, err = formatAmount(leg.AmountOutExpected); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	respondJSON(w, http.StatusOK, resp)
 }
 
@@ -197,6 +295,42 @@ type relayLegSummary struct {
 	RefundTxID           *string `json:"refund_tx_id,omitempty"`
 	CreatedAt            string  `json:"created_at"`
 	UpdatedAt            string  `json:"updated_at"`
+
+	// What actually happened, for full transaction tracking.
+	CustomerLabel   *string `json:"customer_label,omitempty"`
+	DepositAddress  string  `json:"deposit_address"`
+	SenderAddress   *string `json:"sender_address,omitempty"`
+	ProfitBPS       *int64  `json:"profit_bps,omitempty"`
+	ReceivedAmount  *string `json:"received_amount,omitempty"`
+	ProfitAmount    *string `json:"profit_amount,omitempty"`
+	ForwardAmount   *string `json:"forward_amount,omitempty"`
+	VendorFeeAmount *string `json:"vendor_fee_amount,omitempty"`
+	LeaseReleasedAt *string `json:"lease_released_at,omitempty"`
+}
+
+// addTracking fills in what actually happened on leg.
+func addTracking(summary *relayLegSummary, leg relay.Leg) {
+	summary.CustomerLabel, summary.DepositAddress, summary.SenderAddress = leg.CustomerLabel, leg.DepositAddress, leg.SenderAddress
+	summary.ProfitBPS = leg.ProfitBPS
+	for _, f := range []struct {
+		src *money.Amount
+		dst **string
+	}{{leg.ReceivedAmount, &summary.ReceivedAmount}, {leg.ProfitAmount, &summary.ProfitAmount}, {leg.ForwardAmount, &summary.ForwardAmount}} {
+		if f.src != nil {
+			if formatted, err := formatAmount(*f.src); err == nil {
+				*f.dst = &formatted
+			}
+		}
+	}
+	if leg.VendorFeeAmount != nil {
+		if formatted, err := formatAmount(money.Amount{Asset: leg.AmountIn.Asset, Units: *leg.VendorFeeAmount}); err == nil {
+			summary.VendorFeeAmount = &formatted
+		}
+	}
+	if leg.LeaseReleasedAt != nil {
+		at := leg.LeaseReleasedAt.UTC().Format(time.RFC3339)
+		summary.LeaseReleasedAt = &at
+	}
 }
 
 type listRelayLegsResponse struct {
@@ -249,6 +383,7 @@ func (s *Server) getRelayLegs(w http.ResponseWriter, r *http.Request) {
 			}
 			summary.AmountOutActual = &actual
 		}
+		addTracking(&summary, leg)
 		resp.Legs = append(resp.Legs, summary)
 	}
 

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"math/big"
 	"strings"
 
@@ -38,44 +37,6 @@ type transferIntent struct {
 	sender    string
 	recipient string
 	amount    money.Amount
-}
-
-// preflightForwardEVM gates a BEP20 forward: the signed transaction must
-// match intent, and the vendor's order must still be waiting for exactly
-// this deposit.
-func (o *Orchestrator) preflightForwardEVM(ctx context.Context, leg relay.Leg, signed *types.Transaction, intent transferIntent) error {
-	if err := checkEVMTransfer(signed, intent); err != nil {
-		return o.refuseBroadcast(ctx, leg, "forward", err)
-	}
-	return o.checkVendorOrder(ctx, leg, intent)
-}
-
-// preflightForwardTRON is preflightForwardEVM's TRC20 counterpart. The
-// signer itself isn't re-derived here: TRON states the owner inside the
-// transaction and the network rejects a signature from any other key
-// (confirmed live: "Validate signature error"), so the owner check is
-// what matters.
-func (o *Orchestrator) preflightForwardTRON(ctx context.Context, leg relay.Leg, unsignedTx []byte, intent transferIntent) error {
-	if err := checkTRONTransfer(unsignedTx, intent); err != nil {
-		return o.refuseBroadcast(ctx, leg, "forward", err)
-	}
-	return o.checkVendorOrder(ctx, leg, intent)
-}
-
-// preflightRefundEVM gates a BEP20 refund. No vendor is involved.
-func (o *Orchestrator) preflightRefundEVM(ctx context.Context, leg relay.Leg, signed *types.Transaction, intent transferIntent) error {
-	if err := checkEVMTransfer(signed, intent); err != nil {
-		return o.refuseBroadcast(ctx, leg, "refund", err)
-	}
-	return nil
-}
-
-// preflightRefundTRON gates a TRC20 refund. No vendor is involved.
-func (o *Orchestrator) preflightRefundTRON(ctx context.Context, leg relay.Leg, unsignedTx []byte, intent transferIntent) error {
-	if err := checkTRONTransfer(unsignedTx, intent); err != nil {
-		return o.refuseBroadcast(ctx, leg, "refund", err)
-	}
-	return nil
 }
 
 // checkEVMTransfer verifies signed does exactly what intent says. The
@@ -158,7 +119,7 @@ func (o *Orchestrator) checkVendorOrder(ctx context.Context, leg relay.Leg, inte
 	if leg.UpstreamOrderID == nil {
 		return o.refuseBroadcast(ctx, leg, "forward", errors.New("leg has no upstream order recorded"))
 	}
-	vendorOrder, err := o.Upstream.GetOrder(ctx, *leg.UpstreamOrderID)
+	vendorOrder, err := o.vendorOrder(ctx, leg)
 	if err != nil {
 		return fmt.Errorf("confirming upstream order %s before sending: %w", *leg.UpstreamOrderID, err)
 	}
@@ -190,21 +151,8 @@ func (o *Orchestrator) checkVendorOrder(ctx context.Context, leg relay.Leg, inte
 // is and this runs again every tick), then an error the caller returns
 // without broadcasting.
 func (o *Orchestrator) refuseBroadcast(ctx context.Context, leg relay.Leg, kind string, cause error) error {
-	detail := fmt.Sprintf("relay leg %s: %s transfer NOT sent -- %v", leg.ExternalID, kind, cause)
-
-	o.mu.Lock()
-	alreadyAlerted := o.preflightAlerted[leg.ExternalID] == detail
-	o.preflightAlerted[leg.ExternalID] = detail
-	o.mu.Unlock()
-
-	if !alreadyAlerted {
-		if alertErr := o.Alert.Fire(ctx, alert.Alert{
-			Severity: alert.SeverityCritical, ExternalID: leg.ExternalID,
-			Reason: "relay_leg_preflight_failed", Detail: detail,
-		}); alertErr != nil {
-			slog.Error("orchestrate: firing the preflight-failed alert itself failed", "external_id", leg.ExternalID, "error", alertErr)
-		}
-	}
+	o.alertOnce(ctx, leg.ExternalID, "relay_leg_preflight_failed", alert.SeverityCritical,
+		fmt.Sprintf("relay leg %s: %s transfer NOT sent -- %v", leg.ExternalID, kind, cause))
 	return fmt.Errorf("%w: %s transfer: %v", ErrPreflightFailed, kind, cause)
 }
 

@@ -385,3 +385,17 @@ func TestSelfCheck_SurfacesARejectedKeyAsAnAPIError(t *testing.T) {
 		t.Fatalf("expected an *APIError with code 501, got %v", err)
 	}
 }
+
+// EMERGENCY holds the funds for a human decision and an unknown status
+// is unknown: neither may be read as a failure that gives up on the order.
+func TestStatusFromFixedFloat(t *testing.T) {
+	for input, want := range map[string]SwapStatus{
+		"NEW": StatusAwaitingDeposit, "PENDING": StatusConfirming, "EXCHANGE": StatusExchanging,
+		"WITHDRAW": StatusSending, "DONE": StatusComplete, "EXPIRED": StatusExpired,
+		"EMERGENCY": StatusNeedsAttention, "SOMETHING_NEW": StatusNeedsAttention,
+	} {
+		if got := statusFromFixedFloat(input); got != want {
+			t.Errorf("statusFromFixedFloat(%q) = %s, want %s", input, got, want)
+		}
+	}
+}

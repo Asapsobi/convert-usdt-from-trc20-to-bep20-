@@ -37,6 +37,7 @@ package orchestrate_test
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -58,6 +59,7 @@ import (
 	"relayd/internal/signing"
 	"relayd/internal/tests1"
 	"relayd/internal/testtronwatcher"
+	"relayd/internal/tronbroadcast"
 	"relayd/internal/txbuild"
 	"relayd/internal/upstream"
 	"relayd/internal/watcherclient"
@@ -116,11 +118,28 @@ func (c *capturingTRONChain) CurrentBlockReference(ctx context.Context) (txbuild
 
 func (c *capturingTRONChain) BroadcastSigned(ctx context.Context, unsignedTx []byte, signature [65]byte) (string, error) {
 	digest := txbuild.Digest(unsignedTx)
-	txID := fmt.Sprintf("%x", digest[:8])
+	txID := fmt.Sprintf("%x", digest[:])
 	c.mu.Lock()
 	c.byTxID[txID] = capturedTRONBroadcast{unsignedTx: unsignedTx, sig: signature}
 	c.mu.Unlock()
 	return txID, nil
+}
+
+// TokenBalance reports plenty of USDT for every holder -- balance
+// shortfalls are exercised by tests that configure them explicitly.
+func (c *capturingTRONChain) TokenBalance(ctx context.Context, holder string) (*big.Int, error) {
+	return new(big.Int).Exp(big.NewInt(10), big.NewInt(30), nil), nil
+}
+
+// AccountResources reports an activated account with plenty of energy,
+// bandwidth, and TRX -- resource shortfalls are exercised by tests that
+// configure them explicitly.
+func (c *capturingTRONChain) AccountResources(ctx context.Context, holder string) (tronbroadcast.Resources, error) {
+	return tronbroadcast.Resources{Exists: true, Energy: 1_000_000_000, Bandwidth: 1_000_000, BalanceSun: 1_000_000_000}, nil
+}
+
+func (c *capturingTRONChain) EstimateTransferEnergy(ctx context.Context, from, to string, raw *big.Int) (int64, error) {
+	return 64_285, nil
 }
 
 // CapturedFor returns the broadcast this fake recorded for txID (a
@@ -232,12 +251,13 @@ func TestForwardTRC20_SignsFromLegsOwnRealDepositAddress(t *testing.T) {
 		Ledger: client, Upstream: mockProvider,
 		TronWatcher: watcherclient.New(watcher.BaseURL(), watcher.Token()),
 		Store:       store,
-		Cfg:         driver.Config{FeeBasisPoints: 30, QuoteValidity: 10 * time.Minute},
+		Pricing:     e2ePricing(t, store),
+		Cfg:         driver.Config{QuoteValidity: 10 * time.Minute, DepositWindow: 30 * time.Minute},
 	}
 
 	if _, err := d.CreateRelayLeg(context.Background(), driver.CreateRelayLegRequest{
-		ExternalID: externalID, CustomerID: "cust-e2e-sign-trc20", Direction: relay.TRC20ToBEP20,
-		DestinationAddress: "0x4192cc99D3Cb95573dCaf8dD76921476E0c7bCAf", AmountIn: "100.000000",
+		ExternalID: externalID, CustomerLabel: "cust-e2e-sign-trc20", Direction: relay.TRC20ToBEP20,
+		DestinationAddress: "0x4192cC99D3CB95573DcAF8dd76921476e0C7bCaF", AmountIn: "100.000000",
 	}); err != nil {
 		t.Fatalf("CreateRelayLeg: %v", err)
 	}
@@ -317,11 +337,9 @@ func TestForwardTRC20_SignsFromLegsOwnRealDepositAddress(t *testing.T) {
 	// does not exist"). fakeEnergy previously discarded targetAddress
 	// entirely, which is exactly how that shipped with no test catching
 	// it.
-	gotEnergyTarget := fakeEnergyClient.TargetAddressFor(externalID)
-	if gotEnergyTarget != leg.DepositAddress {
-		t.Fatalf("energy reserved for %s, want the leg's own real deposit address %s (not the vendor's own upstream deposit address)",
-			gotEnergyTarget, leg.DepositAddress)
-	}
+	// Energy for the forward is rented for the sender (the deposit
+	// address) only when it is short -- see
+	// TestResources_TRONRentsExactlyTheShortfallForTheSender.
 
 	// Critical assertion, part 1: decode the broadcast transaction's own
 	// baked-in OwnerAddress (proto-marshaled by txbuild.BuildTransfer's

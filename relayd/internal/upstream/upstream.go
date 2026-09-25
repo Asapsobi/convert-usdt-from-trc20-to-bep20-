@@ -50,6 +50,11 @@ const (
 	StatusComplete        SwapStatus = "complete"
 	StatusFailed          SwapStatus = "failed"
 	StatusExpired         SwapStatus = "expired"
+	// StatusNeedsAttention: the vendor paused the order for a human
+	// decision (FixedFloat's EMERGENCY, SideShift's review) or reported a
+	// status this code doesn't know. Not terminal: relayd alerts and keeps
+	// following the order, which may still complete.
+	StatusNeedsAttention SwapStatus = "needs_attention"
 )
 
 // SwapOrder is one order placed with the upstream platform.
@@ -94,6 +99,10 @@ type SelfChecker interface {
 // ErrMisconfigured means a SelfCheck found the provider reachable but
 // wrongly configured -- fatal, unlike a transport error.
 var ErrMisconfigured = errors.New("upstream: provider misconfigured")
+
+// ErrAllProvidersFailed means every vendor a request was tried with
+// failed it.
+var ErrAllProvidersFailed = errors.New("upstream: every configured vendor failed this call")
 
 // ErrNoVendorConfigured is PlaceholderProvider's only possible result --
 // same posture as screening's AlwaysCleanProvider and energybroker's

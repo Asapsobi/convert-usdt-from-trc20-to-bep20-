@@ -178,7 +178,7 @@ func TestStatusFromChangeNow_MapsEveryKnownStatus(t *testing.T) {
 		"confirming": StatusConfirming, "verifying": StatusConfirming,
 		"exchanging": StatusExchanging, "sending": StatusSending,
 		"finished": StatusComplete, "failed": StatusFailed, "refunded": StatusFailed,
-		"some-unrecognized-future-status": StatusFailed,
+		"some-unrecognized-future-status": StatusNeedsAttention,
 	}
 	for input, want := range cases {
 		if got := statusFromChangeNow(input); got != want {

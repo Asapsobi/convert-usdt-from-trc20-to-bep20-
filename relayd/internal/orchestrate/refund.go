@@ -35,16 +35,13 @@
 //     post-FORWARDED for now.
 //
 // The mechanism this file DOES build is deliberately vendor-agnostic and
-// needs none of the above: a leg still FORWARDING after Config.ForwardingTimeout
-// has, by construction, never had its forward transfer leave this
-// system's own custody on-chain successfully -- MarkForwarded (which
-// would have moved the leg out of FORWARDING) only ever runs after
-// checkForwardExecutionAndFinish confirms the broadcast transaction's
-// own on-chain EXECUTION succeeded, not merely that a broadcast attempt
-// was accepted by the network (a real, confirmed-live distinction: an
-// accepted broadcast can still fail execution, e.g. "OUT_OF_ENERGY",
-// while moving zero funds). Refunding it is safe regardless of what any
-// vendor does or says.
+// needs none of the above. A leg still FORWARDING after
+// Config.ForwardingTimeout is only refunded when internal/transfers shows
+// no forward transaction that could still land -- none confirmed, and
+// none signed but unresolved (see forwardMayStillLand). Transfer attempts
+// are durable, so this holds across restarts: a forward sent just before
+// a crash is found again and followed to its real outcome, never
+// forgotten and refunded on top of.
 package orchestrate
 
 import (
@@ -54,12 +51,9 @@ import (
 	"log/slog"
 	"time"
 
-	"relayd/internal/alert"
-	"relayd/internal/evmbroadcast"
-	"relayd/internal/evmtx"
 	"relayd/internal/ledgerclient"
 	"relayd/internal/relay"
-	"relayd/internal/txbuild"
+	"relayd/internal/transfers"
 )
 
 // startExternallyRefundedLegs scans C1 for orders in state=refunded and,
@@ -118,22 +112,10 @@ func (o *Orchestrator) startExternallyRefundedLegs(ctx context.Context) error {
 // matching this Config's own "no hardcoded defaults for real-money
 // thresholds" posture.
 //
-// A leg with a broadcast already in flight (hasPendingBroadcast) is
-// skipped regardless of how stale UpdatedAt is: UpdatedAt is set ONCE,
-// at the very first MarkForwarding, and never bumped by a later retry's
-// own broadcast -- so a leg that finally broadcasts on a late attempt,
-// after its own UpdatedAt has already aged past ForwardingTimeout, would
-// otherwise get abandoned+refunded in this SAME tick, racing a broadcast
-// that may itself still go on to succeed on-chain (checked next tick via
-// checkForwardExecutionAndFinish / checkForwardEVMExecutionAndFinish).
-// Both transfers spend the same deposit, so the chain lets only one land
-// -- but abandoning here would still post a refund to C1 for money
-// that may be on its way to the vendor, leaving the books claiming a
-// refund the chain then rejects. Left alone, such a leg
-// becomes eligible for this same refund again, from a fresh broadcast
-// attempt, only once a confirmed on-chain FAILURE clears the pending
-// cache -- never while a real broadcast is still awaiting its own
-// execution-confirmation check.
+// A leg whose forward could still land is never refunded, however stale:
+// UpdatedAt is not bumped by later attempts, so a forward finally sent
+// after a long wait (a vendor order re-created, gas topped up) would
+// otherwise be refunded while its transaction is on its way.
 func (o *Orchestrator) refundStuckForwardingLegs(ctx context.Context) error {
 	if o.Cfg.ForwardingTimeout <= 0 {
 		return nil
@@ -146,8 +128,14 @@ func (o *Orchestrator) refundStuckForwardingLegs(ctx context.Context) error {
 		if time.Since(leg.UpdatedAt) < o.Cfg.ForwardingTimeout {
 			continue
 		}
-		if o.hasPendingBroadcast(leg.ExternalID) {
-			slog.Info("orchestrate: relay leg's forwarding attempt is stale but a broadcast is already awaiting its own execution check, not refunding yet",
+		mayLand, err := o.forwardMayStillLand(ctx, leg.ExternalID)
+		if err != nil {
+			slog.Error("orchestrate: checking a stuck leg's forward attempts failed, will retry next tick",
+				"external_id", leg.ExternalID, "error", err)
+			continue
+		}
+		if mayLand {
+			slog.Info("orchestrate: relay leg's forwarding attempt is stale but its forward transaction may still land, not refunding",
 				"external_id", leg.ExternalID)
 			continue
 		}
@@ -159,22 +147,23 @@ func (o *Orchestrator) refundStuckForwardingLegs(ctx context.Context) error {
 	return nil
 }
 
-// hasPendingBroadcast reports whether a forward transfer has already
-// been broadcast for externalID and is awaiting its own on-chain
-// execution-confirmation check (checkForwardExecutionAndFinish for
-// TRC20_TO_BEP20, checkForwardEVMExecutionAndFinish for BEP20_TO_TRC20)
-// -- both o.pending and o.pendingEVM are checked since the caller does
-// not know (and does not need to know) the leg's own direction.
-func (o *Orchestrator) hasPendingBroadcast(externalID string) bool {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if pb, ok := o.pending[externalID]; ok && pb.broadcastTxID != "" {
-		return true
+// forwardMayStillLand reports whether externalID's forward has confirmed
+// or has a signed transaction not yet resolved by the chain -- either way
+// the deposit may already be (or be about to be) with the vendor. An
+// unsigned (BUILT) forward attempt can't land, so it is abandoned here to
+// make way for the refund.
+func (o *Orchestrator) forwardMayStillLand(ctx context.Context, externalID string) (bool, error) {
+	if _, ok, err := o.Transfers.Confirmed(ctx, externalID, transfers.Forward); err != nil || ok {
+		return ok, err
 	}
-	if pb, ok := o.pendingEVM[externalID]; ok && pb.broadcastTxHash != "" {
-		return true
+	a, ok, err := o.Transfers.Open(ctx, externalID, transfers.Forward)
+	if err != nil || !ok {
+		return false, err
 	}
-	return false
+	if a.Status.MayLand() {
+		return true, nil
+	}
+	return false, o.Transfers.MarkAbandoned(ctx, a.ID, "leg is being refunded")
 }
 
 // startRefund commits the refund on C1 (reversing relay_forward_start,
@@ -240,6 +229,17 @@ func (o *Orchestrator) refundStuckAwaitingDepositLegs(ctx context.Context) error
 // screened (no reversal step needed first -- see this file's own
 // top-of-file doc comment) and marks the leg REFUND_PENDING locally.
 func (o *Orchestrator) startAwaitingDepositRefund(ctx context.Context, leg relay.Leg) error {
+	if leg.ReceivedAmount == nil {
+		// The refund returns what actually arrived, so that must be on
+		// record first -- never fall back to the quoted amount here.
+		order, err := o.Ledger.GetOrder(ctx, leg.ExternalID)
+		if err != nil {
+			return fmt.Errorf("fetching order: %w", err)
+		}
+		if leg, _, err = o.recordDeposit(ctx, leg, order); err != nil {
+			return fmt.Errorf("recording the deposit before refunding it: %w", err)
+		}
+	}
 	if err := o.postScreenedRefundEntry(ctx, leg); err != nil {
 		return err
 	}
@@ -274,13 +274,14 @@ func (o *Orchestrator) postScreenedRefundEntry(ctx context.Context, leg relay.Le
 	legAccount := relayLegAccountCode(leg.OrderID)
 	asset := string(order.AmountIn.Asset)
 
-	negAmountIn, err := order.AmountIn.Neg()
+	received := receivedFor(leg, order)
+	negAmountIn, err := received.Neg()
 	if err != nil {
-		return fmt.Errorf("negating amount_in: %w", err)
+		return fmt.Errorf("negating the received amount: %w", err)
 	}
 	idemKey := "relayd:refund_awaiting:" + leg.ExternalID
 	lines := []ledgerclient.EntryLine{
-		{AccountCode: customerAccount, Asset: asset, Amount: order.AmountIn},
+		{AccountCode: customerAccount, Asset: asset, Amount: received},
 		{AccountCode: legAccount, Asset: asset, Amount: negAmountIn},
 	}
 	if _, err := o.Ledger.TransitionWithEntry(ctx, leg.ExternalID, "refunded", order.Version,
@@ -312,13 +313,14 @@ func (o *Orchestrator) postForwardAbandonEntry(ctx context.Context, leg relay.Le
 	forwardingAccount := relayLegForwardingAccountCode(leg.OrderID)
 	asset := string(order.AmountIn.Asset)
 
-	negAmountIn, err := order.AmountIn.Neg()
+	received := receivedFor(leg, order)
+	negAmountIn, err := received.Neg()
 	if err != nil {
-		return fmt.Errorf("negating amount_in: %w", err)
+		return fmt.Errorf("negating the received amount: %w", err)
 	}
 	idemKey := "relayd:forward_abandon:" + leg.ExternalID
 	lines := []ledgerclient.EntryLine{
-		{AccountCode: legAccount, Asset: asset, Amount: order.AmountIn},
+		{AccountCode: legAccount, Asset: asset, Amount: received},
 		{AccountCode: forwardingAccount, Asset: asset, Amount: negAmountIn},
 	}
 	if _, err := o.Ledger.TransitionWithEntry(ctx, leg.ExternalID, "held", order.Version,
@@ -354,13 +356,14 @@ func (o *Orchestrator) postRefundEntry(ctx context.Context, leg relay.Leg) error
 	legAccount := relayLegAccountCode(leg.OrderID)
 	asset := string(order.AmountIn.Asset)
 
-	negAmountIn, err := order.AmountIn.Neg()
+	received := receivedFor(leg, order)
+	negAmountIn, err := received.Neg()
 	if err != nil {
-		return fmt.Errorf("negating amount_in: %w", err)
+		return fmt.Errorf("negating the received amount: %w", err)
 	}
 	idemKey := "relayd:refund:" + leg.ExternalID
 	lines := []ledgerclient.EntryLine{
-		{AccountCode: customerAccount, Asset: asset, Amount: order.AmountIn},
+		{AccountCode: customerAccount, Asset: asset, Amount: received},
 		{AccountCode: legAccount, Asset: asset, Amount: negAmountIn},
 	}
 	if _, err := o.Ledger.TransitionWithEntry(ctx, leg.ExternalID, "refunded", order.Version,
@@ -371,64 +374,36 @@ func (o *Orchestrator) postRefundEntry(ctx context.Context, leg relay.Leg) error
 }
 
 // advanceRefundPendingLegs drives every REFUND_PENDING leg's own actual
-// on-chain refund transfer, dispatching by Direction -- a
-// TRC20_TO_BEP20 leg was funded in TRC20, so it refunds over TRON;
-// BEP20_TO_TRC20 refunds over BSC. The mirror of advanceForwardingLegs
-// (forward_trc20.go), one phase later in the leg's own lifecycle.
+// on-chain refund transfer -- a TRC20_TO_BEP20 leg was funded in TRC20,
+// so it refunds over TRON; BEP20_TO_TRC20 refunds over BSC. The mirror
+// of advanceForwardingLegs, one phase later in the leg's own lifecycle.
 func (o *Orchestrator) advanceRefundPendingLegs(ctx context.Context) error {
 	legs, err := o.Store.ListByStatus(ctx, relay.StatusRefundPending)
 	if err != nil {
 		return fmt.Errorf("listing refund-pending legs: %w", err)
 	}
 	for _, leg := range legs {
-		var err error
-		switch leg.Direction {
-		case relay.TRC20ToBEP20:
-			err = o.advanceRefundPendingOneTRC20(ctx, leg)
-		case relay.BEP20ToTRC20:
-			err = o.advanceRefundPendingOneBEP20(ctx, leg)
-		default:
-			err = fmt.Errorf("relay leg has unrecognized direction %q", leg.Direction)
-		}
-		if err != nil {
+		if err := o.advanceRefundPendingOne(ctx, leg); err != nil {
 			slog.Error("orchestrate: advancing refund-pending leg failed, will retry next tick",
-				"external_id", leg.ExternalID, "error", err)
+				"external_id", leg.ExternalID, "direction", leg.Direction, "error", err)
 		}
 	}
 	return nil
 }
 
-// advanceRefundPendingOneTRC20 is advanceForwardingOneTRC20's own
-// refund-direction sibling: same energy reservation / build-cache-sign-
-// broadcast shape, but the destination is the ORIGINAL depositor's own
+// advanceRefundPendingOne sends the refund to the ORIGINAL depositor's own
 // address (C1's order.SenderAddress -- never a customer-supplied one,
 // closing the obvious social-engineering vector on a refund flow, per
-// R5's own acceptance criterion) and the amount is the FULL amount_in,
-// not forwardAmount's discounted figure -- nothing was delivered, so no
-// commission is withheld.
+// R5's own acceptance criterion) for the FULL amount_in -- nothing was
+// delivered, so no commission is withheld. The amount is what actually
+// arrived (receivedFor), which can differ from the quote.
 //
-// It sends FROM the leg's own deposit address, signed with that
-// address's own per-order key, exactly like the forward: every path into
+// It sends FROM the leg's own deposit address, signed with that address's
+// own per-order key, exactly like the forward: every path into
 // REFUND_PENDING (screening rejected the order, CreateOrder never
 // succeeded, or the forward never confirmed) means the customer's funds
-// never left that address. Refunding from relayd's own slot instead
-// would pay the customer out of operating funds (or fail, with none)
-// while the real deposit stayed stuck -- and would be a true double
-// payment if the forward also landed. Spending the one deposit twice is
-// impossible on-chain, so this path can't double-pay by construction.
-func (o *Orchestrator) advanceRefundPendingOneTRC20(ctx context.Context, leg relay.Leg) error {
-	// A broadcast already happened for this leg's refund in an earlier
-	// tick -- check ITS OWN on-chain execution result before doing
-	// anything else. See forward_trc20.go's own identical pattern and
-	// checkForwardExecutionAndFinish's doc comment for why this must
-	// happen before a refund is ever marked complete.
-	o.mu.Lock()
-	existingPB, alreadyBroadcast := o.pendingRefund[leg.ExternalID]
-	o.mu.Unlock()
-	if alreadyBroadcast && existingPB.broadcastTxID != "" {
-		return o.checkRefundExecutionAndFinish(ctx, leg, existingPB.broadcastTxID)
-	}
-
+// never left that address.
+func (o *Orchestrator) advanceRefundPendingOne(ctx context.Context, leg relay.Leg) error {
 	order, err := o.Ledger.GetOrder(ctx, leg.ExternalID)
 	if err != nil {
 		return fmt.Errorf("fetching order: %w", err)
@@ -437,269 +412,13 @@ func (o *Orchestrator) advanceRefundPendingOneTRC20(ctx context.Context, leg rel
 		return fmt.Errorf("order has no sender_address recorded -- cannot refund")
 	}
 
-	if err := o.reverifyDepositAddress(ctx, leg); err != nil {
+	done, err := o.driveTransfer(ctx, legTransfer(leg, transfers.Refund, *order.SenderAddress, receivedFor(leg, order)))
+	if err != nil || done == nil {
 		return err
 	}
-
-	o.mu.Lock()
-	pb, ok := o.pendingRefund[leg.ExternalID]
-	o.mu.Unlock()
-	if !ok {
-		ref, err := o.Chain.CurrentBlockReference(ctx)
-		if err != nil {
-			return fmt.Errorf("resolving a current TRON block reference: %w", err)
-		}
-		unsignedTx, err := txbuild.BuildTransfer(leg.DepositAddress, *order.SenderAddress, leg.AmountIn, ref)
-		if err != nil {
-			return fmt.Errorf("building the unsigned refund transfer: %w", err)
-		}
-		pb = pendingForward{unsignedTx: unsignedTx}
-		o.mu.Lock()
-		o.pendingRefund[leg.ExternalID] = pb
-		o.mu.Unlock()
-	}
-
-	// Energy goes to the refund's own sender, leg.DepositAddress -- the
-	// same rule (and the same target-address-scoped idempotency key) as
-	// forward_trc20.go's own reservation; *order.SenderAddress is only
-	// the recipient and never needs energy.
-	deadline := time.Now().Add(defaultEnergyDeadlineWindow)
-	reserveIdemKey := fmt.Sprintf("relayd:refund-reserve:%s:%s", leg.ExternalID, leg.DepositAddress)
-	reservation, err := o.Energy.Reserve(ctx, leg.ExternalID, leg.DepositAddress,
-		o.Cfg.EnergyPerTransferUnits, "STANDARD", deadline, reserveIdemKey)
-	if err != nil {
-		return fmt.Errorf("reserving energy for refund: %w", err)
-	}
-	if reservation.Status != "CONFIRMED" {
-		return fmt.Errorf("energy reservation ended in status %s, not CONFIRMED", reservation.Status)
-	}
-
-	digest := txbuild.Digest(pb.unsignedTx)
-	estimatedUSD := estimatedUSDFor(leg.AmountIn)
-	// Digest-scoped idempotency key -- see forward_trc20.go's own
-	// identical fix and doc comment: leg.ExternalID alone stays stable
-	// across a relayd restart even though pendingRefund is in-memory only
-	// and gets rebuilt (a fresh block reference) on the next attempt,
-	// which would otherwise make S1 replay a stale, since-mismatched
-	// signature.
-	idemKey := fmt.Sprintf("relayd:refund-sign:%s:%x", leg.ExternalID, digest)
-	sigReq, err := o.Signing.RequestTronDepositSweepSignature(ctx, *leg.DepositDerivationIndex, digest, estimatedUSD, idemKey)
-	if err != nil {
-		return fmt.Errorf("requesting refund signature: %w", err)
-	}
-	switch sigReq.Status {
-	case "PENDING":
-		slog.Info("orchestrate: refund signature still pending approval, resuming next tick", "external_id", leg.ExternalID)
-		return nil
-	case "REJECTED":
-		o.mu.Lock()
-		delete(o.pendingRefund, leg.ExternalID)
-		o.mu.Unlock()
-		return fmt.Errorf("refund signature request was rejected")
-	case "SIGNED":
-		// fall through to broadcast
-	default:
-		return fmt.Errorf("unexpected signing status %q", sigReq.Status)
-	}
-
-	intent := transferIntent{sender: leg.DepositAddress, recipient: *order.SenderAddress, amount: leg.AmountIn}
-	if err := o.preflightRefundTRON(ctx, leg, pb.unsignedTx, intent); err != nil {
-		return err
-	}
-	txID, err := o.Chain.BroadcastSigned(ctx, pb.unsignedTx, sigReq.SignedTx)
-	if err != nil {
-		return fmt.Errorf("broadcasting refund: %w", err)
-	}
-
-	// Record the broadcast txid -- do NOT mark refunded yet. See
-	// forward_trc20.go's own identical fix and doc comment: a successful
-	// broadcast only means the network accepted the transaction, not that
-	// its own execution succeeded.
-	pb.broadcastTxID = txID
-	o.mu.Lock()
-	o.pendingRefund[leg.ExternalID] = pb
-	o.mu.Unlock()
-	slog.Info("orchestrate: refund broadcast, awaiting on-chain execution result", "external_id", leg.ExternalID, "tron_txid", txID)
-	return nil
-}
-
-// checkRefundExecutionAndFinish is checkForwardExecutionAndFinish's own
-// refund-direction sibling -- see that function's own doc comment.
-func (o *Orchestrator) checkRefundExecutionAndFinish(ctx context.Context, leg relay.Leg, txID string) error {
-	final, success, failureReason, err := o.Finality.CheckExecution(ctx, txID)
-	if err != nil {
-		return fmt.Errorf("checking refund execution result: %w", err)
-	}
-	if !final {
-		slog.Info("orchestrate: refund broadcast but not yet finalized, resuming next tick", "external_id", leg.ExternalID, "tron_txid", txID)
-		return nil
-	}
-	if !success {
-		o.mu.Lock()
-		delete(o.pendingRefund, leg.ExternalID)
-		o.mu.Unlock()
-		if alertErr := o.Alert.Fire(ctx, alert.Alert{
-			Severity: alert.SeverityCritical, ExternalID: leg.ExternalID,
-			Reason: "relay_leg_refund_execution_failed",
-			Detail: fmt.Sprintf("leg %s: refund transfer %s was accepted by the network but its own execution failed: %s -- rebuilding and retrying next tick",
-				leg.ExternalID, txID, failureReason),
-		}); alertErr != nil {
-			slog.Error("orchestrate: firing the refund-execution-failed alert itself failed", "external_id", leg.ExternalID, "error", alertErr)
-		}
-		return fmt.Errorf("refund transfer %s failed on-chain execution: %s", txID, failureReason)
-	}
-
-	if err := o.Store.MarkRefunded(ctx, leg.ExternalID, txID); err != nil {
+	if err := o.Store.MarkRefunded(ctx, leg.ExternalID, *done.TxHash); err != nil {
 		return fmt.Errorf("marking refunded: %w", err)
 	}
-	o.mu.Lock()
-	delete(o.pendingRefund, leg.ExternalID)
-	o.mu.Unlock()
-	slog.Info("orchestrate: relay leg refunded", "external_id", leg.ExternalID, "tron_txid", txID)
-	return nil
-}
-
-// advanceRefundPendingOneBEP20 is advanceForwardingOneBEP20's own
-// refund-direction sibling -- see advanceRefundPendingOneTRC20's own doc
-// comment for the shared reasoning (SenderAddress-only destination, full
-// amount_in, no commission, sent from the leg's own deposit address with
-// its own per-order key). No C4 involvement, same as the BEP20 forward
-// leg: the deposit address pays its own BNB gas.
-func (o *Orchestrator) advanceRefundPendingOneBEP20(ctx context.Context, leg relay.Leg) error {
-	// A broadcast already happened for this leg in an earlier tick --
-	// check ITS OWN on-chain execution result before doing anything
-	// else. See checkForwardEVMExecutionAndFinish's own doc comment
-	// (forward_bep20.go) for why: a mined BSC transaction can still
-	// revert.
-	o.mu.Lock()
-	existingPB, alreadyBroadcast := o.pendingRefundEVM[leg.ExternalID]
-	o.mu.Unlock()
-	if alreadyBroadcast && existingPB.broadcastTxHash != "" {
-		return o.checkRefundEVMExecutionAndFinish(ctx, leg, existingPB.broadcastTxHash)
-	}
-
-	order, err := o.Ledger.GetOrder(ctx, leg.ExternalID)
-	if err != nil {
-		return fmt.Errorf("fetching order: %w", err)
-	}
-	if order.SenderAddress == nil || *order.SenderAddress == "" {
-		return fmt.Errorf("order has no sender_address recorded -- cannot refund")
-	}
-
-	if err := o.reverifyDepositAddress(ctx, leg); err != nil {
-		return err
-	}
-
-	o.mu.Lock()
-	pb, ok := o.pendingRefundEVM[leg.ExternalID]
-	o.mu.Unlock()
-	if !ok {
-		nonce, err := o.EVMChain.CurrentNonce(ctx, leg.DepositAddress)
-		if err != nil {
-			return fmt.Errorf("resolving a current BSC nonce: %w", err)
-		}
-		gasPrice, err := o.EVMChain.SuggestGasPrice(ctx)
-		if err != nil {
-			return fmt.Errorf("suggesting a BSC gas price: %w", err)
-		}
-		params := evmtx.TxParams{Nonce: nonce, GasPrice: gasPrice, GasLimit: o.Cfg.EVMGasLimit}
-		tx, digest, err := evmtx.BuildTransfer(*order.SenderAddress, leg.AmountIn, params)
-		if err != nil {
-			return fmt.Errorf("building the unsigned refund transfer: %w", err)
-		}
-		pb = pendingEVMForward{unsignedTx: tx, digest: digest}
-		o.mu.Lock()
-		o.pendingRefundEVM[leg.ExternalID] = pb
-		o.mu.Unlock()
-	}
-
-	estimatedUSD := estimatedUSDFor(leg.AmountIn)
-	// Digest-scoped idempotency key -- see forward_trc20.go's own
-	// identical fix and doc comment.
-	idemKey := fmt.Sprintf("relayd:refund-sign:%s:%x", leg.ExternalID, pb.digest)
-	sigReq, err := o.Signing.RequestDepositSweepSignature(ctx, *leg.DepositDerivationIndex, pb.digest, estimatedUSD, idemKey)
-	if err != nil {
-		return fmt.Errorf("requesting refund signature: %w", err)
-	}
-	switch sigReq.Status {
-	case "PENDING":
-		slog.Info("orchestrate: refund signature still pending approval, resuming next tick", "external_id", leg.ExternalID)
-		return nil
-	case "REJECTED":
-		o.mu.Lock()
-		delete(o.pendingRefundEVM, leg.ExternalID)
-		o.mu.Unlock()
-		return fmt.Errorf("refund signature request was rejected")
-	case "SIGNED":
-		// fall through to broadcast
-	default:
-		return fmt.Errorf("unexpected signing status %q", sigReq.Status)
-	}
-
-	signed, err := evmtx.WithSignature(pb.unsignedTx, sigReq.SignedTx)
-	if err != nil {
-		return fmt.Errorf("applying signature: %w", err)
-	}
-	intent := transferIntent{sender: leg.DepositAddress, recipient: *order.SenderAddress, amount: leg.AmountIn}
-	if err := o.preflightRefundEVM(ctx, leg, signed, intent); err != nil {
-		return err
-	}
-	txHash, err := o.EVMChain.Broadcast(ctx, signed)
-	if err != nil {
-		return fmt.Errorf("broadcasting refund: %w", err)
-	}
-
-	// Do NOT mark refunded yet -- cache the hash and verify its real
-	// execution receipt on the next tick via
-	// checkRefundEVMExecutionAndFinish before ever calling MarkRefunded.
-	// See advanceForwardingOneBEP20's own identical pattern.
-	pb.broadcastTxHash = txHash
-	o.mu.Lock()
-	o.pendingRefundEVM[leg.ExternalID] = pb
-	o.mu.Unlock()
-	slog.Info("orchestrate: refund transfer broadcast, awaiting on-chain execution result", "external_id", leg.ExternalID, "bsc_tx_hash", txHash)
-	return nil
-}
-
-// checkRefundEVMExecutionAndFinish is checkForwardEVMExecutionAndFinish's
-// own refund-direction sibling (advanceRefundPendingOneBEP20's early-return
-// path) -- see that function's own doc comment for the shared reasoning.
-func (o *Orchestrator) checkRefundEVMExecutionAndFinish(ctx context.Context, leg relay.Leg, txHash string) error {
-	final, err := o.EVMFinality.IsFinal(ctx, txHash)
-	if err != nil {
-		if !errors.Is(err, evmbroadcast.ErrReverted) {
-			// A transient error checking status, not a confirmed on-chain
-			// outcome -- see checkForwardEVMExecutionAndFinish's own
-			// identical handling and evmbroadcast.ErrReverted's own doc
-			// comment for why this must not be treated as a confirmed
-			// failure.
-			return fmt.Errorf("checking refund transfer execution result: %w", err)
-		}
-		detail := fmt.Sprintf("leg %s: refund transfer bsc_tx_hash=%s was broadcast and mined but its execution FAILED: %s -- "+
-			"funds were NOT moved; clearing cached state to rebuild and retry with a fresh nonce/gas price",
-			leg.ExternalID, txHash, err)
-		if alertErr := o.Alert.Fire(ctx, alert.Alert{
-			Severity: alert.SeverityCritical, ExternalID: leg.ExternalID,
-			Reason: "relay_leg_refund_execution_failed", Detail: detail,
-		}); alertErr != nil {
-			slog.Error("orchestrate: firing the refund-execution-failed alert itself failed", "external_id", leg.ExternalID, "error", alertErr)
-		}
-		o.mu.Lock()
-		delete(o.pendingRefundEVM, leg.ExternalID)
-		o.mu.Unlock()
-		return fmt.Errorf("%s", detail)
-	}
-	if !final {
-		slog.Info("orchestrate: refund transfer broadcast but not yet final, resuming next tick", "external_id", leg.ExternalID, "bsc_tx_hash", txHash)
-		return nil
-	}
-
-	if err := o.Store.MarkRefunded(ctx, leg.ExternalID, txHash); err != nil {
-		return fmt.Errorf("marking refunded: %w", err)
-	}
-	o.mu.Lock()
-	delete(o.pendingRefundEVM, leg.ExternalID)
-	o.mu.Unlock()
-	slog.Info("orchestrate: relay leg refunded", "external_id", leg.ExternalID, "bsc_tx_hash", txHash)
+	slog.Info("orchestrate: relay leg refunded", "external_id", leg.ExternalID, "tx_hash", *done.TxHash)
 	return nil
 }

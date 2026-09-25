@@ -2,8 +2,9 @@
 // logic -- the direct sibling of dispatcher/internal/orchestrate, but
 // for a zero-float relay leg rather than a pre-funded payout. Mirrors
 // that package's own two-independent-phases-per-tick shape (RunLoop/
-// RunTick, per-row error isolation, an in-memory unsigned-tx cache with
-// the same documented not-crash-safe limitation).
+// RunTick, per-row error isolation). Unlike that package, every on-chain
+// transfer is recorded in internal/transfers before it is signed and
+// sent, so a restart resumes it instead of forgetting it (transfer.go).
 //
 // # The ledger entries this package posts -- a real design decision,
 // not fully specified by docs/02-architecture/model-f-relay-architecture.md
@@ -50,8 +51,12 @@ import (
 	"relayd/internal/energy"
 	"relayd/internal/ledgerclient"
 	"relayd/internal/money"
+	"relayd/internal/pricing"
 	"relayd/internal/relay"
 	"relayd/internal/signing"
+	"relayd/internal/sweeps"
+	"relayd/internal/transfers"
+	"relayd/internal/tronbroadcast"
 	"relayd/internal/txbuild"
 	"relayd/internal/upstream"
 	"relayd/internal/watcherclient"
@@ -68,6 +73,9 @@ type LedgerClient interface {
 	GetOrder(ctx context.Context, externalID string) (ledgerclient.Order, error)
 	EnsureAccount(ctx context.Context, code string, accountType ledgerclient.AccountType, asset string, idempotencyKey string) error
 	TransitionWithEntry(ctx context.Context, externalID, toState string, expectedVersion int32, reason, entryType string, occurredAt time.Time, lines []ledgerclient.EntryLine, idempotencyKey string) (ledgerclient.Order, error)
+	AccountBalance(ctx context.Context, code string) (money.Amount, error)
+	Transition(ctx context.Context, externalID, toState string, expectedVersion int32, reason string, occurredAt time.Time, idempotencyKey string) (ledgerclient.Order, error)
+	PostEntry(ctx context.Context, entryType string, occurredAt time.Time, lines []ledgerclient.EntryLine, metadata map[string]any, idempotencyKey string) (int64, error)
 }
 
 // EnergyClient is the narrow slice of *energy.Client this package needs.
@@ -113,6 +121,15 @@ type DepositAddressLookup interface {
 type TRC20Broadcaster interface {
 	CurrentBlockReference(ctx context.Context) (txbuild.BlockReference, error)
 	BroadcastSigned(ctx context.Context, unsignedTx []byte, signature [65]byte) (txid string, err error)
+	// TokenBalance is holder's USDT-TRC20 balance in raw on-chain units --
+	// checked before any transfer is built, so relayd never signs one
+	// the sender can't pay.
+	TokenBalance(ctx context.Context, holder string) (*big.Int, error)
+	// AccountResources is holder's activation, energy, bandwidth, and TRX.
+	AccountResources(ctx context.Context, holder string) (tronbroadcast.Resources, error)
+	// EstimateTransferEnergy is the exact energy a USDT transfer of raw
+	// units from from to to would use, simulated on the node.
+	EstimateTransferEnergy(ctx context.Context, from, to string, raw *big.Int) (int64, error)
 }
 
 // TRC20FinalityChecker checks TRC20 forward-transfer finality AND
@@ -141,6 +158,17 @@ type EVMBroadcaster interface {
 	CurrentNonce(ctx context.Context, address string) (uint64, error)
 	SuggestGasPrice(ctx context.Context) (*big.Int, error)
 	Broadcast(ctx context.Context, signed *types.Transaction) (txHash string, err error)
+	// ConfirmedNonce is address's nonce as of the latest block (mined
+	// transactions only) -- once it passes a sent transaction's nonce,
+	// that nonce has been used.
+	ConfirmedNonce(ctx context.Context, address string) (uint64, error)
+	// TransactionMined reports whether txHash has a receipt at all
+	// (successful or reverted), final or not.
+	TransactionMined(ctx context.Context, txHash string) (bool, error)
+	// TokenBalance is holder's USDT-BEP20 balance in raw on-chain units.
+	TokenBalance(ctx context.Context, holder string) (*big.Int, error)
+	// NativeBalance is holder's BNB balance in wei -- what pays its gas.
+	NativeBalance(ctx context.Context, holder string) (*big.Int, error)
 }
 
 // EVMFinalityChecker checks BEP20 forward-transfer finality.
@@ -204,6 +232,24 @@ type Config struct {
 	// automatic action -- see reconcile.go's own doc comment for exactly
 	// which statuses and why.
 	StaleLegAlertAfter time.Duration
+
+	// DepositGrace is how long past a leg's deposit deadline relayd waits
+	// before expiring it unpaid and releasing its wallet (a customer's
+	// payment can be slow to confirm). Zero disables expiry.
+	DepositGrace time.Duration
+
+	// GasTopUpWei / TRXTopUpSun are the least a treasury top-up sends to a
+	// deposit wallet short of BNB (gas) or TRX (activation, bandwidth).
+	// Zero uses the defaults (0.0005 BNB, 2 TRX).
+	GasTopUpWei int64
+	TRXTopUpSun int64
+
+	// SweepToBSC / SweepToTRON are where swept profit goes on each chain.
+	// Empty means the treasury slot's own address (SlotEVMAddress /
+	// SlotAddress). Set from the environment only, never through the admin
+	// API: redirecting profit must take access to the server itself.
+	SweepToBSC  string
+	SweepToTRON string
 }
 
 // Orchestrator bundles every dependency RunTick needs.
@@ -228,62 +274,22 @@ type Orchestrator struct {
 	// advanceForwardingOneTRC20's own identical defense-in-depth
 	// cross-check.
 	TronDepositWatcher DepositAddressLookup
-	Cfg                Config
+	// Transfers is the durable record of every forward and refund
+	// transaction -- see internal/transfers. Nothing about an in-flight
+	// transfer lives only in memory.
+	Transfers *transfers.Store
+	// Pricing is the admin-managed pricing, used for a leg created before
+	// legs snapshotted their own pricing (see pricingFor). Optional.
+	Pricing *pricing.Store
+	// Sweeps records the profit in each deposit wallet and its sweeps to
+	// the treasury (sweep.go). Optional: nil disables sweeping.
+	Sweeps *sweeps.Store
+	Cfg    Config
 
 	mu               sync.Mutex
-	pending          map[string]pendingForward    // externalID -> cached unsigned TRC20 forward tx
-	pendingEVM       map[string]pendingEVMForward // externalID -> cached unsigned BEP20 forward tx
-	pendingRefund    map[string]pendingForward    // externalID -> cached unsigned TRC20 refund tx
-	pendingRefundEVM map[string]pendingEVMForward // externalID -> cached unsigned BEP20 refund tx
-	preflightAlerted map[string]string            // externalID -> last pre-broadcast failure already alerted on
-}
-
-// pendingForward caches a TRC20 forward leg's unsigned bytes across
-// ticks -- BlockReference is not deterministic, so this cannot simply
-// be rebuilt from persisted inputs. Not persisted across a process
-// restart: the same accepted, documented limitation
-// dispatcher/internal/orchestrate's own Orchestrator.pending carries
-// (see that package's own doc comment on dispatchOne). pendingEVM
-// carries the identical limitation for the BEP20 direction, for the
-// identical reason (nonce/gas price are resolved live, not
-// deterministic from persisted inputs alone).
-//
-// broadcastTxID is set the tick a broadcast actually happens, BEFORE the
-// leg is marked forwarded -- advanceForwardingOneTRC20 (and its refund-
-// direction sibling) check this field first: empty means "not yet
-// broadcast, build/sign/broadcast this tick," non-empty means "broadcast
-// already happened, check ITS OWN execution result via
-// TRC20FinalityChecker.CheckExecution before doing anything else." A
-// leg is marked forwarded only once that check reports success -- never
-// on the mere fact that BroadcastSigned itself returned no error, which
-// only means the network ACCEPTED the transaction into a block, not that
-// it executed successfully (confirmed live: a real, accepted broadcast
-// still failed on-chain with "OUT_OF_ENERGY", moving zero funds).
-type pendingForward struct {
-	unsignedTx    []byte
-	broadcastTxID string
-}
-
-// pendingEVMForward is pendingForward's own BEP20-direction analogue --
-// the digest is cached alongside the unsigned transaction rather than
-// recomputed from it every tick (evmtx.BuildTransfer is pure/deterministic
-// so recomputing would also be correct, but caching is cheaper and avoids
-// a second, redundant construction call on every tick a signature stays
-// PENDING).
-//
-// broadcastTxHash mirrors pendingForward's own broadcastTxID -- set the
-// tick a broadcast actually happens, checked via EVMFinalityChecker.IsFinal
-// (which already distinguishes "not yet mined" from "reverted," unlike
-// TRC20FinalityChecker before it gained CheckExecution) before the leg is
-// ever marked forwarded. A BSC transaction can be mined and still revert
-// (e.g. insufficient gas at execution time), the exact same real risk
-// class TRC20's own OUT_OF_ENERGY incident confirmed live -- a successful
-// Broadcast call only means the node accepted the raw transaction, never
-// that its own execution succeeded.
-type pendingEVMForward struct {
-	unsignedTx      *types.Transaction
-	digest          [32]byte
-	broadcastTxHash string
+	preflightAlerted map[string]string // externalID|reason -> last detail already alerted on
+	lastSweepScan    time.Time
+	releaseRetryAt   map[string]time.Time // externalID -> when its failed wallet release may be retried
 }
 
 // New wires an Orchestrator.
@@ -295,11 +301,9 @@ func New(store *relay.Store, ledger LedgerClient, up upstream.SwapProvider, ener
 		Store: store, Ledger: ledger, Upstream: up, Energy: energyClient, Signing: signer,
 		Chain: chain, Finality: finality, EVMChain: evmChain, EVMFinality: evmFinality, Alert: alerter,
 		BEP20DepositWatcher: bep20DepositWatcher, TronDepositWatcher: tronDepositWatcher, Cfg: cfg,
-		pending:          make(map[string]pendingForward),
-		pendingEVM:       make(map[string]pendingEVMForward),
-		pendingRefund:    make(map[string]pendingForward),
-		pendingRefundEVM: make(map[string]pendingEVMForward),
+		Transfers:        transfers.NewStore(store.DB()),
 		preflightAlerted: make(map[string]string),
+		releaseRetryAt:   make(map[string]time.Time),
 	}
 }
 

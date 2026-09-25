@@ -13,6 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	tronaddress "github.com/fbsobreira/gotron-sdk/pkg/address"
 
 	"relayd/internal/alert"
 	"relayd/internal/evmtx"
@@ -158,6 +159,34 @@ func TestCheckTRONTransfer_AcceptsAMatchingTransferAndCatchesMismatches(t *testi
 		if err := checkTRONTransfer(unsigned, intent); err == nil {
 			t.Errorf("wrong %s: expected a mismatch, got nil", name)
 		}
+	}
+}
+
+func TestCheckTRONSigner_AcceptsTheHoldingKeyAndCatchesAnyOther(t *testing.T) {
+	holder, other := mustKey(t), mustKey(t)
+	sender := tronaddress.PubkeyToAddress(holder.PublicKey).String()
+	digest := txbuild.Digest(buildTRON(t, sender, customerTRON, trc20(1_630000)))
+
+	sign := func(key *ecdsa.PrivateKey) [65]byte {
+		raw, err := crypto.Sign(digest[:], key)
+		if err != nil {
+			t.Fatalf("crypto.Sign: %v", err)
+		}
+		var sig [65]byte
+		copy(sig[:], raw)
+		return sig
+	}
+
+	if err := checkTRONSigner(digest, sign(holder), sender); err != nil {
+		t.Fatalf("expected the holding key's signature to pass, got %v", err)
+	}
+	withLegacyV := sign(holder)
+	withLegacyV[64] += 27
+	if err := checkTRONSigner(digest, withLegacyV, sender); err != nil {
+		t.Fatalf("expected a 27/28-style recovery byte to pass too, got %v", err)
+	}
+	if err := checkTRONSigner(digest, sign(other), sender); err == nil || !strings.Contains(err.Error(), "signed by") {
+		t.Fatalf("expected a signature from another key to be caught, got %v", err)
 	}
 }
 

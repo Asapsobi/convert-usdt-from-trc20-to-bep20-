@@ -426,9 +426,9 @@ func statusFromSideShift(status string) SwapStatus {
 		return StatusSending
 	case "settled":
 		return StatusComplete
-	case "refund", "refunding", "expired", "review", "multiple":
+	case "refund", "refunding", "expired", "multiple":
 		return StatusFailed
-	default:
-		return StatusFailed
+	default: // "review", or a status this code doesn't know
+		return StatusNeedsAttention
 	}
 }

@@ -39,7 +39,7 @@ func (o *Orchestrator) advanceForwardedOne(ctx context.Context, leg relay.Leg) e
 		return fmt.Errorf("leg has no upstream_order_id recorded")
 	}
 
-	upstreamOrder, err := o.Upstream.GetOrder(ctx, *leg.UpstreamOrderID)
+	upstreamOrder, err := o.vendorOrder(ctx, leg)
 	if err != nil {
 		return fmt.Errorf("checking upstream order status: %w", err)
 	}
@@ -63,6 +63,12 @@ func (o *Orchestrator) advanceForwardedOne(ctx context.Context, leg relay.Leg) e
 		// items". Revisit once a real vendor's actual EXPIRED behavior is
 		// known.
 		return o.handleUnrecoverable(ctx, leg, upstreamOrder.Status)
+	case upstream.StatusNeedsAttention:
+		o.alertOnce(ctx, leg.ExternalID, "relay_leg_vendor_needs_attention", alert.SeverityCritical,
+			fmt.Sprintf("relay leg %s: vendor %s paused order %s for a human decision (e.g. FixedFloat EMERGENCY) -- "+
+				"resolve it with the vendor (continue the exchange, or refund); relayd keeps following the order",
+				leg.ExternalID, valueOrEmpty(leg.UpstreamProviderName), valueOrEmpty(leg.UpstreamOrderID)))
+		return nil
 	default:
 		return nil // still in flight upstream -- check again next tick
 	}
@@ -83,11 +89,13 @@ func (o *Orchestrator) advanceForwardedOne(ctx context.Context, leg relay.Leg) e
 		return fmt.Errorf("order is in state %q, not dispatching -- cannot settle", order.State)
 	}
 
-	inAsset := string(order.AmountIn.Asset)
-	customerAccount := customerAccountCode(order.CustomerID, order.AmountIn.Asset)
+	received := receivedFor(leg, order)
+	profit := profitFor(leg, order)
+	inAsset := string(received.Asset)
+	customerAccount := customerAccountCode(order.CustomerID, received.Asset)
 	forwardingAccount := relayLegForwardingAccountCode(leg.OrderID)
-	commissionWalletAccount := commissionWalletAccountCode(order.AmountIn.Asset)
-	commissionAccount := commissionAccountCode(order.AmountIn.Asset)
+	commissionWalletAccount := commissionWalletAccountCode(received.Asset)
+	commissionAccount := commissionAccountCode(received.Asset)
 
 	if err := o.Ledger.EnsureAccount(ctx, customerAccount, ledgerclient.AccountLiability, inAsset, "relayd:ensure-account:"+customerAccount); err != nil {
 		return fmt.Errorf("ensuring %s exists: %w", customerAccount, err)
@@ -116,21 +124,24 @@ func (o *Orchestrator) advanceForwardedOne(ctx context.Context, leg relay.Leg) e
 	// (it didn't, on the first version of this entry: 300000 units of
 	// commission sat there forever, invisible to any test that doesn't
 	// check the real post-settle balance against a real ledgerd).
-	negAmountIn, err := order.AmountIn.Neg()
+	negReceived, err := received.Neg()
 	if err != nil {
-		return fmt.Errorf("negating amount_in: %w", err)
+		return fmt.Errorf("negating the received amount: %w", err)
 	}
-	negFee, err := order.FeeUnits.Neg()
+	negProfit, err := profit.Neg()
 	if err != nil {
-		return fmt.Errorf("negating fee_units: %w", err)
+		return fmt.Errorf("negating the profit: %w", err)
 	}
 
 	idemKey := "relayd:settle:" + leg.ExternalID
 	lines := []ledgerclient.EntryLine{
-		{AccountCode: customerAccount, Asset: inAsset, Amount: order.AmountIn},
-		{AccountCode: forwardingAccount, Asset: inAsset, Amount: negAmountIn},
-		{AccountCode: commissionWalletAccount, Asset: inAsset, Amount: order.FeeUnits},
-		{AccountCode: commissionAccount, Asset: inAsset, Amount: negFee},
+		{AccountCode: customerAccount, Asset: inAsset, Amount: received},
+		{AccountCode: forwardingAccount, Asset: inAsset, Amount: negReceived},
+	}
+	if profit.Units > 0 {
+		lines = append(lines,
+			ledgerclient.EntryLine{AccountCode: commissionWalletAccount, Asset: inAsset, Amount: profit},
+			ledgerclient.EntryLine{AccountCode: commissionAccount, Asset: inAsset, Amount: negProfit})
 	}
 	if _, err := o.Ledger.TransitionWithEntry(ctx, leg.ExternalID, "settled", order.Version,
 		"relay_settle", "relay_settle", time.Now().UTC(), lines, idemKey); err != nil {
@@ -140,7 +151,13 @@ func (o *Orchestrator) advanceForwardedOne(ctx context.Context, leg relay.Leg) e
 	if err := o.Store.MarkSettled(ctx, leg.ExternalID, *upstreamOrder.AmountOutActual); err != nil {
 		return fmt.Errorf("marking settled: %w", err)
 	}
-	slog.Info("orchestrate: relay leg settled", "external_id", leg.ExternalID)
+	if leg.ForwardAmount != nil {
+		if err := o.Store.RecordVendorFee(ctx, leg.ExternalID, leg.ForwardAmount.Units-upstreamOrder.AmountOutActual.Units); err != nil {
+			slog.Error("orchestrate: recording the actual vendor fee failed", "external_id", leg.ExternalID, "error", err)
+		}
+	}
+	slog.Info("orchestrate: relay leg settled", "external_id", leg.ExternalID,
+		"received", fmtAmount(received), "our_profit", fmtAmount(profit), "customer_received", fmtAmount(*upstreamOrder.AmountOutActual))
 	return nil
 }
 

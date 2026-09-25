@@ -205,3 +205,63 @@ func DecodeTransfer(unsignedTx []byte) (DecodedTransfer, error) {
 func Digest(unsignedTx []byte) [32]byte {
 	return sha256.Sum256(unsignedTx)
 }
+
+// BuildTRXTransfer constructs an unsigned transfer of sun TRX from
+// fromAddress to recipientAddress -- the treasury activating a new TRON
+// deposit wallet (the first TRX an address receives creates its account)
+// and funding the TRX its bandwidth burns.
+func BuildTRXTransfer(fromAddress, recipientAddress string, sun int64, ref BlockReference) ([]byte, error) {
+	owner, err := address.Base58ToAddress(fromAddress)
+	if err != nil {
+		return nil, fmt.Errorf("%w: fromAddress %q: %v", ErrInvalidAddress, fromAddress, err)
+	}
+	to, err := address.Base58ToAddress(recipientAddress)
+	if err != nil {
+		return nil, fmt.Errorf("%w: recipientAddress %q: %v", ErrInvalidAddress, recipientAddress, err)
+	}
+	if sun <= 0 {
+		return nil, fmt.Errorf("%w: got %d sun", ErrNonPositiveAmount, sun)
+	}
+	parameter, err := anypb.New(&core.TransferContract{OwnerAddress: owner.Bytes(), ToAddress: to.Bytes(), Amount: sun})
+	if err != nil {
+		return nil, fmt.Errorf("txbuild: wrapping TransferContract: %w", err)
+	}
+	raw := &core.TransactionRaw{
+		RefBlockBytes: []byte{byte(ref.BlockNumber >> 8), byte(ref.BlockNumber)},
+		RefBlockHash:  ref.BlockHash[8:16],
+		Expiration:    ref.Expiration.UnixMilli(),
+		Contract:      []*core.Transaction_Contract{{Type: core.Transaction_Contract_TransferContract, Parameter: parameter}},
+		Timestamp:     ref.Timestamp.UnixMilli(),
+	}
+	out, err := proto.Marshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("txbuild: marshaling raw_data: %w", err)
+	}
+	return out, nil
+}
+
+// DecodedTRXTransfer is what an unsigned TRX transfer actually does.
+type DecodedTRXTransfer struct {
+	Owner     string
+	Recipient string
+	Sun       int64
+}
+
+// DecodeTRXTransfer reads back an unsigned transaction and refuses
+// anything but exactly one plain TRX transfer.
+func DecodeTRXTransfer(unsignedTx []byte) (DecodedTRXTransfer, error) {
+	raw := &core.TransactionRaw{}
+	if err := proto.Unmarshal(unsignedTx, raw); err != nil {
+		return DecodedTRXTransfer{}, fmt.Errorf("%w: unmarshaling raw_data: %v", ErrNotATransfer, err)
+	}
+	if len(raw.Contract) != 1 || raw.Contract[0].Type != core.Transaction_Contract_TransferContract {
+		return DecodedTRXTransfer{}, fmt.Errorf("%w: want exactly one TransferContract", ErrNotATransfer)
+	}
+	var tc core.TransferContract
+	if err := raw.Contract[0].Parameter.UnmarshalTo(&tc); err != nil {
+		return DecodedTRXTransfer{}, fmt.Errorf("%w: unwrapping TransferContract: %v", ErrNotATransfer, err)
+	}
+	return DecodedTRXTransfer{
+		Owner: address.Address(tc.OwnerAddress).String(), Recipient: address.Address(tc.ToAddress).String(), Sun: tc.Amount,
+	}, nil
+}

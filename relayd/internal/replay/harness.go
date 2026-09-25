@@ -19,6 +19,7 @@ import (
 	"relayd/internal/orchestrate"
 	"relayd/internal/relay"
 	"relayd/internal/signing"
+	"relayd/internal/tronbroadcast"
 	"relayd/internal/txbuild"
 	"relayd/internal/upstream"
 	"relayd/internal/watcherclient"
@@ -120,7 +121,24 @@ func (f *fakeChain) BroadcastSigned(ctx context.Context, unsignedTx []byte, sign
 	f.broadcasts++
 	f.mu.Unlock()
 	digest := txbuild.Digest(unsignedTx)
-	return fmt.Sprintf("%x", digest[:8]), nil
+	return fmt.Sprintf("%x", digest[:]), nil
+}
+
+// TokenBalance reports plenty of USDT for every holder -- balance
+// shortfalls are exercised by tests that configure them explicitly.
+func (f *fakeChain) TokenBalance(ctx context.Context, holder string) (*big.Int, error) {
+	return new(big.Int).Exp(big.NewInt(10), big.NewInt(30), nil), nil
+}
+
+// AccountResources reports an activated account with plenty of energy,
+// bandwidth, and TRX -- resource shortfalls are exercised by tests that
+// configure them explicitly.
+func (f *fakeChain) AccountResources(ctx context.Context, holder string) (tronbroadcast.Resources, error) {
+	return tronbroadcast.Resources{Exists: true, Energy: 1_000_000_000, Bandwidth: 1_000_000, BalanceSun: 1_000_000_000}, nil
+}
+
+func (f *fakeChain) EstimateTransferEnergy(ctx context.Context, from, to string, raw *big.Int) (int64, error) {
+	return 64_285, nil
 }
 
 // fakeFinality always reports a broadcast TRC20 transfer as final and
@@ -160,6 +178,27 @@ func (f *fakeEVMChain) Broadcast(ctx context.Context, signed *gethtypes.Transact
 	f.nonce++
 	f.mu.Unlock()
 	return signed.Hash().Hex(), nil
+}
+
+// ConfirmedNonce never passes a sent transaction's nonce, so nothing is
+// ever treated as dropped unless a test says so.
+func (f *fakeEVMChain) ConfirmedNonce(ctx context.Context, address string) (uint64, error) {
+	return 0, nil
+}
+
+func (f *fakeEVMChain) TransactionMined(ctx context.Context, txHash string) (bool, error) {
+	return true, nil
+}
+
+// TokenBalance and NativeBalance report plenty of USDT and BNB for every
+// holder -- balance shortfalls are exercised by tests that configure them
+// explicitly.
+func (f *fakeEVMChain) TokenBalance(ctx context.Context, holder string) (*big.Int, error) {
+	return new(big.Int).Exp(big.NewInt(10), big.NewInt(30), nil), nil
+}
+
+func (f *fakeEVMChain) NativeBalance(ctx context.Context, holder string) (*big.Int, error) {
+	return new(big.Int).Exp(big.NewInt(10), big.NewInt(30), nil), nil
 }
 
 // fakeAlerter captures every alert fired -- the harness's own record,

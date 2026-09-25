@@ -311,9 +311,9 @@ type changeNowStatusResponse struct {
 // public sources use both interchangeably for the pre-deposit state;
 // "verifying" (an occasional manual-review step some vendors insert)
 // maps to Confirming, the closest existing SwapStatus for "still in
-// progress, not yet actionable." "refunded" maps to Failed, the same
-// posture FixedFloat's own EMERGENCY status uses -- settle.go's own
-// UNRECOVERABLE escalation is the correct outcome either way. Verify
+// progress, not yet actionable." "refunded" maps to Failed -- settle.go's
+// own UNRECOVERABLE escalation. A status this code doesn't know is
+// StatusNeedsAttention (alerted, still followed), never a failure. Verify
 // this mapping against a real GET /transactions/{id}/{api_key}
 // response before trusting it in production.
 func statusFromChangeNow(status string) SwapStatus {
@@ -331,7 +331,7 @@ func statusFromChangeNow(status string) SwapStatus {
 	case "failed", "refunded":
 		return StatusFailed
 	default:
-		return StatusFailed
+		return StatusNeedsAttention
 	}
 }
 

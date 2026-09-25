@@ -49,6 +49,14 @@ func run() error {
 	}
 	defer pool.Close()
 
+	// Exactly one relayd may drive this database: two would each sign and
+	// broadcast the same transfers.
+	lock, err := db.AcquireInstanceLock(ctx, pool, "relayd", 30*time.Second)
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+
 	d, orch, err := buildDriverAndOrchestrator(ctx, pool)
 	if err != nil {
 		return err
@@ -68,7 +76,16 @@ func run() error {
 	}()
 	slog.Info("relayd: orchestrate loop started", "interval", interval)
 
-	server := &httpapi.Server{Driver: d, BuildInfo: buildInfo}
+	admin, err := adminFromEnv(d, orch)
+	if err != nil {
+		return err
+	}
+	trustProxy := os.Getenv("RELAYD_TRUST_PROXY") == "true"
+	server := &httpapi.Server{
+		Driver: d, BuildInfo: buildInfo, Admin: admin,
+		QuoteLimit: &httpapi.RateLimit{PerMinute: 30, Burst: 10, TrustProxy: trustProxy},
+		OrderLimit: &httpapi.RateLimit{PerMinute: 3, Burst: 5, TrustProxy: trustProxy},
+	}
 	router := httpapi.NewRouter(server)
 
 	srv := &http.Server{Addr: listenAddr(), Handler: router}
@@ -86,6 +103,8 @@ func run() error {
 		slog.Info("shutdown signal received")
 	case err := <-serveErr:
 		return err
+	case <-lock.Lost():
+		return errors.New("relayd: lost the instance lock -- exiting so a second instance never runs alongside this one")
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
