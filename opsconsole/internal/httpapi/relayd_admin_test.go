@@ -27,18 +27,27 @@ func TestRelaydAdminPagesRender(t *testing.T) {
 		t.Fatal(err)
 	}
 	leg := opclient.RelayLeg{ExternalID: "relay-web-1", Status: "SETTLED", AmountIn: "100", AmountOutExpected: "99", AmountOutActual: str("98.9"),
-		ReceivedAmount: str("100"), ProfitAmount: str("0.25"), ForwardAmount: str("99.75"), VendorFeeAmount: str("0.85"), CustomerLabel: str("alice")}
+		ReceivedAmount: str("100"), ProfitAmount: str("0.25"), ForwardAmount: str("99.75"), VendorFeeAmount: str("0.85"), CustomerLabel: str("alice"),
+		PayoutTxID: str("0xpayout")}
 
 	for name, data := range map[string]any{
-		"relayd_pricing": relaydPricingData{Pricing: &opclient.Pricing{ProfitBPS: 25, MinProfit: "0", MinAmountIn: "5", MaxAmountIn: "10000"}},
+		"relayd_pricing": relaydPricingData{Pricing: &opclient.Pricing{ProfitBPS: 25, MinProfit: "0", MinAmountIn: "5", MaxAmountIn: "10000"},
+			DirectionRows: []directionRow{{Key: "TRC20_TO_BEP20", Label: "TRON → BSC", ProfitBPS: "40", MinProfit: "1.5"}, {Key: "BEP20_TO_TRC20", Label: "BSC → TRON"}}},
 		"relayd_vendors": relaydVendorsData{View: opclient.Vendors{
 			Vendors:    []opclient.Vendor{{Service: "conversion", Name: "fixedfloat", Enabled: true, Available: false, LastError: str("timeout")}},
 			Strategies: map[string]string{"conversion": "best_rate", "energy": "cheapest"},
 		}},
 		"relayd_sweeps": relaydSweepsData{
 			Settings: &opclient.SweepSettings{Enabled: true, IntervalMinutes: 60, MinAmount: map[string]string{"USDT_BEP20": "10", "USDT_TRC20": "50"}},
-			Wallets:  opclient.ProfitWallets{Wallets: []opclient.ProfitWallet{{Chain: "TRON", Address: "TX", Legs: 3, Unswept: "0.75", Busy: true}}, UnsweptTotals: map[string]string{"USDT_TRC20": "0.75"}},
-			Sweeps:   []opclient.Sweep{{ID: 1, Chain: "BSC", Amount: "12", Status: "FAILED", Error: str("gas"), Costs: &costs}},
+			Wallets: opclient.ProfitWallets{Wallets: []opclient.ProfitWallet{
+				{Chain: "TRON", Address: "TX", Legs: 3, Unswept: "0.75", Busy: true, OnChain: &opclient.WalletBalance{USDT: "0.75", Native: "2.1", NativeFor: "TRX"}},
+				{Chain: "BSC", Address: "0xA", Legs: 1, Unswept: "0", OnChain: &opclient.WalletBalance{Error: "403"}},
+			}, UnsweptTotals: map[string]string{"USDT_TRC20": "0.75"}},
+			Treasury: map[string]opclient.TreasuryChain{
+				"bsc":  {Treasury: "0xT", SweepTo: "0xT", Balance: &opclient.WalletBalance{USDT: "12", Native: "0.05", NativeFor: "BNB"}},
+				"tron": {Treasury: "TT", SweepTo: "TCold", Balance: &opclient.WalletBalance{Error: "unreachable"}},
+			},
+			Sweeps: []opclient.Sweep{{ID: 1, Chain: "BSC", Amount: "12", Status: "FAILED", Error: str("gas"), Costs: &costs}},
 		},
 		"relayd_pool": relaydPoolData{Chain: "bsc", ChainName: "BSC", Settings: &opclient.PoolSettings{MaxWallets: 10, CooldownAfterUse: "30m0s"}, Wallets: pool},
 		"relayd_leg":  relaydLegData{ExternalID: "relay-web-1", Detail: &opclient.LegDetail{Leg: leg, Costs: costs}},

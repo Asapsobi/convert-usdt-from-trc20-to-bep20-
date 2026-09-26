@@ -58,6 +58,7 @@ type RelayLeg struct {
 	ProfitAmount    *string `json:"profit_amount,omitempty"`
 	ForwardAmount   *string `json:"forward_amount,omitempty"`
 	VendorFeeAmount *string `json:"vendor_fee_amount,omitempty"`
+	PayoutTxID      *string `json:"payout_tx_id,omitempty"`
 }
 
 // ListRelayLegs calls relayd's own GET /v1/relay-legs?status=. An empty

@@ -55,6 +55,17 @@ Each order keeps the pricing it was quoted under -- a change applies to new orde
   <label>Minimum profit per order (USDT)</label><input type="text" name="min_profit" value="{{ .MinProfit }}">
   <label>Smallest deposit accepted (USDT) -- smaller deposits are refunded</label><input type="text" name="min_amount_in" value="{{ .MinAmountIn }}">
   <label>Largest deposit accepted (USDT)</label><input type="text" name="max_amount_in" value="{{ .MaxAmountIn }}">
+  <h3>Per direction (optional)</h3>
+  <p>Leave empty to use the default above. Sending from a TRON deposit wallet rents energy (around 1 USD per order), so
+  TRON &rarr; BSC usually needs a higher margin or minimum than BSC &rarr; TRON.</p>
+  <table>
+  <tr><th>Direction</th><th>Profit (bps)</th><th>Minimum profit (USDT)</th></tr>
+  {{ range $.DirectionRows }}
+  <tr><td>{{ .Label }}</td>
+    <td><input type="number" name="{{ .Key }}_profit_bps" min="0" max="9999" value="{{ .ProfitBPS }}"></td>
+    <td><input type="text" name="{{ .Key }}_min_profit" value="{{ .MinProfit }}"></td></tr>
+  {{ end }}
+  </table>
   <p><button type="submit">Save pricing</button></p>
 </form>
 {{ end }}
@@ -62,7 +73,16 @@ Each order keeps the pricing it was quoted under -- a change applies to new orde
 
 type relaydPricingData struct {
 	flashData
-	Pricing *opclient.Pricing
+	Pricing       *opclient.Pricing
+	DirectionRows []directionRow
+}
+
+type directionRow struct {
+	Key, Label, ProfitBPS, MinProfit string
+}
+
+var pricingDirections = []struct{ Key, Label string }{
+	{"TRC20_TO_BEP20", "TRON → BSC"}, {"BEP20_TO_TRC20", "BSC → TRON"},
 }
 
 func (s *Server) getRelaydPricing(w http.ResponseWriter, r *http.Request) {
@@ -73,6 +93,13 @@ func (s *Server) getRelaydPricing(w http.ResponseWriter, r *http.Request) {
 		data.Err = err.Error()
 	} else {
 		data.Pricing = &p
+		for _, d := range pricingDirections {
+			row := directionRow{Key: d.Key, Label: d.Label}
+			if m, ok := p.Directions[d.Key]; ok {
+				row.ProfitBPS, row.MinProfit = strconv.FormatInt(m.ProfitBPS, 10), m.MinProfit
+			}
+			data.DirectionRows = append(data.DirectionRows, row)
+		}
 	}
 	s.Templates.Render(w, "relayd_pricing", data)
 }
@@ -84,8 +111,22 @@ func (s *Server) postRelaydPricing(w http.ResponseWriter, r *http.Request) {
 		ProfitBPS: bps, MinProfit: strings.TrimSpace(r.FormValue("min_profit")),
 		MinAmountIn: strings.TrimSpace(r.FormValue("min_amount_in")), MaxAmountIn: strings.TrimSpace(r.FormValue("max_amount_in")),
 	}
+	for _, d := range pricingDirections {
+		rawBPS, minProfit := strings.TrimSpace(r.FormValue(d.Key+"_profit_bps")), strings.TrimSpace(r.FormValue(d.Key+"_min_profit"))
+		if rawBPS == "" && minProfit == "" {
+			continue // uses the default
+		}
+		dirBPS, _ := strconv.ParseInt(rawBPS, 10, 64)
+		if minProfit == "" {
+			minProfit = "0"
+		}
+		if p.Directions == nil {
+			p.Directions = map[string]opclient.DirectionMargin{}
+		}
+		p.Directions[d.Key] = opclient.DirectionMargin{ProfitBPS: dirBPS, MinProfit: minProfit}
+	}
 	s.relaydAction(w, r, "/relayd/pricing", "relayd.pricing.update", "pricing",
-		map[string]any{"profit_bps": p.ProfitBPS, "min_profit": p.MinProfit, "min_amount_in": p.MinAmountIn, "max_amount_in": p.MaxAmountIn},
+		map[string]any{"profit_bps": p.ProfitBPS, "min_profit": p.MinProfit, "min_amount_in": p.MinAmountIn, "max_amount_in": p.MaxAmountIn, "directions": p.Directions},
 		func() error { return s.Relayd.PutPricing(r.Context(), p) })
 }
 
@@ -167,6 +208,10 @@ func (s *Server) postRelaydVendorStrategy(w http.ResponseWriter, r *http.Request
 const relaydSweepsContent = relaydNav + `
 <h1>Profit &amp; sweeps</h1>` + flashSnippet + `
 <div class="cards">{{ range $asset, $amount := .Wallets.UnsweptTotals }}<div class="card"><b>{{ $asset }}</b><br>{{ $amount }} unswept</div>{{ end }}</div>
+<h2>Treasury</h2>
+<div class="cards">{{ range $chain, $t := .Treasury }}<div class="card"><b>{{ $chain }} treasury</b><br><small>{{ $t.Treasury }}</small><br>
+{{ with $t.Balance }}{{ if .Error }}<span class="err">{{ .Error }}</span>{{ else }}{{ .USDT }} USDT &middot; {{ .Native }} {{ .NativeFor }}{{ end }}{{ end }}
+{{ if ne $t.SweepTo $t.Treasury }}<br>sweeps go to <small>{{ $t.SweepTo }}</small>{{ end }}</div>{{ end }}</div>
 <p>Each deposit wallet keeps our profit from the orders it served. Once a wallet's profit reaches the minimum and no order is using it,
 relayd sends it to the treasury in one transfer (on TRON, renting only the energy that transfer needs). Only profit recorded on settled
 orders is ever swept -- anything else a wallet holds stays for an operator.</p>
@@ -182,9 +227,10 @@ orders is ever swept -- anything else a wallet holds stays for an operator.</p>
 <form method="post" action="/relayd/sweeps/run"><button type="submit">Check for sweeps now</button></form>
 <h2>Deposit wallets</h2>
 <table>
-<tr><th>Chain</th><th>Address</th><th>Orders</th><th>Earned</th><th>Swept</th><th>Unswept</th><th>State</th></tr>
+<tr><th>Chain</th><th>Address</th><th>Orders</th><th>Earned</th><th>Swept</th><th>Unswept</th><th>On chain now</th><th>State</th></tr>
 {{ range .Wallets.Wallets }}
 <tr><td>{{ .Chain }}</td><td>{{ .Address }}</td><td>{{ .Legs }}</td><td>{{ .Earned }}</td><td>{{ .Swept }}</td><td><b>{{ .Unswept }}</b></td>
+<td>{{ with .OnChain }}{{ if .Error }}<span class="err">unavailable</span>{{ else }}{{ .USDT }} USDT, {{ .Native }} {{ .NativeFor }}{{ end }}{{ end }}</td>
 <td>{{ if .SweepPending }}sweeping{{ else if .Busy }}in use{{ else if .LastFailedAt }}last sweep failed {{ .LastFailedAt.Format "2006-01-02 15:04" }}{{ else }}idle{{ end }}</td></tr>
 {{ end }}
 </table>
@@ -204,6 +250,7 @@ type relaydSweepsData struct {
 	Settings *opclient.SweepSettings
 	Wallets  opclient.ProfitWallets
 	Sweeps   []opclient.Sweep
+	Treasury map[string]opclient.TreasuryChain
 }
 
 func (s *Server) getRelaydSweeps(w http.ResponseWriter, r *http.Request) {
@@ -224,6 +271,9 @@ func (s *Server) getRelaydSweeps(w http.ResponseWriter, r *http.Request) {
 		errs = append(errs, err.Error())
 	}
 	if data.Sweeps, err = s.Relayd.ListSweeps(r.Context()); err != nil {
+		errs = append(errs, err.Error())
+	}
+	if data.Treasury, err = s.Relayd.GetTreasury(r.Context()); err != nil {
 		errs = append(errs, err.Error())
 	}
 	if len(errs) > 0 {
@@ -383,6 +433,7 @@ const relaydLegContent = relaydNav + `
 <tr><th>Paid from</th><td>{{ if .SenderAddress }}{{ .SenderAddress }}{{ end }}</td></tr>
 <tr><th>Customer's destination</th><td>{{ .DestinationAddress }}</td></tr>
 <tr><th>Vendor order</th><td>{{ if .UpstreamProviderName }}{{ .UpstreamProviderName }}: {{ end }}{{ if .UpstreamOrderID }}{{ .UpstreamOrderID }}{{ end }}</td></tr>
+<tr><th>Vendor's payout transaction</th><td>{{ if .PayoutTxID }}{{ .PayoutTxID }}{{ else }}-{{ end }}</td></tr>
 <tr><th>Created / updated</th><td>{{ .CreatedAt }} / {{ .UpdatedAt }}</td></tr>
 </table>
 {{ end }}
