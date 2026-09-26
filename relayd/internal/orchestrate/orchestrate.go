@@ -317,6 +317,7 @@ type Orchestrator struct {
 	preflightAlerted map[string]string // externalID|reason -> last detail already alerted on
 	lastSweepScan    time.Time
 	releaseRetryAt   map[string]time.Time // externalID -> when its failed wallet release may be retried
+	vendorRenewals   map[string]int       // externalID -> vendor orders replaced after expiring unsent
 }
 
 // New wires an Orchestrator.
