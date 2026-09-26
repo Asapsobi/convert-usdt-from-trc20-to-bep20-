@@ -51,9 +51,21 @@ type Admin struct {
 	Watchers map[string]WatcherForwarder
 	// Treasury describes where top-ups come from and sweeps go, for display.
 	Treasury map[string]string
+	// Treasuries are every treasury wallet, the primary first.
+	Treasuries []TreasuryWallet
+	// Prices asks every vendor for its live price on amount USDT.
+	// Optional.
+	Prices func(ctx context.Context, amount string) (any, error)
 	// Balance reads what an address holds on chain ("BSC" or "TRON").
 	// Optional.
 	Balance func(ctx context.Context, chain, address string) (WalletBalance, error)
+}
+
+// TreasuryWallet is one treasury wallet's S1 slot and addresses.
+type TreasuryWallet struct {
+	SlotID int    `json:"slot_id"`
+	BSC    string `json:"bsc"`
+	TRON   string `json:"tron"`
 }
 
 // WalletBalance is what one address holds on chain, formatted.
@@ -121,6 +133,7 @@ func (s *Server) adminRoutes(r chi.Router) {
 	r.Get("/pricing", s.getPricing)
 	r.Put("/pricing", s.putPricing)
 	r.Get("/vendors", s.getVendors)
+	r.Get("/vendors/prices", s.getVendorPrices)
 	r.Patch("/vendors/{service}/{name}", s.patchVendor)
 	r.Put("/vendors/{service}/strategy", s.putVendorStrategy)
 	r.Get("/sweeps", s.getSweeps)
@@ -210,6 +223,8 @@ type vendorResponse struct {
 	LastError           *string    `json:"last_error,omitempty"`
 	LastErrorAt         *time.Time `json:"last_error_at,omitempty"`
 	LastSuccessAt       *time.Time `json:"last_success_at,omitempty"`
+	RevenueBPS          int        `json:"revenue_bps"`
+	Notes               string     `json:"notes"`
 }
 
 var vendorServices = []vendors.Service{vendors.Conversion, vendors.Energy}
@@ -233,6 +248,7 @@ func (s *Server) getVendors(w http.ResponseWriter, r *http.Request) {
 				Service: string(v.Service), Name: v.Name, Enabled: v.Enabled, Priority: v.Priority,
 				Available: v.Available(now), ConsecutiveFailures: v.ConsecutiveFailures, UnavailableUntil: v.UnavailableUntil,
 				LastError: v.LastError, LastErrorAt: v.LastErrorAt, LastSuccessAt: v.LastSuccessAt,
+				RevenueBPS: v.RevenueBPS, Notes: v.Notes,
 			})
 		}
 		strategy, err := s.Admin.Vendors.Strategy(r.Context(), service)
@@ -265,16 +281,32 @@ func (s *Server) patchVendor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Enabled  *bool `json:"enabled"`
-		Priority *int  `json:"priority"`
+		Enabled    *bool   `json:"enabled"`
+		Priority   *int    `json:"priority"`
+		RevenueBPS *int    `json:"revenue_bps"`
+		Notes      *string `json:"notes"`
 	}
 	if !decodeBody(w, r, &req) {
 		return
 	}
 	name := chi.URLParam(r, "name")
-	if _, err := s.Admin.Vendors.Get(r.Context(), service, name); err != nil {
+	current, err := s.Admin.Vendors.Get(r.Context(), service, name)
+	if err != nil {
 		writeError(w, http.StatusNotFound, err)
 		return
+	}
+	if req.RevenueBPS != nil || req.Notes != nil {
+		revenue, notes := current.RevenueBPS, current.Notes
+		if req.RevenueBPS != nil {
+			revenue = *req.RevenueBPS
+		}
+		if req.Notes != nil {
+			notes = *req.Notes
+		}
+		if err := s.Admin.Vendors.SetTerms(r.Context(), service, name, revenue, notes); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
 	}
 	if req.Enabled != nil {
 		if err := s.Admin.Vendors.SetEnabled(r.Context(), service, name, *req.Enabled); err != nil {
@@ -662,5 +694,35 @@ func (s *Server) getTreasury(w http.ResponseWriter, r *http.Request) {
 		}
 		out[key] = entry
 	}
+	var wallets []map[string]any
+	for _, t := range s.Admin.Treasuries {
+		wallets = append(wallets, map[string]any{
+			"slot_id": t.SlotID, "bsc": t.BSC, "tron": t.TRON,
+			"bsc_balance": s.balanceOf(ctx, "BSC", t.BSC), "tron_balance": s.balanceOf(ctx, "TRON", t.TRON),
+		})
+	}
+	out["wallets"] = wallets
 	respondJSON(w, http.StatusOK, out)
+}
+
+// getVendorPrices is every vendor's live price: conversion vendors on
+// ?amount= USDT (default 100) in both directions, energy vendors on one
+// transfer's energy.
+func (s *Server) getVendorPrices(w http.ResponseWriter, r *http.Request) {
+	if s.Admin.Prices == nil {
+		writeError(w, http.StatusServiceUnavailable, errNotConfigured)
+		return
+	}
+	amount := r.URL.Query().Get("amount")
+	if amount == "" {
+		amount = "100"
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	prices, err := s.Admin.Prices(ctx, amount)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, prices)
 }

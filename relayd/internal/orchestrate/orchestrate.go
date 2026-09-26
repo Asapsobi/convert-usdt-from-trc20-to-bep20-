@@ -250,6 +250,28 @@ type Config struct {
 	// API: redirecting profit must take access to the server itself.
 	SweepToBSC  string
 	SweepToTRON string
+
+	// Treasuries are every treasury wallet -- S1 slots whose addresses pay
+	// deposit wallets' gas and TRX. The first is the primary (the SlotID
+	// slot); a top-up comes from whichever can pay for it. Empty means the
+	// SlotID slot alone.
+	Treasuries []Treasury
+}
+
+// Treasury is one treasury wallet: an S1 slot and its address on each
+// chain.
+type Treasury struct {
+	SlotID      int
+	EVMAddress  string // BSC
+	TronAddress string // TRON
+}
+
+// Address is t's address on chain.
+func (t Treasury) Address(chain transfers.Chain) string {
+	if chain == transfers.BSC {
+		return t.EVMAddress
+	}
+	return t.TronAddress
 }
 
 // Orchestrator bundles every dependency RunTick needs.
@@ -284,7 +306,12 @@ type Orchestrator struct {
 	// Sweeps records the profit in each deposit wallet and its sweeps to
 	// the treasury (sweep.go). Optional: nil disables sweeping.
 	Sweeps *sweeps.Store
-	Cfg    Config
+	// EVMPayouts and TRONPayouts check a vendor's payout on the chain the
+	// customer is paid on before a leg is marked complete (payout.go).
+	// Optional: nil takes the vendor's word for that chain.
+	EVMPayouts  EVMPayoutReader
+	TRONPayouts TRONPayoutReader
+	Cfg         Config
 
 	mu               sync.Mutex
 	preflightAlerted map[string]string // externalID|reason -> last detail already alerted on

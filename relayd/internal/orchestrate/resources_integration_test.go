@@ -225,3 +225,39 @@ func TestResources_TRONActivatesThenRentsExactlyTheShortfall(t *testing.T) {
 		t.Fatalf("expected the forward sent once energy arrived, got %d attempts", forwards())
 	}
 }
+
+// With several treasury wallets, a gas top-up comes from one that can pay
+// for it -- the primary being short doesn't hold the order up -- and is
+// signed with that treasury's own key.
+func TestResources_TopUpComesFromATreasuryThatCanPay(t *testing.T) {
+	f := newBEP20Fixture(t, 84)
+	store := transfers.NewStore(f.pool)
+	primary, second := signing.FakeSlotEVMAddress(1), signing.FakeSlotEVMAddress(2)
+	f.chain.setNative(f.deposit, big.NewInt(0))
+	f.chain.setNative(primary, big.NewInt(0))
+	o := f.newOrchestrator(0)
+	o.Cfg.Treasuries = []orchestrate.Treasury{
+		{SlotID: 1, EVMAddress: primary, TronAddress: signing.FakeSlotTronAddress(1)},
+		{SlotID: 2, EVMAddress: second, TronAddress: signing.FakeSlotTronAddress(2)},
+	}
+
+	f.tick(o)
+	var topUp *transfers.Attempt
+	for _, a := range openOf(t, store, transfers.GasTopUp) {
+		if a.ToAddress == f.deposit {
+			a := a
+			topUp = &a
+		}
+	}
+	if topUp == nil {
+		t.Fatal("expected a gas top-up to the deposit wallet")
+	}
+	if topUp.FromAddress != second || !topUp.Status.MayLand() {
+		t.Fatalf("expected the top-up sent from the second treasury (the primary holds no BNB), got %+v", *topUp)
+	}
+	for _, a := range f.alerts.Fired() {
+		if a.Reason == "treasury_needs_bnb" {
+			t.Fatalf("a short primary must not alert while another treasury can pay: %+v", a)
+		}
+	}
+}

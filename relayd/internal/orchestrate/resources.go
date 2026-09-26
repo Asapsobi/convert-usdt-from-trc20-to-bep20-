@@ -73,8 +73,9 @@ func (o *Orchestrator) trackTopUps(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		treasury, _ := o.treasuryAt(a.Chain, a.FromAddress)
 		req := transferRequest{job: a.ExternalID, purpose: a.Purpose, chain: a.Chain, from: a.FromAddress,
-			signer: signer{slot: true}, to: a.ToAddress, amount: a.Amount}
+			signer: signer{slot: true, slotID: treasury.SlotID}, to: a.ToAddress, amount: a.Amount}
 		if _, err := o.trackSent(ctx, ad, req, a); err != nil {
 			slog.Error("orchestrate: tracking a treasury top-up failed, will retry next tick", "job", a.ExternalID, "error", err)
 		}
@@ -82,13 +83,93 @@ func (o *Orchestrator) trackTopUps(ctx context.Context) error {
 	return nil
 }
 
-// treasuryAddress is where top-ups come from on chain: the S1 slot's
-// own address in that chain's encoding.
-func (o *Orchestrator) treasuryAddress(chain transfers.Chain) string {
-	if chain == transfers.BSC {
-		return o.Cfg.SlotEVMAddress
+// treasuries is every treasury wallet, the primary first.
+func (o *Orchestrator) treasuries() []Treasury {
+	if len(o.Cfg.Treasuries) > 0 {
+		return o.Cfg.Treasuries
 	}
-	return o.Cfg.SlotAddress
+	return []Treasury{{SlotID: o.Cfg.SlotID, EVMAddress: o.Cfg.SlotEVMAddress, TronAddress: o.Cfg.SlotAddress}}
+}
+
+// Treasuries is every treasury wallet, the primary first.
+func (o *Orchestrator) Treasuries() []Treasury { return o.treasuries() }
+
+// treasuryAddress is the primary treasury's address on chain.
+func (o *Orchestrator) treasuryAddress(chain transfers.Chain) string {
+	return o.treasuries()[0].Address(chain)
+}
+
+// treasuryAt finds the treasury whose address on chain is address.
+func (o *Orchestrator) treasuryAt(chain transfers.Chain, address string) (Treasury, bool) {
+	for _, t := range o.treasuries() {
+		if a := t.Address(chain); a != "" && strings.EqualFold(a, address) {
+			return t, true
+		}
+	}
+	return Treasury{}, false
+}
+
+// treasuryFeeReserve is what a treasury keeps on top of a top-up's own
+// amount when choosing which one sends it: a native transfer's gas at the
+// highest gas price relayd accepts (BSC), or TRON's account-creation fee
+// and bandwidth.
+func treasuryFeeReserve(chain transfers.Chain) *big.Int {
+	if chain == transfers.BSC {
+		return new(big.Int).Mul(big.NewInt(21_000), maxGasPriceWei)
+	}
+	return big.NewInt(tronTreasuryReserveSun)
+}
+
+// nativeBalance is address's BNB (wei) or TRX (sun).
+func (o *Orchestrator) nativeBalance(ctx context.Context, chain transfers.Chain, address string) (*big.Int, error) {
+	if chain == transfers.BSC {
+		return o.EVMChain.NativeBalance(ctx, address)
+	}
+	res, err := o.Chain.AccountResources(ctx, address)
+	if err != nil {
+		return nil, err
+	}
+	return big.NewInt(res.BalanceSun), nil
+}
+
+// pickTreasury chooses the treasury wallet that sends a top-up: the one
+// already sending it (a restart mid-top-up), else the first that isn't
+// busy sending something else and holds the amount plus its fee. With
+// none suitable it falls back to the primary, whose own balance check
+// then says exactly what's missing.
+func (o *Orchestrator) pickTreasury(ctx context.Context, chain transfers.Chain, job string, purpose transfers.Purpose, amount money.Amount) (Treasury, error) {
+	all := o.treasuries()
+	if a, ok, err := o.Transfers.Open(ctx, job, purpose); err != nil {
+		return Treasury{}, err
+	} else if ok {
+		if t, found := o.treasuryAt(chain, a.FromAddress); found {
+			return t, nil
+		}
+	}
+	if len(all) == 1 {
+		return all[0], nil
+	}
+	need := new(big.Int).Add(big.NewInt(amount.Units), treasuryFeeReserve(chain))
+	for _, t := range all {
+		addr := t.Address(chain)
+		if addr == "" {
+			continue
+		}
+		if _, busy, err := o.Transfers.OpenFrom(ctx, addr); err != nil {
+			return Treasury{}, err
+		} else if busy {
+			continue
+		}
+		have, err := o.nativeBalance(ctx, chain, addr)
+		if err != nil {
+			slog.Warn("orchestrate: reading a treasury's balance failed, trying the next", "treasury", addr, "error", err)
+			continue
+		}
+		if have.Cmp(need) >= 0 {
+			return t, nil
+		}
+	}
+	return all[0], nil
 }
 
 // topUp funds parent's sending wallet from the treasury: BNB for gas on
@@ -97,8 +178,7 @@ func (o *Orchestrator) treasuryAddress(chain transfers.Chain) string {
 // topped up rarely. Always returns an error: errNotReady while the top-up
 // is under way, a real error when it can't be done.
 func (o *Orchestrator) topUp(ctx context.Context, parent transferRequest, purpose transfers.Purpose, shortfall *big.Int) error {
-	treasury := o.treasuryAddress(parent.chain)
-	if treasury == "" {
+	if o.treasuryAddress(parent.chain) == "" {
 		return fmt.Errorf("%s needs a %s from the treasury, but no treasury address is configured", parent.from, purpose)
 	}
 	prefix := fmt.Sprintf("%s:%s:%s:", strings.ToLower(string(purpose)), parent.job, parent.purpose)
@@ -138,9 +218,14 @@ func (o *Orchestrator) topUp(ctx context.Context, parent transferRequest, purpos
 		return fmt.Errorf("%s is not a top-up", purpose)
 	}
 
+	job := prefix + strconv.Itoa(rounds)
+	treasury, err := o.pickTreasury(ctx, parent.chain, job, purpose, amount)
+	if err != nil {
+		return err
+	}
 	req := transferRequest{
-		job: prefix + strconv.Itoa(rounds), purpose: purpose, chain: parent.chain,
-		from: treasury, signer: signer{slot: true}, to: parent.from, amount: amount,
+		job: job, purpose: purpose, chain: parent.chain,
+		from: treasury.Address(parent.chain), signer: signer{slot: true, slotID: treasury.SlotID}, to: parent.from, amount: amount,
 	}
 	done, err := o.driveTransfer(ctx, req)
 	if err != nil {

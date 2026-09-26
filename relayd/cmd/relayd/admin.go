@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"math/big"
 	"os"
+	"relayd/internal/money"
+	"relayd/internal/upstream"
 	"strings"
 
 	"relayd/internal/driver"
@@ -64,6 +66,12 @@ func adminFromEnv(d *driver.Driver, orch *orchestrate.Orchestrator) (*httpapi.Ad
 		}
 		return out, nil
 	}
+	admin.Prices = func(ctx context.Context, amount string) (any, error) {
+		return vendorPrices(ctx, d, orch, amount)
+	}
+	for _, t := range orch.Treasuries() {
+		admin.Treasuries = append(admin.Treasuries, httpapi.TreasuryWallet{SlotID: t.SlotID, BSC: t.EVMAddress, TRON: t.TronAddress})
+	}
 	if d.BEP20Watcher != nil {
 		admin.Watchers["bsc"] = d.BEP20Watcher
 	}
@@ -89,4 +97,44 @@ func formatRaw(raw *big.Int, decimals int) string {
 		return whole.String()
 	}
 	return whole.String() + "." + digits
+}
+
+// vendorPrices asks every configured vendor for its live price.
+func vendorPrices(ctx context.Context, d *driver.Driver, orch *orchestrate.Orchestrator, amount string) (any, error) {
+	out := map[string]any{"amount": amount}
+	if router, ok := d.Upstream.(*vendors.ConversionRouter); ok {
+		for _, pair := range []upstream.Pair{{From: money.USDT_BEP20, To: money.USDT_TRC20}, {From: money.USDT_TRC20, To: money.USDT_BEP20}} {
+			in, err := money.ParseDecimal(amount, pair.From)
+			if err != nil {
+				return nil, fmt.Errorf("amount: %w", err)
+			}
+			var rows []map[string]string
+			for _, q := range router.QuoteEach(ctx, pair, in) {
+				row := map[string]string{"vendor": q.Vendor}
+				if q.Err != nil {
+					row["error"] = q.Err.Error()
+				} else {
+					row["customer_receives"], _ = money.Format(q.Quote.AmountOut)
+					fee := money.Amount{Asset: pair.From, Units: in.Units - q.Quote.AmountOut.Units}
+					row["vendor_fee"], _ = money.Format(fee)
+				}
+				rows = append(rows, row)
+			}
+			out[string(pair.From)+"_TO_"+string(pair.To)] = rows
+		}
+	}
+	if energy, ok := orch.Energy.(*vendors.EnergyRouter); ok {
+		var rows []map[string]string
+		for _, q := range energy.QuoteEach(ctx, 65_000) {
+			row := map[string]string{"vendor": q.Vendor, "units": fmt.Sprint(q.Units)}
+			if q.Err != nil {
+				row["error"] = q.Err.Error()
+			} else {
+				row["cost_trx"] = formatRaw(big.NewInt(q.CostSun), 6)
+			}
+			rows = append(rows, row)
+		}
+		out["energy"] = rows
+	}
+	return out, nil
 }

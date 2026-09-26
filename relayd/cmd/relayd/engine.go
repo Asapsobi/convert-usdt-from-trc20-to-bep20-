@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"relayd/internal/addrcheck"
@@ -121,6 +122,34 @@ func buildDriverAndOrchestrator(ctx context.Context, pool *db.Pool) (*driver.Dri
 	slotEVMAddress, err := signer.EVMAddress(ctx, slotID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("relayd: fetching slot %d's own EVM address from S1: %w", slotID, err)
+	}
+	// RELAYD_TREASURY_SLOT_IDS names extra treasury wallets (S1 slots),
+	// after the primary RELAYD_SLOT_ID: a top-up comes from whichever
+	// treasury can pay for it.
+	treasuries := []orchestrate.Treasury{{SlotID: slotID, EVMAddress: slotEVMAddress, TronAddress: slotAddress}}
+	for _, raw := range strings.Split(os.Getenv("RELAYD_TREASURY_SLOT_IDS"), ",") {
+		if raw = strings.TrimSpace(raw); raw == "" {
+			continue
+		}
+		extra, err := strconv.Atoi(raw)
+		if err != nil || extra <= 0 {
+			return nil, nil, fmt.Errorf("relayd: RELAYD_TREASURY_SLOT_IDS: %q is not a slot id", raw)
+		}
+		if extra == slotID {
+			continue
+		}
+		tron, err := signer.SlotAddress(ctx, extra)
+		if err != nil {
+			return nil, nil, fmt.Errorf("relayd: fetching treasury slot %d's TRON address from S1: %w", extra, err)
+		}
+		evm, err := signer.EVMAddress(ctx, extra)
+		if err != nil {
+			return nil, nil, fmt.Errorf("relayd: fetching treasury slot %d's EVM address from S1: %w", extra, err)
+		}
+		treasuries = append(treasuries, orchestrate.Treasury{SlotID: extra, EVMAddress: evm, TronAddress: tron})
+	}
+	for _, t := range treasuries {
+		slog.Info("relayd: treasury wallet", "slot", t.SlotID, "bsc", t.EVMAddress, "tron", t.TronAddress)
 	}
 
 	energyPerTransferUnits, err := requiredEnvInt64("RELAYD_ENERGY_PER_TRANSFER_UNITS")
@@ -238,11 +267,12 @@ func buildDriverAndOrchestrator(ctx context.Context, pool *db.Pool) (*driver.Dri
 			SlotID: slotID, SlotAddress: slotAddress, SlotEVMAddress: slotEVMAddress,
 			EnergyPerTransferUnits: energyPerTransferUnits, ForwardingTimeout: forwardingTimeout,
 			StaleLegAlertAfter: staleLegAlertAfter, DepositGrace: depositGrace,
-			SweepToBSC: sweepToBSC, SweepToTRON: sweepToTRON,
+			SweepToBSC: sweepToBSC, SweepToTRON: sweepToTRON, Treasuries: treasuries,
 		})
 
 	orch.Pricing = pricingStore
 	orch.Sweeps = sweepStore
+	orch.EVMPayouts, orch.TRONPayouts = evmClient, finalityReader
 
 	return d, orch, nil
 }

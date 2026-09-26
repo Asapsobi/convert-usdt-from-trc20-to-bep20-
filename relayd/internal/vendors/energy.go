@@ -139,3 +139,24 @@ func (r *EnergyRouter) Reserve(ctx context.Context, externalID, target string, u
 	}
 	return energy.Reservation{}, fmt.Errorf("vendors: every energy vendor failed this rental: %s", strings.Join(failures, "; "))
 }
+
+// EnergyQuote is one energy vendor's live price for an amount of energy.
+type EnergyQuote struct {
+	Vendor  string
+	Units   int64
+	CostSun int64
+	Err     error
+}
+
+// QuoteEach asks every configured energy vendor for its price on units
+// (raised to each vendor's minimum): the administrator's pricing view.
+func (r *EnergyRouter) QuoteEach(ctx context.Context, units int64) []EnergyQuote {
+	out := make([]EnergyQuote, 0, len(r.vendors))
+	for name, v := range r.vendors {
+		n := max(units, v.MinUnits())
+		cost, err := v.QuoteSun(ctx, n)
+		out = append(out, EnergyQuote{Vendor: name, Units: n, CostSun: cost, Err: err})
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].Vendor < out[b].Vendor })
+	return out
+}

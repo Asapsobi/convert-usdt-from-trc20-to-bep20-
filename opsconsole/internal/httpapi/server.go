@@ -118,6 +118,7 @@ func NewRouter(s *Server) http.Handler {
 		r.Get("/relayd/vendors", s.getRelaydVendors)
 		r.Post("/relayd/vendors/{service}/strategy", s.postRelaydVendorStrategy)
 		r.Post("/relayd/vendors/{service}/{name}", s.postRelaydVendor)
+		r.Post("/relayd/vendors/{service}/{name}/terms", s.postRelaydVendorTerms)
 		r.Get("/relayd/sweeps", s.getRelaydSweeps)
 		r.Post("/relayd/sweeps/settings", s.postRelaydSweepSettings)
 		r.Post("/relayd/sweeps/run", s.postRelaydSweepRun)
