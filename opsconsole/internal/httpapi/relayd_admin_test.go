@@ -35,17 +35,23 @@ func TestRelaydAdminPagesRender(t *testing.T) {
 			DirectionRows: []directionRow{{Key: "TRC20_TO_BEP20", Label: "TRON → BSC", ProfitBPS: "40", MinProfit: "1.5"}, {Key: "BEP20_TO_TRC20", Label: "BSC → TRON"}}},
 		"relayd_vendors": relaydVendorsData{View: opclient.Vendors{
 			Vendors:    []opclient.Vendor{{Service: "conversion", Name: "fixedfloat", Enabled: true, Available: false, LastError: str("timeout")}},
-			Strategies: map[string]string{"conversion": "best_rate", "energy": "cheapest"},
-		}},
+			Strategies: map[string]string{"conversion": "best_margin", "energy": "cheapest"},
+		}, Prices: &opclient.VendorPrices{Amount: "100",
+			BSCToTRON: []map[string]string{{"vendor": "fixedfloat", "customer_receives": "98.9", "vendor_fee": "1.1"}},
+			TRONToBSC: []map[string]string{{"vendor": "fixedfloat", "error": "timeout"}},
+			Energy:    []map[string]string{{"vendor": "catfee", "units": "65000", "cost_trx": "3.9"}}}},
 		"relayd_sweeps": relaydSweepsData{
 			Settings: &opclient.SweepSettings{Enabled: true, IntervalMinutes: 60, MinAmount: map[string]string{"USDT_BEP20": "10", "USDT_TRC20": "50"}},
 			Wallets: opclient.ProfitWallets{Wallets: []opclient.ProfitWallet{
 				{Chain: "TRON", Address: "TX", Legs: 3, Unswept: "0.75", Busy: true, OnChain: &opclient.WalletBalance{USDT: "0.75", Native: "2.1", NativeFor: "TRX"}},
 				{Chain: "BSC", Address: "0xA", Legs: 1, Unswept: "0", OnChain: &opclient.WalletBalance{Error: "403"}},
 			}, UnsweptTotals: map[string]string{"USDT_TRC20": "0.75"}},
-			Treasury: map[string]opclient.TreasuryChain{
-				"bsc":  {Treasury: "0xT", SweepTo: "0xT", Balance: &opclient.WalletBalance{USDT: "12", Native: "0.05", NativeFor: "BNB"}},
-				"tron": {Treasury: "TT", SweepTo: "TCold", Balance: &opclient.WalletBalance{Error: "unreachable"}},
+			Treasury: &opclient.Treasury{
+				BSC: opclient.TreasuryChain{Treasury: "0xT", SweepTo: "0xT"}, TRON: opclient.TreasuryChain{Treasury: "TT", SweepTo: "TCold"},
+				Wallets: []opclient.TreasuryWallet{
+					{SlotID: 2, BSC: "0xT", TRON: "TT", BSCBalance: &opclient.WalletBalance{USDT: "12", Native: "0.05", NativeFor: "BNB"},
+						TRONBalance: &opclient.WalletBalance{Error: "unreachable"}},
+				},
 			},
 			Sweeps: []opclient.Sweep{{ID: 1, Chain: "BSC", Amount: "12", Status: "FAILED", Error: str("gas"), Costs: &costs}},
 		},

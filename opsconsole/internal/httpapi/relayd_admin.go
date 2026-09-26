@@ -138,7 +138,8 @@ its orders already in progress are still followed.</p>
 <form method="post" action="/relayd/vendors/{{ $service }}/strategy" class="card">
   <b>{{ $service }}</b> vendor selection:
   <select name="strategy">
-    {{ if eq $service "conversion" }}<option value="best_rate"{{ if eq $strategy "best_rate" }} selected{{ end }}>best rate for the customer</option>{{ end }}
+    {{ if eq $service "conversion" }}<option value="best_rate"{{ if eq $strategy "best_rate" }} selected{{ end }}>best rate for the customer</option>
+    <option value="best_margin"{{ if eq $strategy "best_margin" }} selected{{ end }}>most revenue for us (vendor's revenue share)</option>{{ end }}
     {{ if eq $service "energy" }}<option value="cheapest"{{ if eq $strategy "cheapest" }} selected{{ end }}>cheapest</option>{{ end }}
     <option value="priority"{{ if eq $strategy "priority" }} selected{{ end }}>fixed priority (lowest number first)</option>
   </select>
@@ -146,13 +147,16 @@ its orders already in progress are still followed.</p>
 </form>
 {{ end }}
 <table>
-<tr><th>Service</th><th>Vendor</th><th>Enabled</th><th>Health</th><th>Priority</th><th>Last error</th><th></th></tr>
+<tr><th>Service</th><th>Vendor</th><th>Enabled</th><th>Health</th><th>Priority</th><th>Pays us (bps) / notes</th><th>Last error</th><th></th></tr>
 {{ range .View.Vendors }}
 <tr{{ if not .Available }} class="row-alert"{{ end }}>
   <td>{{ .Service }}</td><td>{{ .Name }}</td><td>{{ if .Enabled }}yes{{ else }}no{{ end }}</td>
   <td>{{ if .Available }}<span class="dot dot-green"></span>ok{{ else }}<span class="dot dot-red"></span>out{{ if .UnavailableUntil }} until {{ .UnavailableUntil.Format "15:04:05" }}{{ end }} ({{ .ConsecutiveFailures }} failures){{ end }}</td>
   <td><form class="inline" method="post" action="/relayd/vendors/{{ .Service }}/{{ .Name }}">
     <input type="number" name="priority" value="{{ .Priority }}" style="width:70px"><button type="submit">Set</button></form></td>
+  <td><form class="inline" method="post" action="/relayd/vendors/{{ .Service }}/{{ .Name }}/terms">
+    <input type="number" name="revenue_bps" min="0" max="9999" value="{{ .RevenueBPS }}" style="width:70px">
+    <input type="text" name="notes" value="{{ .Notes }}" placeholder="terms, limits, contact" style="width:160px"><button type="submit">Save</button></form></td>
   <td>{{ if .LastError }}{{ .LastError }}{{ end }}</td>
   <td><form class="inline" method="post" action="/relayd/vendors/{{ .Service }}/{{ .Name }}">
     {{ if .Enabled }}<input type="hidden" name="enabled" value="false"><button class="danger" type="submit">Disable</button>
@@ -160,11 +164,22 @@ its orders already in progress are still followed.</p>
 </tr>
 {{ end }}
 </table>
+<h2>Live prices{{ with .Prices }} for {{ .Amount }} USDT{{ end }}</h2>
+{{ with .Prices }}
+<table>
+<tr><th>Direction</th><th>Vendor</th><th>Customer receives</th><th>Vendor fee</th></tr>
+{{ range .BSCToTRON }}<tr><td>BSC → TRON</td><td>{{ index . "vendor" }}</td><td>{{ index . "customer_receives" }}</td><td>{{ index . "vendor_fee" }}{{ index . "error" }}</td></tr>{{ end }}
+{{ range .TRONToBSC }}<tr><td>TRON → BSC</td><td>{{ index . "vendor" }}</td><td>{{ index . "customer_receives" }}</td><td>{{ index . "vendor_fee" }}{{ index . "error" }}</td></tr>{{ end }}
+</table>
+{{ if .Energy }}<table><tr><th>Energy vendor</th><th>Energy</th><th>Cost (TRX)</th></tr>
+{{ range .Energy }}<tr><td>{{ index . "vendor" }}</td><td>{{ index . "units" }}</td><td>{{ index . "cost_trx" }}{{ index . "error" }}</td></tr>{{ end }}</table>{{ end }}
+{{ else }}<p>Prices unavailable right now.</p>{{ end }}
 `
 
 type relaydVendorsData struct {
 	flashData
-	View opclient.Vendors
+	View   opclient.Vendors
+	Prices *opclient.VendorPrices
 }
 
 func (s *Server) getRelaydVendors(w http.ResponseWriter, r *http.Request) {
@@ -175,6 +190,9 @@ func (s *Server) getRelaydVendors(w http.ResponseWriter, r *http.Request) {
 		data.Err = err.Error()
 	} else {
 		data.View = v
+		if prices, err := s.Relayd.GetVendorPrices(r.Context(), "100"); err == nil {
+			data.Prices = &prices
+		}
 	}
 	s.Templates.Render(w, "relayd_vendors", data)
 }
@@ -198,6 +216,16 @@ func (s *Server) postRelaydVendor(w http.ResponseWriter, r *http.Request) {
 		func() error { return s.Relayd.PatchVendor(r.Context(), service, name, enabled, priority) })
 }
 
+func (s *Server) postRelaydVendorTerms(w http.ResponseWriter, r *http.Request) {
+	_ = r.ParseForm()
+	service, name := chi.URLParam(r, "service"), chi.URLParam(r, "name")
+	revenue, _ := strconv.Atoi(r.FormValue("revenue_bps"))
+	notes := strings.TrimSpace(r.FormValue("notes"))
+	s.relaydAction(w, r, "/relayd/vendors", "relayd.vendor.terms", service+":"+name,
+		map[string]any{"revenue_bps": revenue, "notes": notes},
+		func() error { return s.Relayd.SetVendorTerms(r.Context(), service, name, revenue, notes) })
+}
+
 func (s *Server) postRelaydVendorStrategy(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
 	service, strategy := chi.URLParam(r, "service"), r.FormValue("strategy")
@@ -208,10 +236,19 @@ func (s *Server) postRelaydVendorStrategy(w http.ResponseWriter, r *http.Request
 const relaydSweepsContent = relaydNav + `
 <h1>Profit &amp; sweeps</h1>` + flashSnippet + `
 <div class="cards">{{ range $asset, $amount := .Wallets.UnsweptTotals }}<div class="card"><b>{{ $asset }}</b><br>{{ $amount }} unswept</div>{{ end }}</div>
-<h2>Treasury</h2>
-<div class="cards">{{ range $chain, $t := .Treasury }}<div class="card"><b>{{ $chain }} treasury</b><br><small>{{ $t.Treasury }}</small><br>
-{{ with $t.Balance }}{{ if .Error }}<span class="err">{{ .Error }}</span>{{ else }}{{ .USDT }} USDT &middot; {{ .Native }} {{ .NativeFor }}{{ end }}{{ end }}
-{{ if ne $t.SweepTo $t.Treasury }}<br>sweeps go to <small>{{ $t.SweepTo }}</small>{{ end }}</div>{{ end }}</div>
+<h2>Treasury wallets</h2>
+{{ with .Treasury }}
+<p>Gas and TRX top-ups come from whichever treasury can pay. Profit sweeps go to {{ .BSC.SweepTo }} (BSC) and {{ .TRON.SweepTo }} (TRON).</p>
+<table>
+<tr><th>Slot</th><th>BSC address</th><th>BSC balance</th><th>TRON address</th><th>TRON balance</th></tr>
+{{ range .Wallets }}
+<tr><td>{{ .SlotID }}</td><td>{{ .BSC }}</td>
+<td>{{ with .BSCBalance }}{{ if .Error }}<span class="err">unavailable</span>{{ else }}{{ .Native }} BNB, {{ .USDT }} USDT{{ end }}{{ end }}</td>
+<td>{{ .TRON }}</td>
+<td>{{ with .TRONBalance }}{{ if .Error }}<span class="err">unavailable</span>{{ else }}{{ .Native }} TRX, {{ .USDT }} USDT{{ end }}{{ end }}</td></tr>
+{{ end }}
+</table>
+{{ end }}
 <p>Each deposit wallet keeps our profit from the orders it served. Once a wallet's profit reaches the minimum and no order is using it,
 relayd sends it to the treasury in one transfer (on TRON, renting only the energy that transfer needs). Only profit recorded on settled
 orders is ever swept -- anything else a wallet holds stays for an operator.</p>
@@ -250,7 +287,7 @@ type relaydSweepsData struct {
 	Settings *opclient.SweepSettings
 	Wallets  opclient.ProfitWallets
 	Sweeps   []opclient.Sweep
-	Treasury map[string]opclient.TreasuryChain
+	Treasury *opclient.Treasury
 }
 
 func (s *Server) getRelaydSweeps(w http.ResponseWriter, r *http.Request) {
@@ -273,8 +310,10 @@ func (s *Server) getRelaydSweeps(w http.ResponseWriter, r *http.Request) {
 	if data.Sweeps, err = s.Relayd.ListSweeps(r.Context()); err != nil {
 		errs = append(errs, err.Error())
 	}
-	if data.Treasury, err = s.Relayd.GetTreasury(r.Context()); err != nil {
+	if treasury, err := s.Relayd.GetTreasury(r.Context()); err != nil {
 		errs = append(errs, err.Error())
+	} else {
+		data.Treasury = &treasury
 	}
 	if len(errs) > 0 {
 		data.Err = strings.Join(errs, "; ")

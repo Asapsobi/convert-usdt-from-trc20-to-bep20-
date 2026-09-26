@@ -43,9 +43,26 @@ type TreasuryChain struct {
 	SweepToBalance *WalletBalance `json:"sweep_to_balance,omitempty"`
 }
 
+// Treasury is every treasury wallet with its balances, and where sweeps
+// go on each chain.
+type Treasury struct {
+	BSC     TreasuryChain    `json:"bsc"`
+	TRON    TreasuryChain    `json:"tron"`
+	Wallets []TreasuryWallet `json:"wallets"`
+}
+
+// TreasuryWallet is one treasury wallet (an S1 slot) on both chains.
+type TreasuryWallet struct {
+	SlotID      int            `json:"slot_id"`
+	BSC         string         `json:"bsc"`
+	TRON        string         `json:"tron"`
+	BSCBalance  *WalletBalance `json:"bsc_balance,omitempty"`
+	TRONBalance *WalletBalance `json:"tron_balance,omitempty"`
+}
+
 // GetTreasury calls GET /v1/admin/treasury.
-func (c *RelaydClient) GetTreasury(ctx context.Context) (map[string]TreasuryChain, error) {
-	var out map[string]TreasuryChain
+func (c *RelaydClient) GetTreasury(ctx context.Context) (Treasury, error) {
+	var out Treasury
 	err := do(ctx, c.http, "relayd", c.token, http.MethodGet, c.baseURL+"/v1/admin/treasury", nil, &out)
 	return out, err
 }
@@ -73,6 +90,30 @@ type Vendor struct {
 	UnavailableUntil    *time.Time `json:"unavailable_until,omitempty"`
 	LastError           *string    `json:"last_error,omitempty"`
 	LastSuccessAt       *time.Time `json:"last_success_at,omitempty"`
+	RevenueBPS          int        `json:"revenue_bps"`
+	Notes               string     `json:"notes"`
+}
+
+// VendorPrices is every vendor's live price: conversion per direction,
+// and energy for one transfer.
+type VendorPrices struct {
+	Amount    string              `json:"amount"`
+	BSCToTRON []map[string]string `json:"USDT_BEP20_TO_USDT_TRC20"`
+	TRONToBSC []map[string]string `json:"USDT_TRC20_TO_USDT_BEP20"`
+	Energy    []map[string]string `json:"energy"`
+}
+
+// GetVendorPrices calls GET /v1/admin/vendors/prices.
+func (c *RelaydClient) GetVendorPrices(ctx context.Context, amount string) (VendorPrices, error) {
+	var out VendorPrices
+	err := do(ctx, c.http, "relayd", c.token, http.MethodGet, c.baseURL+"/v1/admin/vendors/prices?amount="+url.QueryEscape(amount), nil, &out)
+	return out, err
+}
+
+// SetVendorTerms records what a vendor pays us and notes on it.
+func (c *RelaydClient) SetVendorTerms(ctx context.Context, service, name string, revenueBPS int, notes string) error {
+	u := c.baseURL + "/v1/admin/vendors/" + url.PathEscape(service) + "/" + url.PathEscape(name)
+	return do(ctx, c.http, "relayd", c.token, http.MethodPatch, u, map[string]any{"revenue_bps": revenueBPS, "notes": notes}, nil)
 }
 
 // Vendors is every vendor plus each service's selection strategy.
