@@ -174,6 +174,11 @@ func (t tronAdapter) outcome(ctx context.Context, a transfers.Attempt, now time.
 		return sentOutcome{state: outcomeConfirmed}, nil
 	case final && reason != "":
 		return sentOutcome{state: outcomeFailed, reason: reason}, nil
+	case final && a.Amount.Asset == assetTRX:
+		// A TRX transfer is not a contract call: its receipt never carries
+		// a verdict, and one that can't apply is rejected before it is ever
+		// included -- solidified means the TRX moved.
+		return sentOutcome{state: outcomeConfirmed}, nil
 	case final:
 		// Solidified, but the receipt carries no verdict. Never guess
 		// "failed" -- a wrong guess rebuilds a transfer that landed.
