@@ -166,6 +166,7 @@ type getRelayLegResponse struct {
 	DepositDeadline    string  `json:"deposit_deadline"`
 	ForwardTxID        *string `json:"forward_tx_id,omitempty"`
 	RefundTxID         *string `json:"refund_tx_id,omitempty"`
+	PayoutTxID         *string `json:"payout_tx_id,omitempty"`
 }
 
 func formatOptional(a *money.Amount) (*string, error) {
@@ -193,7 +194,7 @@ func (s *Server) getRelayLeg(w http.ResponseWriter, r *http.Request) {
 		RelayStatus: string(leg.Status), Direction: string(leg.Direction),
 		DepositAddress: leg.DepositAddress, DestinationAddress: leg.DestinationAddress,
 		Vendor: leg.UpstreamProviderName, DepositDeadline: status.Order.QuoteExpiresAt.Format(time.RFC3339),
-		ForwardTxID: leg.ForwardTxID, RefundTxID: leg.RefundTxID,
+		ForwardTxID: leg.ForwardTxID, RefundTxID: leg.RefundTxID, PayoutTxID: leg.PayoutTxID,
 	}
 	var vendorFee *money.Amount
 	if leg.VendorFeeAmount != nil {
@@ -306,12 +307,13 @@ type relayLegSummary struct {
 	ForwardAmount   *string `json:"forward_amount,omitempty"`
 	VendorFeeAmount *string `json:"vendor_fee_amount,omitempty"`
 	LeaseReleasedAt *string `json:"lease_released_at,omitempty"`
+	PayoutTxID      *string `json:"payout_tx_id,omitempty"`
 }
 
 // addTracking fills in what actually happened on leg.
 func addTracking(summary *relayLegSummary, leg relay.Leg) {
 	summary.CustomerLabel, summary.DepositAddress, summary.SenderAddress = leg.CustomerLabel, leg.DepositAddress, leg.SenderAddress
-	summary.ProfitBPS = leg.ProfitBPS
+	summary.ProfitBPS, summary.PayoutTxID = leg.ProfitBPS, leg.PayoutTxID
 	for _, f := range []struct {
 		src *money.Amount
 		dst **string

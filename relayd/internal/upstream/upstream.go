@@ -74,7 +74,10 @@ type SwapOrder struct {
 	AmountIn           money.Amount
 	AmountOutExpected  money.Amount
 	AmountOutActual    *money.Amount // nil until the provider reports the final payout
-	CreatedAt          time.Time
+	// PayoutTxID is the transaction the vendor paid the customer in, once
+	// it reports one -- the customer's proof of delivery on the other chain.
+	PayoutTxID *string
+	CreatedAt  time.Time
 }
 
 // SwapProvider is the one thing every instant-exchange integration
@@ -135,4 +138,12 @@ func (PlaceholderProvider) CreateOrder(ctx context.Context, pair Pair, amountIn 
 // GetOrder implements SwapProvider.
 func (PlaceholderProvider) GetOrder(ctx context.Context, providerOrderID string) (SwapOrder, error) {
 	return SwapOrder{}, ErrNoVendorConfigured
+}
+
+// nonEmpty is s as a pointer, or nil when s is empty.
+func nonEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }

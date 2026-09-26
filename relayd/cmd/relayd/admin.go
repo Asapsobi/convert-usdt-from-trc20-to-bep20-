@@ -1,14 +1,17 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"os"
 	"strings"
 
 	"relayd/internal/driver"
 	"relayd/internal/httpapi"
 	"relayd/internal/orchestrate"
+	"relayd/internal/transfers"
 	"relayd/internal/vendors"
 )
 
@@ -42,9 +45,24 @@ func adminFromEnv(d *driver.Driver, orch *orchestrate.Orchestrator) (*httpapi.Ad
 		Watchers: map[string]httpapi.WatcherForwarder{},
 		Treasury: map[string]string{
 			"bsc_treasury": orch.Cfg.SlotEVMAddress, "tron_treasury": orch.Cfg.SlotAddress,
-			"bsc_sweep_to": firstNonEmpty(orch.Cfg.SweepToBSC, orch.Cfg.SlotEVMAddress),
+			"bsc_sweep_to":  firstNonEmpty(orch.Cfg.SweepToBSC, orch.Cfg.SlotEVMAddress),
 			"tron_sweep_to": firstNonEmpty(orch.Cfg.SweepToTRON, orch.Cfg.SlotAddress),
 		},
+	}
+	admin.Balance = func(ctx context.Context, chain, address string) (httpapi.WalletBalance, error) {
+		b, err := orch.BalanceOf(ctx, transfers.Chain(chain), address)
+		if err != nil {
+			return httpapi.WalletBalance{}, err
+		}
+		nativeDecimals := 18
+		if b.NativeName == "TRX" {
+			nativeDecimals = 6
+		}
+		out := httpapi.WalletBalance{USDT: formatRaw(b.USDTRaw, b.USDTDecimals), Native: formatRaw(b.NativeRaw, nativeDecimals), NativeFor: b.NativeName}
+		if b.NativeName == "TRX" {
+			out.Energy, out.Bandwidth = &b.Energy, &b.Bandwidth
+		}
+		return out, nil
 	}
 	if d.BEP20Watcher != nil {
 		admin.Watchers["bsc"] = d.BEP20Watcher
@@ -53,4 +71,22 @@ func adminFromEnv(d *driver.Driver, orch *orchestrate.Orchestrator) (*httpapi.Ad
 		admin.Watchers["tron"] = d.TronWatcher
 	}
 	return admin, nil
+}
+
+// formatRaw renders raw on-chain units with decimals places, trimmed.
+func formatRaw(raw *big.Int, decimals int) string {
+	if raw == nil {
+		return "0"
+	}
+	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil)
+	whole, frac := new(big.Int).QuoRem(raw, scale, new(big.Int))
+	digits := frac.String()
+	for len(digits) < decimals {
+		digits = "0" + digits
+	}
+	digits = strings.TrimRight(digits, "0")
+	if digits == "" {
+		return whole.String()
+	}
+	return whole.String() + "." + digits
 }

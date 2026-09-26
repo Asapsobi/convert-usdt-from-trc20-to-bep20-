@@ -302,6 +302,7 @@ type changeNowStatusResponse struct {
 	ToCurrency    string  `json:"toCurrency"`
 	AmountSend    float64 `json:"amountSend"`
 	AmountReceive float64 `json:"amountReceive"`
+	PayoutHash    string  `json:"payoutHash"`
 }
 
 // statusFromChangeNow maps ChangeNOW's own status field onto SwapStatus.
@@ -379,6 +380,7 @@ func (p *ChangeNowProvider) GetOrder(ctx context.Context, providerOrderID string
 		AmountIn:           amountIn,
 		AmountOutExpected:  amountOutExpected,
 		AmountOutActual:    amountOutActual,
+		PayoutTxID:         nonEmpty(resp.PayoutHash),
 		CreatedAt:          time.Now().UTC(),
 	}, nil
 }

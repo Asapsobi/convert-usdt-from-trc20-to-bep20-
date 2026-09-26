@@ -196,6 +196,31 @@ func (c *Client) RetireAddress(ctx context.Context, orderID int64, reason, idemp
 	return nil
 }
 
+// ScanStatus is how far a watcher has looked for deposits, and how many
+// it holds for an order that haven't reached the ledger yet.
+type ScanStatus struct {
+	ScannedThrough  time.Time `json:"scanned_through"`
+	PendingDeposits int       `json:"pending_deposits"`
+}
+
+// ScanStatus calls GET /v1/addresses/{order_id}/scan-status. An error
+// means the watcher can't say how far it has scanned (it is down, or
+// can't reach its node).
+func (c *Client) ScanStatus(ctx context.Context, orderID int64) (ScanStatus, error) {
+	status, body, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/v1/addresses/%d/scan-status", orderID), "", nil)
+	if err != nil {
+		return ScanStatus{}, err
+	}
+	if status != http.StatusOK {
+		return ScanStatus{}, decodeAPIError(status, body)
+	}
+	var out ScanStatus
+	if err := json.Unmarshal(body, &out); err != nil {
+		return ScanStatus{}, fmt.Errorf("watcherclient: decoding scan status for order %d: %w", orderID, err)
+	}
+	return out, nil
+}
+
 // Forward sends one raw request to the watcher's API -- relayd's admin API
 // passes wallet-pool management through this way (the watcher owns the
 // pool). A write carries a fresh idempotency key.

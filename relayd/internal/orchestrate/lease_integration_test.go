@@ -4,6 +4,7 @@ package orchestrate_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -132,5 +133,93 @@ func TestLease_FinishedLegReleasesItsWalletOnce(t *testing.T) {
 	}
 	if ok.reason(g.orderID) != "refunded" || g.leg().LeaseReleasedAt == nil {
 		t.Fatalf("expected the refunded leg's wallet released (reason %q)", ok.reason(g.orderID))
+	}
+}
+
+// scanningWatcher is a releasing watcher that also reports how far it has
+// scanned.
+type scanningWatcher struct {
+	*releasingWatcher
+	status watcherclient.ScanStatus
+	err    error
+}
+
+func (s *scanningWatcher) ScanStatus(ctx context.Context, orderID int64) (watcherclient.ScanStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.status, s.err
+}
+
+func (s *scanningWatcher) set(status watcherclient.ScanStatus, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status, s.err = status, err
+}
+
+// An unpaid order is expired only once its watcher has scanned past the
+// deposit deadline and holds nothing for it. While the watcher is down,
+// behind, or holding a deposit the ledger hasn't seen, the order stays
+// open (with an alert): expiring it would turn a real payment into a
+// manual refund.
+func TestLease_UnpaidLegIsNotExpiredWhileItsWatcherIsBehind(t *testing.T) {
+	ledger := startLedger(t)
+	pool := testPool(t)
+	store := relay.NewStore(pool)
+	ctx := context.Background()
+
+	externalID := uniqueExternalID(t)
+	order := ledger.CreateRelayOrderBEP20ToTRC20(externalID, "cust-expire-lag")
+	index := uint32(74)
+	if _, err := store.Create(ctx, relay.Leg{
+		ExternalID: externalID, OrderID: order.ID, Direction: relay.BEP20ToTRC20, CustomerID: "cust-expire-lag",
+		DestinationAddress: "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj", DepositAddress: signing.FakeBSCDepositAddress(index),
+		DepositDerivationIndex: &index,
+		AmountIn:               money.Amount{Asset: money.USDT_BEP20, Units: 100_000000},
+		AmountOutExpected:      money.Amount{Asset: money.USDT_TRC20, Units: 99_700000},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ledger.BackdateDeposit(externalID)
+	if _, err := pool.Exec(ctx, `UPDATE relay_legs SET created_at = now() - interval '2 hours' WHERE external_id = $1`, externalID); err != nil {
+		t.Fatal(err)
+	}
+	watcher := &scanningWatcher{releasingWatcher: &releasingWatcher{fakeBEP20DepositWatcher: newFakeBEP20DepositWatcher(), released: map[int64]string{}}}
+	alerts := &fakeAlerter{}
+	o := orchestrate.New(store, ledgerclient.New(ledger.BaseURL(), ledger.Token()), upstream.NewMockProvider("mock-expire-lag", 1),
+		newFakeEnergy(), signing.NewFakeSigningService(), &fakeChain{}, newFakeFinality(), &fakeEVMChain{}, newFakeEVMFinality(),
+		alerts, watcher, nil, orchestrate.Config{SlotID: 1, DepositGrace: 30 * time.Minute})
+
+	for name, tc := range map[string]struct {
+		status watcherclient.ScanStatus
+		err    error
+	}{
+		"watcher unreachable": {err: errors.New("connection refused")},
+		"watcher behind":      {status: watcherclient.ScanStatus{ScannedThrough: time.Now().Add(-2 * time.Hour)}},
+		"deposit pending":     {status: watcherclient.ScanStatus{ScannedThrough: time.Now(), PendingDeposits: 1}},
+	} {
+		watcher.set(tc.status, tc.err)
+		if err := o.RunTick(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if leg, _ := store.GetByExternalID(ctx, externalID); leg.Status != relay.StatusAwaitingDeposit {
+			t.Fatalf("%s: the leg was expired while a payment might be unseen (now %s)", name, leg.Status)
+		}
+	}
+	deferred := 0
+	for _, a := range alerts.Fired() {
+		if a.Reason == "relay_leg_expiry_deferred" && a.ExternalID == externalID {
+			deferred++
+		}
+	}
+	if deferred != 3 {
+		t.Fatalf("expected one deferral alert per distinct reason (3), got %d", deferred)
+	}
+
+	watcher.set(watcherclient.ScanStatus{ScannedThrough: time.Now()}, nil)
+	if err := o.RunTick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if leg, _ := store.GetByExternalID(ctx, externalID); leg.Status != relay.StatusExpired {
+		t.Fatalf("expected EXPIRED once the whole window was scanned with nothing found, got %s", leg.Status)
 	}
 }

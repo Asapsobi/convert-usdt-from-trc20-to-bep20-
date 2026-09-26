@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"relayd/internal/alert"
 	"relayd/internal/relay"
 	"relayd/internal/upstream"
 	"relayd/internal/watcherclient"
@@ -89,6 +90,12 @@ func (o *Orchestrator) expireOne(ctx context.Context, leg relay.Leg, now time.Ti
 		if now.Before(order.QuoteExpiresAt.Add(o.Cfg.DepositGrace)) {
 			return nil
 		}
+		if why := o.depositMaybeUnseen(ctx, leg, order.QuoteExpiresAt); why != "" {
+			o.alertOnce(ctx, leg.ExternalID, "relay_leg_expiry_deferred", alert.SeverityWarning,
+				fmt.Sprintf("relay leg %s is past its deposit deadline but is NOT being expired: %s -- a payment may still be unseen",
+					leg.ExternalID, why))
+			return nil
+		}
 		if _, err := o.Ledger.Transition(ctx, leg.ExternalID, "expired", order.Version, "deposit_window_passed",
 			now.UTC(), "relayd:expire:"+leg.ExternalID); err != nil {
 			return fmt.Errorf("expiring the C1 order (a deposit may have just landed): %w", err)
@@ -102,6 +109,34 @@ func (o *Orchestrator) expireOne(ctx context.Context, leg relay.Leg, now time.Ti
 	slog.Info("orchestrate: relay leg expired unpaid", "external_id", leg.ExternalID,
 		"deposit_deadline", order.QuoteExpiresAt.Format(time.RFC3339))
 	return nil
+}
+
+// ScanReporter is the slice of a watcher client that says how far it has
+// scanned for an order's deposit. *watcherclient.Client implements it.
+type ScanReporter interface {
+	ScanStatus(ctx context.Context, orderID int64) (watcherclient.ScanStatus, error)
+}
+
+// depositMaybeUnseen explains why leg's deposit might still be out there
+// unseen -- its watcher can't say how far it has scanned, hasn't scanned
+// past the deadline, or holds a deposit the ledger doesn't show yet -- or
+// returns "" when the whole deposit window was scanned and nothing came.
+// Expiring a paid order would turn its payment into a manual refund.
+func (o *Orchestrator) depositMaybeUnseen(ctx context.Context, leg relay.Leg, deadline time.Time) string {
+	reporter, ok := o.watcherFor(leg).(ScanReporter)
+	if !ok {
+		return ""
+	}
+	st, err := reporter.ScanStatus(ctx, leg.OrderID)
+	switch {
+	case err != nil:
+		return "its deposit watcher can't report how far it has scanned (down, or cut off from its node)"
+	case st.PendingDeposits > 0:
+		return "its deposit watcher holds a deposit for it that the ledger doesn't show yet"
+	case st.ScannedThrough.Before(deadline):
+		return "its deposit watcher hasn't scanned up to the deposit deadline yet"
+	}
+	return ""
 }
 
 // releaseRetryAfter spaces out retries of a release whose watcher failed.

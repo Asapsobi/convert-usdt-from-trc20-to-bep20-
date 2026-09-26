@@ -12,10 +12,42 @@ import (
 
 // Pricing is what we keep from each deposit.
 type Pricing struct {
-	ProfitBPS   int64  `json:"profit_bps"`
-	MinProfit   string `json:"min_profit"`
-	MinAmountIn string `json:"min_amount_in"`
-	MaxAmountIn string `json:"max_amount_in"`
+	ProfitBPS   int64                      `json:"profit_bps"`
+	MinProfit   string                     `json:"min_profit"`
+	MinAmountIn string                     `json:"min_amount_in"`
+	MaxAmountIn string                     `json:"max_amount_in"`
+	Directions  map[string]DirectionMargin `json:"directions,omitempty"`
+}
+
+// DirectionMargin overrides the profit rule for one direction.
+type DirectionMargin struct {
+	ProfitBPS int64  `json:"profit_bps"`
+	MinProfit string `json:"min_profit"`
+}
+
+// WalletBalance is what one address holds on chain.
+type WalletBalance struct {
+	USDT      string `json:"usdt"`
+	Native    string `json:"native"`
+	NativeFor string `json:"native_asset"`
+	Energy    *int64 `json:"energy,omitempty"`
+	Bandwidth *int64 `json:"bandwidth,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// TreasuryChain is one chain's treasury and sweep destination.
+type TreasuryChain struct {
+	Treasury       string         `json:"treasury"`
+	SweepTo        string         `json:"sweep_to"`
+	Balance        *WalletBalance `json:"balance,omitempty"`
+	SweepToBalance *WalletBalance `json:"sweep_to_balance,omitempty"`
+}
+
+// GetTreasury calls GET /v1/admin/treasury.
+func (c *RelaydClient) GetTreasury(ctx context.Context) (map[string]TreasuryChain, error) {
+	var out map[string]TreasuryChain
+	err := do(ctx, c.http, "relayd", c.token, http.MethodGet, c.baseURL+"/v1/admin/treasury", nil, &out)
+	return out, err
 }
 
 // GetPricing calls GET /v1/admin/pricing.
@@ -101,16 +133,17 @@ func (c *RelaydClient) RunSweep(ctx context.Context) error {
 
 // ProfitWallet is the profit one deposit wallet holds, per the books.
 type ProfitWallet struct {
-	Chain        string     `json:"chain"`
-	Address      string     `json:"address"`
-	Legs         int        `json:"legs"`
-	Asset        string     `json:"asset"`
-	Earned       string     `json:"earned"`
-	Swept        string     `json:"swept"`
-	Unswept      string     `json:"unswept"`
-	Busy         bool       `json:"busy"`
-	SweepPending bool       `json:"sweep_pending"`
-	LastFailedAt *time.Time `json:"last_failed_sweep_at,omitempty"`
+	Chain        string         `json:"chain"`
+	Address      string         `json:"address"`
+	Legs         int            `json:"legs"`
+	Asset        string         `json:"asset"`
+	Earned       string         `json:"earned"`
+	Swept        string         `json:"swept"`
+	Unswept      string         `json:"unswept"`
+	Busy         bool           `json:"busy"`
+	SweepPending bool           `json:"sweep_pending"`
+	LastFailedAt *time.Time     `json:"last_failed_sweep_at,omitempty"`
+	OnChain      *WalletBalance `json:"on_chain,omitempty"`
 }
 
 // ProfitWallets is every deposit wallet's profit and the unswept totals.
@@ -122,7 +155,7 @@ type ProfitWallets struct {
 // GetProfitWallets calls GET /v1/admin/wallets.
 func (c *RelaydClient) GetProfitWallets(ctx context.Context) (ProfitWallets, error) {
 	var out ProfitWallets
-	err := do(ctx, c.http, "relayd", c.token, http.MethodGet, c.baseURL+"/v1/admin/wallets", nil, &out)
+	err := do(ctx, c.http, "relayd", c.token, http.MethodGet, c.baseURL+"/v1/admin/wallets?balances=1", nil, &out)
 	return out, err
 }
 

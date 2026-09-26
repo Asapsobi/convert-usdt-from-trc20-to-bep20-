@@ -127,6 +127,9 @@ type Leg struct {
 	// LeaseReleasedAt is when relayd handed this leg's deposit wallet back
 	// to its watcher's pool.
 	LeaseReleasedAt *time.Time
+	// PayoutTxID is the transaction the vendor paid the customer in, as
+	// the vendor reported it at completion.
+	PayoutTxID *string
 }
 
 // ErrLegNotFound means no relay_legs row exists for the given key.
@@ -159,7 +162,7 @@ const selectSQL = `
 		amount_out_actual, upstream_provider_name, upstream_order_id, upstream_deposit_address,
 		forward_tx_id, refund_tx_id, stale_alerted_at, forward_attempt_started_at, created_at, updated_at,
 		customer_label, profit_bps, min_profit, received_amount, sender_address, profit_amount, forward_amount, vendor_fee_amount,
-		lease_released_at
+		lease_released_at, payout_tx_id
 	FROM relay_legs`
 
 // Create inserts a new leg in AWAITING_DEPOSIT, idempotent on
@@ -190,7 +193,7 @@ func (s *Store) Create(ctx context.Context, l Leg) (Leg, error) {
 			amount_out_actual, upstream_provider_name, upstream_order_id, upstream_deposit_address,
 			forward_tx_id, refund_tx_id, stale_alerted_at, forward_attempt_started_at, created_at, updated_at,
 		customer_label, profit_bps, min_profit, received_amount, sender_address, profit_amount, forward_amount, vendor_fee_amount,
-		lease_released_at
+		lease_released_at, payout_tx_id
 	`, l.ExternalID, l.OrderID, string(l.Direction), string(StatusAwaitingDeposit), l.CustomerID, l.DestinationAddress, l.DepositAddress, depositDerivationIndex,
 		l.AmountIn.Units, string(l.AmountIn.Asset), l.AmountOutExpected.Units, string(l.AmountOutExpected.Asset),
 		l.CustomerLabel, l.ProfitBPS, l.MinProfit)
@@ -520,6 +523,16 @@ func (s *Store) RecordDeposit(ctx context.Context, externalID string, received m
 	return s.GetByExternalID(ctx, externalID)
 }
 
+// RecordPayoutTx records the transaction the vendor paid the customer in.
+func (s *Store) RecordPayoutTx(ctx context.Context, externalID, txID string) error {
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE relay_legs SET payout_tx_id = $2, updated_at = updated_at WHERE external_id = $1
+	`, externalID, txID); err != nil {
+		return fmt.Errorf("relay: recording payout tx for %s: %w", externalID, err)
+	}
+	return nil
+}
+
 // RecordVendorFee records what the vendor keeps from the forward.
 func (s *Store) RecordVendorFee(ctx context.Context, externalID string, vendorFeeUnits int64) error {
 	if _, err := s.pool.Exec(ctx, `
@@ -565,7 +578,7 @@ func scanLeg(row scanRow) (Leg, error) {
 		&amountOutActualUnits, &l.UpstreamProviderName, &l.UpstreamOrderID, &l.UpstreamDepositAddress,
 		&l.ForwardTxID, &l.RefundTxID, &l.StaleAlertedAt, &l.ForwardAttemptStartedAt, &l.CreatedAt, &l.UpdatedAt,
 		&l.CustomerLabel, &profitBPS, &l.MinProfit, &received, &l.SenderAddress, &profit, &forward, &l.VendorFeeAmount,
-		&l.LeaseReleasedAt,
+		&l.LeaseReleasedAt, &l.PayoutTxID,
 	)
 	if err != nil {
 		return Leg{}, err
