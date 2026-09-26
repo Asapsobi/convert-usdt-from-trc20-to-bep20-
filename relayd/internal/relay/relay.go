@@ -63,6 +63,10 @@ const (
 	StatusRefundPending Status = "REFUND_PENDING"
 	StatusRefunded      Status = "REFUNDED"
 	StatusUnrecoverable Status = "UNRECOVERABLE"
+
+	// StatusExpired is a leg nobody paid for within its deposit window
+	// (plus grace): its C1 order is expired and its wallet released.
+	StatusExpired Status = "EXPIRED"
 )
 
 // Leg is a relay_legs row.
@@ -97,6 +101,32 @@ type Leg struct {
 	ForwardAttemptStartedAt *time.Time
 	CreatedAt               time.Time
 	UpdatedAt               time.Time
+
+	// CustomerLabel is what the customer typed to identify themselves
+	// (a name or email) -- kept for operators only. CustomerID, the
+	// identity the ledger books under, is derived by relayd, never taken
+	// verbatim from the customer.
+	CustomerLabel *string
+	// ProfitBPS/MinProfit are the pricing snapshot this leg was quoted
+	// under (internal/pricing). nil only on legs created before pricing
+	// became admin-managed.
+	ProfitBPS *int64
+	MinProfit *int64
+	// ReceivedAmount is what actually arrived -- the forward, our profit,
+	// and any refund are all computed from it, never from AmountIn (the
+	// quoted amount). SenderAddress is who sent it. ProfitAmount +
+	// ForwardAmount == ReceivedAmount.
+	ReceivedAmount *money.Amount
+	SenderAddress  *string
+	ProfitAmount   *money.Amount
+	ForwardAmount  *money.Amount
+	// VendorFeeAmount is ForwardAmount minus what the vendor pays the
+	// customer (its fee plus network costs) -- estimated when the vendor
+	// order is created, replaced by the actual figure at settlement.
+	VendorFeeAmount *int64
+	// LeaseReleasedAt is when relayd handed this leg's deposit wallet back
+	// to its watcher's pool.
+	LeaseReleasedAt *time.Time
 }
 
 // ErrLegNotFound means no relay_legs row exists for the given key.
@@ -117,11 +147,19 @@ func NewStore(pool *db.Pool) *Store {
 	return &Store{pool: pool}
 }
 
+// DB returns the pool this store writes to -- relayd's own database,
+// which internal/transfers shares.
+func (s *Store) DB() *db.Pool {
+	return s.pool
+}
+
 const selectSQL = `
 	SELECT id, external_id, order_id, direction, status, customer_id, destination_address,
 		deposit_address, deposit_derivation_index, amount_in, amount_in_asset, amount_out_expected, amount_out_expected_asset,
 		amount_out_actual, upstream_provider_name, upstream_order_id, upstream_deposit_address,
-		forward_tx_id, refund_tx_id, stale_alerted_at, forward_attempt_started_at, created_at, updated_at
+		forward_tx_id, refund_tx_id, stale_alerted_at, forward_attempt_started_at, created_at, updated_at,
+		customer_label, profit_bps, min_profit, received_amount, sender_address, profit_amount, forward_amount, vendor_fee_amount,
+		lease_released_at
 	FROM relay_legs`
 
 // Create inserts a new leg in AWAITING_DEPOSIT, idempotent on
@@ -143,15 +181,19 @@ func (s *Store) Create(ctx context.Context, l Leg) (Leg, error) {
 	row := s.pool.QueryRow(ctx, `
 		INSERT INTO relay_legs
 			(external_id, order_id, direction, status, customer_id, destination_address, deposit_address, deposit_derivation_index,
-			 amount_in, amount_in_asset, amount_out_expected, amount_out_expected_asset)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			 amount_in, amount_in_asset, amount_out_expected, amount_out_expected_asset,
+			 customer_label, profit_bps, min_profit)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		ON CONFLICT (external_id) DO NOTHING
 		RETURNING id, external_id, order_id, direction, status, customer_id, destination_address,
 			deposit_address, deposit_derivation_index, amount_in, amount_in_asset, amount_out_expected, amount_out_expected_asset,
 			amount_out_actual, upstream_provider_name, upstream_order_id, upstream_deposit_address,
-			forward_tx_id, refund_tx_id, stale_alerted_at, forward_attempt_started_at, created_at, updated_at
+			forward_tx_id, refund_tx_id, stale_alerted_at, forward_attempt_started_at, created_at, updated_at,
+		customer_label, profit_bps, min_profit, received_amount, sender_address, profit_amount, forward_amount, vendor_fee_amount,
+		lease_released_at
 	`, l.ExternalID, l.OrderID, string(l.Direction), string(StatusAwaitingDeposit), l.CustomerID, l.DestinationAddress, l.DepositAddress, depositDerivationIndex,
-		l.AmountIn.Units, string(l.AmountIn.Asset), l.AmountOutExpected.Units, string(l.AmountOutExpected.Asset))
+		l.AmountIn.Units, string(l.AmountIn.Asset), l.AmountOutExpected.Units, string(l.AmountOutExpected.Asset),
+		l.CustomerLabel, l.ProfitBPS, l.MinProfit)
 
 	leg, err := scanLeg(row)
 	if err == nil {
@@ -410,6 +452,84 @@ func (s *Store) MarkForwardAttemptStarted(ctx context.Context, externalID string
 	return nil
 }
 
+// MarkExpired transitions externalID from AWAITING_DEPOSIT to EXPIRED --
+// its deposit window passed with nothing paid.
+func (s *Store) MarkExpired(ctx context.Context, externalID string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE relay_legs SET status = $1, updated_at = now()
+		WHERE external_id = $2 AND status = $3
+	`, string(StatusExpired), externalID, string(StatusAwaitingDeposit))
+	if err != nil {
+		return fmt.Errorf("relay: marking %s expired: %w", externalID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return s.checkAlreadyAt(ctx, externalID, StatusExpired)
+	}
+	return nil
+}
+
+// ListLeasesToRelease returns legs that are finished (settled, refunded,
+// unrecoverable, or expired) but whose deposit wallet hasn't been handed
+// back to the pool yet.
+func (s *Store) ListLeasesToRelease(ctx context.Context) ([]Leg, error) {
+	rows, err := s.pool.Query(ctx, selectSQL+`
+		WHERE lease_released_at IS NULL AND status IN ('SETTLED', 'REFUNDED', 'UNRECOVERABLE', 'EXPIRED')
+		ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("relay: listing leases to release: %w", err)
+	}
+	defer rows.Close()
+	var out []Leg
+	for rows.Next() {
+		l, err := scanLeg(rows)
+		if err != nil {
+			return nil, fmt.Errorf("relay: listing leases to release: %w", err)
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+// MarkLeaseReleased records that externalID's deposit wallet was handed
+// back to the pool.
+func (s *Store) MarkLeaseReleased(ctx context.Context, externalID string) error {
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE relay_legs SET lease_released_at = now() WHERE external_id = $1 AND lease_released_at IS NULL
+	`, externalID); err != nil {
+		return fmt.Errorf("relay: marking %s's lease released: %w", externalID, err)
+	}
+	return nil
+}
+
+// RecordDeposit records what actually arrived for externalID, and how it
+// splits into our profit and the amount forwarded to the vendor. First
+// write wins: once recorded, these figures never change, so a replayed
+// or restarted step always forwards (or refunds) exactly the same
+// amount.
+func (s *Store) RecordDeposit(ctx context.Context, externalID string, received money.Amount, sender string, profit, forward money.Amount) (Leg, error) {
+	if profit.Units+forward.Units != received.Units || profit.Asset != received.Asset || forward.Asset != received.Asset {
+		return Leg{}, fmt.Errorf("relay: recording deposit for %s: profit %v + forward %v must equal received %v", externalID, profit, forward, received)
+	}
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE relay_legs
+		SET received_amount = $2, sender_address = $3, profit_amount = $4, forward_amount = $5, updated_at = updated_at
+		WHERE external_id = $1 AND received_amount IS NULL
+	`, externalID, received.Units, sender, profit.Units, forward.Units); err != nil {
+		return Leg{}, fmt.Errorf("relay: recording deposit for %s: %w", externalID, err)
+	}
+	return s.GetByExternalID(ctx, externalID)
+}
+
+// RecordVendorFee records what the vendor keeps from the forward.
+func (s *Store) RecordVendorFee(ctx context.Context, externalID string, vendorFeeUnits int64) error {
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE relay_legs SET vendor_fee_amount = $2, updated_at = updated_at WHERE external_id = $1
+	`, externalID, vendorFeeUnits); err != nil {
+		return fmt.Errorf("relay: recording vendor fee for %s: %w", externalID, err)
+	}
+	return nil
+}
+
 // checkAlreadyAt distinguishes "this call is a safe replay of a
 // transition that already happened" (success) from "the leg is in some
 // OTHER status this transition never expected" (a real error) --
@@ -437,14 +557,31 @@ func scanLeg(row scanRow) (Leg, error) {
 	var amountInAsset, amountOutExpectedAsset string
 	var amountOutActualUnits *int64
 	var depositDerivationIndex *int64 // bigint column; converted to *uint32 below, same pattern depositwatcher's own store.go uses for the identical column type
+	var profitBPS *int32
+	var received, profit, forward *int64
 	err := row.Scan(
 		&l.ID, &l.ExternalID, &l.OrderID, &direction, &status, &l.CustomerID, &l.DestinationAddress,
 		&l.DepositAddress, &depositDerivationIndex, &amountInUnits, &amountInAsset, &amountOutExpectedUnits, &amountOutExpectedAsset,
 		&amountOutActualUnits, &l.UpstreamProviderName, &l.UpstreamOrderID, &l.UpstreamDepositAddress,
 		&l.ForwardTxID, &l.RefundTxID, &l.StaleAlertedAt, &l.ForwardAttemptStartedAt, &l.CreatedAt, &l.UpdatedAt,
+		&l.CustomerLabel, &profitBPS, &l.MinProfit, &received, &l.SenderAddress, &profit, &forward, &l.VendorFeeAmount,
+		&l.LeaseReleasedAt,
 	)
 	if err != nil {
 		return Leg{}, err
+	}
+	if profitBPS != nil {
+		v := int64(*profitBPS)
+		l.ProfitBPS = &v
+	}
+	inAsset := money.Asset(amountInAsset)
+	for _, f := range []struct {
+		units *int64
+		dst   **money.Amount
+	}{{received, &l.ReceivedAmount}, {profit, &l.ProfitAmount}, {forward, &l.ForwardAmount}} {
+		if f.units != nil {
+			*f.dst = &money.Amount{Asset: inAsset, Units: *f.units}
+		}
 	}
 	l.Direction = Direction(direction)
 	l.Status = Status(status)

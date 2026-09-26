@@ -14,10 +14,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/fbsobreira/gotron-sdk/pkg/address"
 	"github.com/fbsobreira/gotron-sdk/pkg/client"
 	"github.com/fbsobreira/gotron-sdk/pkg/proto/core"
 	"google.golang.org/grpc"
@@ -26,6 +29,12 @@ import (
 
 	"relayd/internal/txbuild"
 )
+
+// SetAPIKey sends a TronGrid API key (TRON-PRO-API-KEY) with every call
+// -- without one TronGrid rate-limits hard (HTTP 429).
+func (c *GrpcBroadcastClient) SetAPIKey(key string) {
+	_ = c.grpc.SetAPIKey(key)
+}
 
 // GrpcBroadcastClient implements broadcasting against a real TRON
 // node's gRPC surface, via gotron-sdk's own GrpcClient -- the same
@@ -71,6 +80,82 @@ func (c *GrpcBroadcastClient) CurrentBlockReference(ctx context.Context) (txbuil
 		Timestamp:   now,
 		Expiration:  now.Add(2 * time.Minute),
 	}, nil
+}
+
+// TokenBalance returns holder's USDT-TRC20 balance in raw on-chain units
+// (6 decimals), via a constant (read-only) balanceOf call on the node.
+// Written against TRC20CallCtx directly rather than the SDK's own
+// TRC20ContractBalanceCtx, which indexes the node's result without
+// checking it is there and would panic on an empty response.
+func (c *GrpcBroadcastClient) TokenBalance(ctx context.Context, holder string) (*big.Int, error) {
+	addr, err := address.Base58ToAddress(holder)
+	if err != nil {
+		return nil, fmt.Errorf("tronbroadcast: invalid TRON address %q: %w", holder, err)
+	}
+	// balanceOf(address): selector + the 20-byte address (the 0x41 TRON
+	// prefix stripped) left-padded to one 32-byte word.
+	word := hex.EncodeToString(common.LeftPadBytes(addr.Bytes()[1:], 32))
+	result, err := c.grpc.TRC20CallCtx(ctx, "", txbuild.USDTContractAddress, "0x70a08231"+word, true, 0)
+	if err != nil {
+		return nil, fmt.Errorf("tronbroadcast: reading USDT balance of %s: %w", holder, err)
+	}
+	constant := result.GetConstantResult()
+	if len(constant) != 1 || len(constant[0]) != 32 {
+		return nil, fmt.Errorf("tronbroadcast: USDT balanceOf(%s) returned an unexpected result %x", holder, constant)
+	}
+	return new(big.Int).SetBytes(constant[0]), nil
+}
+
+// Resources is what a TRON account can spend without burning TRX.
+type Resources struct {
+	Exists     bool  // the account has been activated (received TRX at least once)
+	Energy     int64 // available energy: delegated + staked, minus what's used
+	Bandwidth  int64 // available bandwidth: free daily + staked, minus what's used
+	BalanceSun int64 // TRX balance -- burned for whatever bandwidth is missing
+}
+
+// AccountResources reads addr's activation, energy, bandwidth, and TRX.
+// An address that never received TRX has no account: Exists is false and
+// it can't send anything until it is activated.
+func (c *GrpcBroadcastClient) AccountResources(ctx context.Context, addr string) (Resources, error) {
+	acct, err := c.grpc.GetAccountCtx(ctx, addr)
+	if err != nil {
+		if strings.Contains(err.Error(), "account not found") {
+			return Resources{}, nil
+		}
+		return Resources{}, fmt.Errorf("tronbroadcast: reading account %s: %w", addr, err)
+	}
+	res, err := c.grpc.GetAccountResourceCtx(ctx, addr)
+	if err != nil {
+		return Resources{}, fmt.Errorf("tronbroadcast: reading resources of %s: %w", addr, err)
+	}
+	return Resources{
+		Exists:     true,
+		Energy:     max(0, res.GetEnergyLimit()-res.GetEnergyUsed()),
+		Bandwidth:  max(0, res.GetFreeNetLimit()-res.GetFreeNetUsed()) + max(0, res.GetNetLimit()-res.GetNetUsed()),
+		BalanceSun: acct.GetBalance(),
+	}, nil
+}
+
+// EstimateTransferEnergy simulates a USDT transfer of raw units from
+// from to to on the node and returns the energy it would use -- the
+// exact figure, which is about twice as high when to has never held USDT
+// (the contract stores a new balance slot).
+func (c *GrpcBroadcastClient) EstimateTransferEnergy(ctx context.Context, from, to string, raw *big.Int) (int64, error) {
+	toAddr, err := address.Base58ToAddress(to)
+	if err != nil {
+		return 0, fmt.Errorf("tronbroadcast: invalid TRON address %q: %w", to, err)
+	}
+	data := "0xa9059cbb" + hex.EncodeToString(common.LeftPadBytes(toAddr.Bytes()[1:], 32)) +
+		hex.EncodeToString(common.LeftPadBytes(raw.Bytes(), 32))
+	result, err := c.grpc.TRC20CallCtx(ctx, from, txbuild.USDTContractAddress, data, true, 0)
+	if err != nil {
+		return 0, fmt.Errorf("tronbroadcast: estimating the energy of a transfer from %s: %w", from, err)
+	}
+	if result.GetEnergyUsed() <= 0 {
+		return 0, fmt.Errorf("tronbroadcast: the node estimated no energy for a transfer from %s", from)
+	}
+	return result.GetEnergyUsed(), nil
 }
 
 // Broadcast submits tx and returns its txID on success. A false Result

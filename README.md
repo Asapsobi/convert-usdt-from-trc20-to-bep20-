@@ -1,5 +1,10 @@
 # USDT Settlement Corridor
 
+> **Start here: [`docs/00-product-goals.md`](docs/00-product-goals.md)** — the product
+> owner's goals for this system and the source of truth for what it must do. The
+> product is public: anyone can convert USDT between TRC-20 and BEP-20 (decision
+> updated 26 Sep 2026). The history below predates that decision.
+
 A specialised USDT cross-network settlement layer — BEP20 → TRC20 — sold not as a
 swap service but as **TRC20 payout infrastructure for businesses**.
 

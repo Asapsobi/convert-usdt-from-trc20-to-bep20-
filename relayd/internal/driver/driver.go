@@ -14,63 +14,58 @@ package driver
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
+	"strings"
 	"time"
 
+	"relayd/internal/addrcheck"
 	"relayd/internal/ledgerclient"
 	"relayd/internal/money"
+	"relayd/internal/pricing"
 	"relayd/internal/relay"
 	"relayd/internal/upstream"
 	"relayd/internal/watcherclient"
 )
 
-// Config is this driver's own required, no-hardcoded-default tuning.
 type Config struct {
-	// FeeBasisPoints is relayd's own commission, in basis points of
-	// amount_in, withheld before forwarding -- a concrete stand-in for
-	// R2's still-open pricing-mechanism decision (commission vs margin,
-	// docs/01-strategy/model-f-relay-findings.md's own "two open pricing
-	// mechanisms"), not itself that decision. Neither mechanism needs
-	// different engineering, per that doc's own note, so this config
-	// value is what changes once R2 resolves, not this driver's shape.
-	FeeBasisPoints int64
-	// QuoteValidity mirrors proofrun's own identical field: generous on
-	// purpose, matching a real deposit's own real-world timing, not
-	// C6's eventual tight 90s lock.
+	// QuoteValidity is how long a displayed quote stays valid, capped by
+	// the vendor's own rate lock. It only bounds the quote screen: the
+	// vendor order itself is created when the deposit arrives.
 	QuoteValidity time.Duration
+	// DepositWindow is how long a customer has, after creating an order,
+	// to send their deposit to the address they were given.
+	DepositWindow time.Duration
 }
 
-// Driver bundles every real dependency CreateRelayLeg needs.
+// Driver is relayd's front door: quotes, and creating relay legs.
 type Driver struct {
 	Ledger       *ledgerclient.Client
 	Upstream     upstream.SwapProvider
 	TronWatcher  *watcherclient.Client // C2' -- TRC20_TO_BEP20's own deposit side
 	BEP20Watcher *watcherclient.Client // C2 (depositwatcher) -- BEP20_TO_TRC20's own deposit side
 	Store        *relay.Store
+	Pricing      *pricing.Store
 	Cfg          Config
 }
 
-// CreateRelayLegRequest is this driver's own minimal quote-then-create
-// input.
-type CreateRelayLegRequest struct {
-	ExternalID         string
-	CustomerID         string
-	Direction          relay.Direction
-	DestinationAddress string // the customer's OWN wallet on the out-chain
-	AmountIn           string // decimal string, in-asset for Direction
-}
+// ErrBadRequest marks a request the customer has to fix (an invalid
+// address, an amount outside the accepted range) -- as opposed to a
+// failure on our side or a vendor's.
+var ErrBadRequest = errors.New("bad request")
 
-// CreateRelayLegResult is what a caller needs to actually fund the leg.
-type CreateRelayLegResult struct {
-	ExternalID      string
-	OrderID         int64
-	DepositAddress  string
-	AmountIn        string
-	AmountOutQuoted string
-	FeeUnits        string
-	QuoteExpiresAt  time.Time
-}
+// ErrConflict means the request's external_id already belongs to a
+// different order -- another customer's, or a Model D order sharing the
+// ledger's namespace. Only an exact retry of the original request may
+// reuse an external_id.
+var ErrConflict = errors.New("driver: external_id is already used by a different order")
+
+// validExternalID keeps external ids long enough not to be guessed and
+// free of characters that would need escaping.
+var validExternalID = regexp.MustCompile(`^[A-Za-z0-9._:-]{16,128}$`)
 
 func pairFor(direction relay.Direction) upstream.Pair {
 	if direction == relay.TRC20ToBEP20 {
@@ -86,101 +81,186 @@ func inAssetFor(direction relay.Direction) money.Asset {
 	return money.USDT_BEP20
 }
 
-// CreateRelayLeg computes amount_in, gets a real quote from the
-// upstream provider, withholds this driver's own commission, creates
-// the order against C1, assigns a deposit address against the right
-// watcher for this leg's direction, and records the leg locally.
-//
-// Order of operations mirrors proofrun's own CreatePayout: C1 first
-// (idempotent-safe to retry: a duplicate external_id CreateOrder call
-// is followed by one GetOrder attempt, on the theory a caller retried
-// after an uncertain outcome), then the watcher (not idempotent the
-// same way relay.Store.Create is, but the watcher's own POST
-// /v1/addresses is idempotent on order_id, matching depositwatcher's/
-// tronwatcher's own real, shared contract), then the local leg row.
-func (d *Driver) CreateRelayLeg(ctx context.Context, req CreateRelayLegRequest) (CreateRelayLegResult, error) {
+// QuoteRequest asks what a deposit of AmountIn would pay out.
+type QuoteRequest struct {
+	Direction relay.Direction
+	AmountIn  string // decimal string, in-asset for Direction
+}
+
+// Quote is the full breakdown a customer sees before committing:
+// AmountIn = OurFee + VendorFee + AmountOut (all USDT, same scale on both
+// networks). The vendor fee includes the vendor's network costs.
+type Quote struct {
+	Direction  relay.Direction
+	AmountIn   money.Amount
+	OurFee     money.Amount // in-asset
+	Forward    money.Amount // in-asset: what the vendor receives
+	VendorFee  money.Amount // in-asset units: Forward minus AmountOut
+	AmountOut  money.Amount // out-asset: what the customer receives
+	Vendor     string
+	ValidUntil time.Time
+	Pricing    pricing.Config
+}
+
+// Quote prices a deposit without creating anything.
+func (d *Driver) Quote(ctx context.Context, req QuoteRequest) (Quote, error) {
+	if req.Direction != relay.TRC20ToBEP20 && req.Direction != relay.BEP20ToTRC20 {
+		return Quote{}, fmt.Errorf("%w: direction must be TRC20_TO_BEP20 or BEP20_TO_TRC20", ErrBadRequest)
+	}
 	inAsset := inAssetFor(req.Direction)
 	amountIn, err := money.ParseDecimal(req.AmountIn, inAsset)
 	if err != nil {
-		return CreateRelayLegResult{}, fmt.Errorf("driver: amount_in: %w", err)
+		return Quote{}, fmt.Errorf("%w: amount_in: %v", ErrBadRequest, err)
 	}
-	if amountIn.Units <= 0 {
-		return CreateRelayLegResult{}, fmt.Errorf("driver: amount_in must be positive")
-	}
-
-	feeUnits := money.Amount{Asset: inAsset, Units: amountIn.Units * d.Cfg.FeeBasisPoints / 10_000}
-	forwardIn, err := amountIn.Sub(feeUnits)
+	cfg, err := d.Pricing.Get(ctx)
 	if err != nil {
-		return CreateRelayLegResult{}, fmt.Errorf("driver: computing forward amount: %w", err)
+		return Quote{}, err
+	}
+	if amountIn.Units < cfg.MinAmountIn || amountIn.Units > cfg.MaxAmountIn {
+		return Quote{}, fmt.Errorf("%w: amount must be between %s and %s USDT", ErrBadRequest,
+			formatUnits(cfg.MinAmountIn, inAsset), formatUnits(cfg.MaxAmountIn, inAsset))
+	}
+	ourFee, forward, ok := cfg.Split(amountIn)
+	if !ok {
+		return Quote{}, fmt.Errorf("%w: amount is too small to cover our fee", ErrBadRequest)
 	}
 
-	pair := pairFor(req.Direction)
-	quote, err := d.Upstream.Quote(ctx, pair, forwardIn)
+	vendorQuote, err := d.Upstream.Quote(ctx, pairFor(req.Direction), forward)
 	if err != nil {
-		return CreateRelayLegResult{}, fmt.Errorf("driver: getting upstream quote: %w", err)
+		return Quote{}, fmt.Errorf("driver: getting a vendor quote: %w", err)
 	}
+	vendorFee := money.Amount{Asset: inAsset, Units: forward.Units - vendorQuote.AmountOut.Units}
 
+	validUntil := time.Now().UTC().Add(d.Cfg.QuoteValidity)
+	if vendorQuote.ValidUntil.Before(validUntil) {
+		validUntil = vendorQuote.ValidUntil
+	}
+	return Quote{
+		Direction: req.Direction, AmountIn: amountIn, OurFee: ourFee, Forward: forward,
+		VendorFee: vendorFee, AmountOut: vendorQuote.AmountOut, Vendor: vendorQuote.ProviderName,
+		ValidUntil: validUntil, Pricing: cfg,
+	}, nil
+}
+
+func formatUnits(units int64, asset money.Asset) string {
+	s, err := money.Format(money.Amount{Asset: asset, Units: units})
+	if err != nil {
+		return fmt.Sprint(units)
+	}
+	return s
+}
+
+// ValidateDestination checks the customer's payout address is a valid
+// address on the network they will be paid on.
+func ValidateDestination(direction relay.Direction, destination string) error {
+	var err error
+	if direction == relay.TRC20ToBEP20 {
+		err = addrcheck.EVM(destination)
+	} else {
+		err = addrcheck.TRON(destination)
+	}
+	if err != nil {
+		return fmt.Errorf("%w: destination_address: %v", ErrBadRequest, err)
+	}
+	return nil
+}
+
+// LedgerCustomerID is the identity a leg is booked under in the ledger.
+// Derived, never taken verbatim: what a customer types (a name, an email)
+// must not be able to land in, or collide with, another customer's ledger
+// accounts -- Model D's customers share the same account namespace.
+func LedgerCustomerID(label string) string {
+	sum := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(label))))
+	return "relay-" + hex.EncodeToString(sum[:8])
+}
+
+type CreateRelayLegRequest struct {
+	ExternalID         string
+	CustomerLabel      string // what the customer typed to identify themselves
+	Direction          relay.Direction
+	DestinationAddress string // the customer's OWN wallet on the out-chain
+	AmountIn           string // decimal string, in-asset for Direction
+}
+
+type CreateRelayLegResult struct {
+	ExternalID      string
+	OrderID         int64
+	DepositAddress  string
+	Quote           Quote
+	DepositDeadline time.Time
+}
+
+// CreateRelayLeg validates the request, prices it, and reserves a
+// deposit address: a C1 order, the watcher's address assignment, and the
+// local leg -- each step idempotent on ExternalID, so a failed call is
+// safe to repeat.
+func (d *Driver) CreateRelayLeg(ctx context.Context, req CreateRelayLegRequest) (CreateRelayLegResult, error) {
+	if strings.TrimSpace(req.CustomerLabel) == "" {
+		return CreateRelayLegResult{}, fmt.Errorf("%w: customer label is required", ErrBadRequest)
+	}
+	if !validExternalID.MatchString(req.ExternalID) {
+		return CreateRelayLegResult{}, fmt.Errorf("%w: external_id must be 16-128 characters of letters, digits, '.', '_', ':' or '-'", ErrBadRequest)
+	}
+	if err := ValidateDestination(req.Direction, req.DestinationAddress); err != nil {
+		return CreateRelayLegResult{}, err
+	}
+	quote, err := d.Quote(ctx, QuoteRequest{Direction: req.Direction, AmountIn: req.AmountIn})
+	if err != nil {
+		return CreateRelayLegResult{}, err
+	}
+	inAsset := quote.AmountIn.Asset
+	customerID := LedgerCustomerID(req.CustomerLabel)
 	quotedAt := time.Now().UTC()
-	quoteExpiresAt := quotedAt.Add(d.Cfg.QuoteValidity)
-	if quote.ValidUntil.Before(quoteExpiresAt) {
-		// Never quote the customer past the upstream's OWN lock window --
-		// architecture doc §6's own "shorten the lock" guidance.
-		quoteExpiresAt = quote.ValidUntil
-	}
+	depositDeadline := quotedAt.Add(d.Cfg.DepositWindow)
 
-	order, err := d.Ledger.CreateOrder(ctx, req.ExternalID, req.CustomerID, amountIn, quote.AmountOut,
-		feeUnits, money.Amount{Asset: inAsset, Units: 0}, req.DestinationAddress, quotedAt, quoteExpiresAt,
+	order, err := d.Ledger.CreateOrder(ctx, req.ExternalID, customerID, quote.AmountIn, quote.AmountOut,
+		quote.OurFee, money.Amount{Asset: inAsset, Units: 0}, req.DestinationAddress, quotedAt, depositDeadline,
 		"relayd:create-order:"+req.ExternalID)
 	if err != nil {
-		if existing, getErr := d.Ledger.GetOrder(ctx, req.ExternalID); getErr == nil {
-			order = existing
-		} else {
+		existing, getErr := d.Ledger.GetOrder(ctx, req.ExternalID)
+		if getErr != nil {
 			return CreateRelayLegResult{}, fmt.Errorf("driver: creating order in C1: %w", err)
 		}
+		// A retry of this same request finds its own order; anything else
+		// is someone else's order and must not be touched.
+		if existing.Tier != "RELAY" || existing.CustomerID != customerID || existing.RecipientAddress != req.DestinationAddress ||
+			existing.AmountIn != quote.AmountIn {
+			return CreateRelayLegResult{}, fmt.Errorf("%w: %s", ErrConflict, req.ExternalID)
+		}
+		order = existing
+		depositDeadline = existing.QuoteExpiresAt
 	}
 
 	watcher := d.BEP20Watcher
 	if req.Direction == relay.TRC20ToBEP20 {
 		watcher = d.TronWatcher
 	}
-	addr, err := watcher.AssignAddress(ctx, order.ID, order.ExternalID, req.CustomerID,
-		quotedAt, quoteExpiresAt, "relayd:assign-address:"+req.ExternalID)
+	addr, err := watcher.AssignAddress(ctx, order.ID, order.ExternalID, order.CustomerID,
+		quotedAt, depositDeadline, "relayd:assign-address:"+req.ExternalID)
 	if err != nil {
 		return CreateRelayLegResult{}, fmt.Errorf("driver: order %d created in C1 (external_id %s) but assigning a deposit address failed -- retry this call, C1's own side is idempotent-safe to repeat: %w",
 			order.ID, order.ExternalID, err)
 	}
 
+	label := strings.TrimSpace(req.CustomerLabel)
+	profitBPS, minProfit := quote.Pricing.ProfitBPS, quote.Pricing.MinProfit
 	leg, err := d.Store.Create(ctx, relay.Leg{
 		ExternalID: order.ExternalID, OrderID: order.ID, Direction: req.Direction,
-		CustomerID: req.CustomerID, DestinationAddress: req.DestinationAddress,
-		// DepositDerivationIndex comes straight off the real
-		// AssignAddress response -- naturally nil for a TRC20ToBEP20
-		// leg (TronWatcher's own response never has this field), never
-		// recomputed or guessed.
+		CustomerID: order.CustomerID, CustomerLabel: &label, DestinationAddress: req.DestinationAddress,
 		DepositAddress: addr.Address, DepositDerivationIndex: addr.DerivationIndex,
-		AmountIn: amountIn, AmountOutExpected: quote.AmountOut,
+		AmountIn: quote.AmountIn, AmountOutExpected: quote.AmountOut,
+		ProfitBPS: &profitBPS, MinProfit: &minProfit,
 	})
 	if err != nil {
 		return CreateRelayLegResult{}, fmt.Errorf("driver: recording relay leg locally: %w", err)
 	}
-
-	feeStr, err := money.Format(feeUnits)
-	if err != nil {
-		return CreateRelayLegResult{}, fmt.Errorf("driver: formatting fee_units: %w", err)
-	}
-	amountInStr, err := money.Format(amountIn)
-	if err != nil {
-		return CreateRelayLegResult{}, fmt.Errorf("driver: formatting amount_in: %w", err)
-	}
-	amountOutStr, err := money.Format(quote.AmountOut)
-	if err != nil {
-		return CreateRelayLegResult{}, fmt.Errorf("driver: formatting amount_out: %w", err)
+	if leg.OrderID != order.ID || leg.Direction != req.Direction || leg.DestinationAddress != req.DestinationAddress {
+		return CreateRelayLegResult{}, fmt.Errorf("%w: %s", ErrConflict, req.ExternalID)
 	}
 
 	return CreateRelayLegResult{
 		ExternalID: leg.ExternalID, OrderID: leg.OrderID, DepositAddress: leg.DepositAddress,
-		AmountIn: amountInStr, AmountOutQuoted: amountOutStr, FeeUnits: feeStr,
-		QuoteExpiresAt: quoteExpiresAt,
+		Quote: quote, DepositDeadline: depositDeadline,
 	}, nil
 }
 
@@ -270,17 +350,35 @@ func (d *Driver) BuildRefundEntry(ctx context.Context, externalID string) (Refun
 		return RefundEntry{}, fmt.Errorf("%w: order state is %s, want held", ErrLegNotEligibleForRefundEntry, order.State)
 	}
 
-	negAmountIn, err := order.AmountIn.Neg()
+	// Refund what actually arrived -- the deposit sits in the leg's own
+	// suspense account -- never the quoted amount, which can differ.
+	received, err := d.Ledger.AccountBalance(ctx, refundRelayLegAccountCode(leg.OrderID))
 	if err != nil {
-		return RefundEntry{}, fmt.Errorf("driver: negating amount_in: %w", err)
+		return RefundEntry{}, fmt.Errorf("driver: reading the deposit held for order %d: %w", leg.OrderID, err)
 	}
-	amountInStr, err := money.Format(order.AmountIn)
+	if received.Units <= 0 {
+		return RefundEntry{}, fmt.Errorf("%w: no deposit is held for this order", ErrLegNotEligibleForRefundEntry)
+	}
+	// Record it on the leg too, so the refund transfer relayd sends once
+	// this entry posts returns exactly the amount the entry books.
+	sender := ""
+	if order.SenderAddress != nil {
+		sender = *order.SenderAddress
+	}
+	if _, err := d.Store.RecordDeposit(ctx, externalID, received, sender, money.Amount{Asset: received.Asset}, received); err != nil {
+		return RefundEntry{}, fmt.Errorf("driver: recording the deposit for order %d: %w", leg.OrderID, err)
+	}
+	negAmountIn, err := received.Neg()
 	if err != nil {
-		return RefundEntry{}, fmt.Errorf("driver: formatting amount_in: %w", err)
+		return RefundEntry{}, fmt.Errorf("driver: negating the received amount: %w", err)
+	}
+	amountInStr, err := money.Format(received)
+	if err != nil {
+		return RefundEntry{}, fmt.Errorf("driver: formatting the received amount: %w", err)
 	}
 	negAmountInStr, err := money.Format(negAmountIn)
 	if err != nil {
-		return RefundEntry{}, fmt.Errorf("driver: formatting negated amount_in: %w", err)
+		return RefundEntry{}, fmt.Errorf("driver: formatting the negated received amount: %w", err)
 	}
 
 	asset := string(order.AmountIn.Asset)

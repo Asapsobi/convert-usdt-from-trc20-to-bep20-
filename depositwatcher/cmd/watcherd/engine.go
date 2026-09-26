@@ -16,6 +16,7 @@ import (
 	"depositwatcher/internal/candidates"
 	"depositwatcher/internal/chain"
 	"depositwatcher/internal/db"
+	"depositwatcher/internal/deposits"
 	"depositwatcher/internal/finality"
 	"depositwatcher/internal/ledgerclient"
 	"depositwatcher/internal/money"
@@ -222,9 +223,19 @@ func newEngineFromEnv(pool *db.Pool) (*engine, error) {
 		ReorgReporter:           ledger,
 		OrphanedDepositRecorder: orphanedRecorder{pool: pool, ledger: ledger},
 		AsyncMinAgreement:       effectiveMinAgreement,
+		Store:                   deposits.NewStore(pool),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("watcherd: building finality tracker: %w", err)
+	}
+	// Deposits a previous run detected but never reported are picked up
+	// again before scanning resumes.
+	restored, err := tracker.Restore(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("watcherd: %w", err)
+	}
+	if restored > 0 {
+		slog.Info("watcherd: resumed deposits detected before the last restart", "count", restored)
 	}
 	e.tracker = tracker
 	return e, nil

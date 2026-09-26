@@ -53,31 +53,28 @@ type Config struct {
 	AsyncFinality bool
 }
 
-// ScanRange fetches Transfer logs in [fromHeight, toHeight] via
-// pool.LogsAt (2-provider agreement, invariant 5) and resolves each one
-// into exactly one of four outcomes:
-//
-//   - Not in the address book at all: expected noise on a shared chain,
-//     ignored entirely -- not even logged as an anomaly, per the C2.4
-//     build spec's own acceptance criterion.
-//   - Address RETIRED: a late deposit, a distinct case handed to C2.8's
-//     own orphaned_deposits mechanism (reused here, since "money arrived
-//     with nowhere to put it" is the same category whether C1 rejected
-//     an already-final report or the address was simply retired first).
-//   - ParseTransferLog fails (ErrWrongToken): logged as an anomaly,
-//     never reaches classification -- "should be near-impossible given
-//     the filter," since LogsAt's own query already scopes by contract
-//     address and this exact topic.
-//   - Address WATCHING or FUNDED: classified against the order's quoted
-//     amount and handed to tracker.OnLogObserved -- deposit.detected
-//     fires there, immediately, before finality is ever considered.
+// ScanRange finds deposits to our own wallets in [fromHeight, toHeight]
+// and hands each to the finality tracker, which records it before this
+// returns -- so the caller may advance its cursor past the range.
 func ScanRange(ctx context.Context, pool *chain.Pool, database db.Queryer, quotes QuotedAmountFetcher,
 	tracker *finality.Tracker, cfg Config, fromHeight, toHeight uint64) error {
 	if fromHeight > toHeight {
 		return nil
 	}
-
-	logs, err := pool.LogsAt(ctx, fromHeight, toHeight, cfg.ContractAddress, [][]common.Hash{{cfg.TransferTopic}})
+	watch, err := addresses.WatchSet(ctx, database)
+	if err != nil {
+		return fmt.Errorf("candidates: %w", err)
+	}
+	if len(watch) == 0 {
+		return nil // no wallet of ours can receive anything in this range
+	}
+	// Only Transfer logs paying one of our wallets: topic 2 is the
+	// recipient, left-padded to 32 bytes.
+	to := make([]common.Hash, len(watch))
+	for i, a := range watch {
+		to[i] = common.BytesToHash(common.HexToAddress(string(a)).Bytes())
+	}
+	logs, err := pool.LogsAt(ctx, fromHeight, toHeight, cfg.ContractAddress, [][]common.Hash{{cfg.TransferTopic}, {}, to})
 	if err != nil {
 		return fmt.Errorf("candidates: fetching logs [%d,%d]: %w", fromHeight, toHeight, err)
 	}
@@ -91,6 +88,11 @@ func ScanRange(ctx context.Context, pool *chain.Pool, database db.Queryer, quote
 	return nil
 }
 
+// processLog attributes one Transfer to the lease that was open on its
+// wallet at its block time, then hands it to the tracker. A payment
+// outside any lease, after its lease ended, or too small to be a real
+// deposit (dust -- e.g. address poisoning) is recorded as orphaned and
+// never funds an order.
 func processLog(ctx context.Context, pool *chain.Pool, database db.Queryer, quotes QuotedAmountFetcher,
 	tracker *finality.Tracker, cfg Config, log types.Log, blockTimes map[uint64]time.Time) error {
 	from, to, amount, err := chain.ParseTransferLog(log)
@@ -102,44 +104,41 @@ func processLog(ctx context.Context, pool *chain.Pool, database db.Queryer, quot
 		}
 		return err
 	}
-
-	wa, err := addresses.GetByAddress(ctx, database, addresses.Address(to.Hex()))
-	if err != nil {
-		if errors.Is(err, addresses.ErrAddressNotFound) {
-			return nil // expected chain noise, not a signal
-		}
-		return err
-	}
-
-	if wa.Status == addresses.StatusRetired {
-		return recordLateDeposit(ctx, database, wa, log, amount)
-	}
-
-	quoted, err := quotes.QuotedAmount(ctx, wa.ExternalID)
-	if err != nil {
-		return fmt.Errorf("fetching quoted amount for %s: %w", wa.ExternalID, err)
-	}
-	classification := chain.ClassifyAgainstOrder(amount, quoted, cfg.DustFloor)
-
 	blockTime, err := blockTimeFor(ctx, pool, log.BlockNumber, blockTimes)
 	if err != nil {
 		return err
 	}
 
+	lease, found, err := addresses.LeaseAt(ctx, database, to.Hex(), blockTime)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return recordOrphan(ctx, database, addresses.WatchedAddress{Address: addresses.Address(to.Hex())}, log, amount, "no_lease")
+	}
+	// Block times are whole seconds: a payment in the same second the
+	// lease ended counts as late.
+	if lease.Status == addresses.StatusRetired && lease.RetiredAt != nil && !blockTime.Before(lease.RetiredAt.Truncate(time.Second)) {
+		return recordOrphan(ctx, database, lease, log, amount, "address_retired")
+	}
+
+	quoted, err := quotes.QuotedAmount(ctx, lease.ExternalID)
+	if err != nil {
+		return fmt.Errorf("fetching quoted amount for %s: %w", lease.ExternalID, err)
+	}
+	classification := chain.ClassifyAgainstOrder(amount, quoted, cfg.DustFloor)
+	if classification == chain.Dust {
+		return recordOrphan(ctx, database, lease, log, amount, "dust")
+	}
+
 	observed := finality.ObservedLog{
 		TxHash: log.TxHash, LogIndex: uint(log.Index), Height: log.BlockNumber, BlockTime: blockTime,
-		OrderID: wa.OrderID, ExternalID: wa.ExternalID, CustomerID: wa.CustomerID, Amount: amount,
-		SenderAddress: from.Hex(),
+		OrderID: lease.OrderID, ExternalID: lease.ExternalID, CustomerID: lease.CustomerID, Amount: amount,
+		SenderAddress: from.Hex(), Address: string(lease.Address),
 	}
 	return tracker.OnLogObserved(ctx, observed, classification)
 }
 
-// blockTimeFor fetches the block timestamp for height via the primary
-// provider only (chain.HeaderByNumber), the same primary-only convention
-// C2.3's own advisory reads use -- this is invariant 7's chain-time
-// requirement, not a finality decision, so it does not need 2-provider
-// agreement. Cached per ScanRange call: several logs in the same block
-// share one header fetch.
 func blockTimeFor(ctx context.Context, pool *chain.Pool, height uint64, cache map[uint64]time.Time) (time.Time, error) {
 	if t, ok := cache[height]; ok {
 		return t, nil
@@ -153,17 +152,14 @@ func blockTimeFor(ctx context.Context, pool *chain.Pool, height uint64, cache ma
 	return t, nil
 }
 
-// recordLateDeposit handles a Transfer landing on an address already
-// RETIRED -- distinct from C2.7's illegal_transition case (no C1 call
-// was ever attempted here), but the same underlying category: real
-// money, nowhere to put it, never silently dropped and never silently
-// credited. order_state_at_detection is a fixed marker rather than an
-// actual C1 state, since this path never asks C1 anything.
-func recordLateDeposit(ctx context.Context, database db.Queryer, wa addresses.WatchedAddress, log types.Log, amount money.Amount) error {
-	slog.Error("candidates: LATE DEPOSIT -- a Transfer landed on a retired address; recorded for manual reconciliation",
-		"tx_hash", log.TxHash, "log_index", log.Index, "order_id", wa.OrderID, "external_id", wa.ExternalID, "amount", amount)
+// recordOrphan records a payment that funds no order, for an operator to
+// resolve (usually a refund). Idempotent on tx_hash:log_index.
+func recordOrphan(ctx context.Context, database db.Queryer, lease addresses.WatchedAddress, log types.Log, amount money.Amount, reason string) error {
+	slog.Error("candidates: ORPHANED DEPOSIT -- a payment to one of our wallets funds no order; recorded for manual reconciliation",
+		"reason", reason, "tx_hash", log.TxHash, "log_index", log.Index, "address", lease.Address,
+		"order_id", lease.OrderID, "external_id", lease.ExternalID, "amount", amount)
 	return orphaned.Record(ctx, database, orphaned.Deposit{
-		OrderID: wa.OrderID, ExternalID: wa.ExternalID, TxHash: log.TxHash.Hex(), LogIndex: int(log.Index),
-		Amount: int64(amount), DetectedAt: time.Now().UTC(), OrderStateAtDetection: "address_retired",
+		OrderID: lease.OrderID, ExternalID: lease.ExternalID, TxHash: log.TxHash.Hex(), LogIndex: int(log.Index),
+		Amount: int64(amount), DetectedAt: time.Now().UTC(), OrderStateAtDetection: reason, Address: string(lease.Address),
 	})
 }

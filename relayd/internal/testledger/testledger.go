@@ -248,7 +248,7 @@ func (l *Ledger) CreateRelayOrderBEP20ToTRC20(externalID, customerID string) Ord
 // this direction), not USDT_TRC20.
 func (l *Ledger) AdvanceToScreenedBEP20ToTRC20(order OrderResp) OrderResp {
 	l.t.Helper()
-	return l.advanceToScreenedBEP20ToTRC20(order, "")
+	return l.advanceToScreenedBEP20ToTRC20(order, "", "100.000000")
 }
 
 // AdvanceToScreenedBEP20ToTRC20WithSender also records the depositor's
@@ -256,10 +256,19 @@ func (l *Ledger) AdvanceToScreenedBEP20ToTRC20(order OrderResp) OrderResp {
 // is ever allowed to return funds to.
 func (l *Ledger) AdvanceToScreenedBEP20ToTRC20WithSender(order OrderResp, senderAddress string) OrderResp {
 	l.t.Helper()
-	return l.advanceToScreenedBEP20ToTRC20(order, senderAddress)
+	return l.advanceToScreenedBEP20ToTRC20(order, senderAddress, "100.000000")
 }
 
-func (l *Ledger) advanceToScreenedBEP20ToTRC20(order OrderResp, senderAddress string) OrderResp {
+// AdvanceToScreenedBEP20ToTRC20WithDeposit is
+// AdvanceToScreenedBEP20ToTRC20WithSender for a customer who sent
+// depositAmount (a decimal USDT string) rather than the quoted 100 --
+// what a watcher books when the deposit doesn't match the quote.
+func (l *Ledger) AdvanceToScreenedBEP20ToTRC20WithDeposit(order OrderResp, senderAddress, depositAmount string) OrderResp {
+	l.t.Helper()
+	return l.advanceToScreenedBEP20ToTRC20(order, senderAddress, depositAmount)
+}
+
+func (l *Ledger) advanceToScreenedBEP20ToTRC20(order OrderResp, senderAddress, depositAmount string) OrderResp {
 	l.t.Helper()
 	relayLegAccount := "asset:relay:leg:" + strconv.FormatInt(order.ID, 10)
 	bepLiability := "liability:customer:" + order.CustomerID + ":USDT_BEP20"
@@ -276,8 +285,8 @@ func (l *Ledger) advanceToScreenedBEP20ToTRC20(order OrderResp, senderAddress st
 			"entry_type":  "deposit_final",
 			"occurred_at": now,
 			"lines": []map[string]any{
-				{"account_code": relayLegAccount, "asset": "USDT_BEP20", "amount": "100.000000"},
-				{"account_code": bepLiability, "asset": "USDT_BEP20", "amount": "-100.000000"},
+				{"account_code": relayLegAccount, "asset": "USDT_BEP20", "amount": depositAmount},
+				{"account_code": bepLiability, "asset": "USDT_BEP20", "amount": "-" + depositAmount},
 			},
 		},
 	}
@@ -490,4 +499,15 @@ func (l *Ledger) GetOrder(externalID string) OrderResp {
 		l.t.Fatalf("decoding order response: %v: %s", err, body)
 	}
 	return o
+}
+
+// BackdateDeposit moves externalID's deposit deadline an hour into the
+// past, as if the customer's deposit window had long since run out.
+func (l *Ledger) BackdateDeposit(externalID string) {
+	l.t.Helper()
+	if _, err := l.pool.Exec(context.Background(),
+		`UPDATE orders SET quoted_at = now() - interval '2 hours', quote_expires_at = now() - interval '1 hour' WHERE external_id = $1`,
+		externalID); err != nil {
+		l.t.Fatalf("backdating %s's deposit deadline: %v", externalID, err)
+	}
 }

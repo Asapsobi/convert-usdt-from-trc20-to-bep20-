@@ -6,7 +6,7 @@
 // nested {error:{code,message}} -- ApiError below is constructed
 // accordingly, with no separate `code` field since relayd's own errors
 // don't carry one.
-import type { CreateRelayLegResponse, Direction, RelayLeg } from "./types";
+import type { CreateRelayLegResponse, Direction, QuoteResponse, RelayLeg } from "./types";
 
 // No default -- an unconfigured deployment must fail loudly in dev
 // rather than silently pointing at the wrong backend, the same
@@ -47,9 +47,12 @@ async function request<T>(path: string, options: { method?: string; body?: unkno
 }
 
 export const api = {
+  quote: (direction: Direction, amountIn: string) =>
+    request<QuoteResponse>("/v1/quotes", { method: "POST", body: { direction, amount_in: amountIn } }),
+
   createRelayLeg: (
     externalId: string,
-    customerId: string,
+    customerLabel: string,
     direction: Direction,
     destinationAddress: string,
     amountIn: string,
@@ -58,7 +61,7 @@ export const api = {
       method: "POST",
       body: {
         external_id: externalId,
-        customer_id: customerId,
+        customer_label: customerLabel,
         direction,
         destination_address: destinationAddress,
         amount_in: amountIn,

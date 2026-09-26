@@ -49,7 +49,7 @@ const layout = `<!doctype html>
 <body>
 {{ if .Session }}
 <header>
-  <div><a href="/">Home</a><a href="/ledger/halt">Ledger</a><a href="/watcher/cursor">Watcher</a><a href="/broker/reservations?status=FAILED">Broker</a><a href="/screening/holds">Screening</a><a href="/dispatcher/slots">Dispatcher</a><a href="/s1/approvals">S1</a><a href="/relayd/legs">Relayd</a><a href="/audit">Audit</a></div>
+  <div><a href="/">Home</a><a href="/ledger/halt">Ledger</a><a href="/watcher/cursor">Watcher</a><a href="/broker/reservations?status=FAILED">Broker</a><a href="/screening/holds">Screening</a><a href="/dispatcher/slots">Dispatcher</a><a href="/s1/approvals">S1</a><a href="/relayd/legs">Relay orders</a><a href="/relayd/sweeps">Profit</a><a href="/audit">Audit</a></div>
   <div>{{ .Session.DisplayName }} &middot; <form class="inline" method="post" action="/logout"><button>Log out</button></form></div>
 </header>
 {{ if .Halted }}<div class="halt-banner">LEDGER HALTED: {{ .HaltReason }} -- <a href="/ledger/halt" style="color:#fff">manage</a></div>{{ end }}
@@ -77,6 +77,11 @@ func MustLoadTemplates() *Templates {
 		"dispatcher_slots":    dispatcherSlotsContent,
 		"s1_approvals":        s1ApprovalsContent,
 		"relay_legs":          relayLegsContent,
+		"relayd_pricing":      relaydPricingContent,
+		"relayd_vendors":      relaydVendorsContent,
+		"relayd_sweeps":       relaydSweepsContent,
+		"relayd_pool":         relaydPoolContent,
+		"relayd_leg":          relaydLegContent,
 		"audit":               auditContent,
 	}
 	t := &Templates{pages: make(map[string]*template.Template, len(pages))}

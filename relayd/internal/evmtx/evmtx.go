@@ -266,3 +266,24 @@ func MarshalForBroadcast(signed *types.Transaction) ([]byte, error) {
 	}
 	return raw, nil
 }
+
+// NativeTransferGasLimit is a plain BNB transfer's gas: the protocol's
+// fixed 21000 for a transfer to an address with no contract code (every
+// deposit wallet is a plain key-controlled address).
+const NativeTransferGasLimit = 21_000
+
+// BuildNativeTransfer constructs an unsigned transfer of wei BNB to
+// recipientAddress -- the treasury topping up a deposit wallet's gas.
+func BuildNativeTransfer(recipientAddress string, wei *big.Int, nonce uint64, gasPrice *big.Int) (tx *types.Transaction, digest [32]byte, err error) {
+	if !common.IsHexAddress(recipientAddress) {
+		return nil, [32]byte{}, fmt.Errorf("%w: recipientAddress %q", ErrInvalidAddress, recipientAddress)
+	}
+	if wei == nil || wei.Sign() <= 0 {
+		return nil, [32]byte{}, fmt.Errorf("%w: got %v wei", ErrNonPositiveAmount, wei)
+	}
+	if gasPrice == nil {
+		return nil, [32]byte{}, ErrNilGasPrice
+	}
+	unsigned := types.NewTransaction(nonce, common.HexToAddress(recipientAddress), wei, NativeTransferGasLimit, gasPrice, nil)
+	return unsigned, types.NewEIP155Signer(big.NewInt(BSCChainID)).Hash(unsigned), nil
+}

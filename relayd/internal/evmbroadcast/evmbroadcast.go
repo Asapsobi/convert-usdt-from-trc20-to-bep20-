@@ -31,6 +31,8 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
+
+	"relayd/internal/evmtx"
 )
 
 // ErrReverted wraps IsFinal's own returned error specifically when a
@@ -72,6 +74,58 @@ func (c *Client) CurrentNonce(ctx context.Context, address string) (uint64, erro
 	return nonce, nil
 }
 
+// ConfirmedNonce returns address's nonce as of the latest block, counting
+// only mined transactions. Once it passes a sent transaction's nonce,
+// that nonce has been used by some mined transaction.
+func (c *Client) ConfirmedNonce(ctx context.Context, address string) (uint64, error) {
+	nonce, err := c.eth.NonceAt(ctx, common.HexToAddress(address), nil)
+	if err != nil {
+		return 0, fmt.Errorf("evmbroadcast: fetching confirmed nonce for %s: %w", address, err)
+	}
+	return nonce, nil
+}
+
+// balanceOfSelector is keccak256("balanceOf(address)")[:4].
+var balanceOfSelector = []byte{0x70, 0xa0, 0x82, 0x31}
+
+// TokenBalance returns holder's USDT balance in raw on-chain units (18
+// decimals), as of the latest block.
+func (c *Client) TokenBalance(ctx context.Context, holder string) (*big.Int, error) {
+	to := common.HexToAddress(evmtx.USDTContractAddress)
+	data := append(append([]byte{}, balanceOfSelector...), common.LeftPadBytes(common.HexToAddress(holder).Bytes(), 32)...)
+	out, err := c.eth.CallContract(ctx, ethereum.CallMsg{To: &to, Data: data}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("evmbroadcast: reading USDT balance of %s: %w", holder, err)
+	}
+	if len(out) != 32 {
+		return nil, fmt.Errorf("evmbroadcast: USDT balanceOf(%s) returned %d bytes, want 32", holder, len(out))
+	}
+	return new(big.Int).SetBytes(out), nil
+}
+
+// TransactionMined reports whether txHash has a receipt at all --
+// successful or reverted, final or not. False means no block this node
+// knows of contains it.
+func (c *Client) TransactionMined(ctx context.Context, txHash string) (bool, error) {
+	_, err := c.eth.TransactionReceipt(ctx, common.HexToHash(txHash))
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, ethereum.NotFound) {
+		return false, nil
+	}
+	return false, fmt.Errorf("evmbroadcast: fetching receipt for %s: %w", txHash, err)
+}
+
+// NativeBalance returns holder's BNB balance in wei, as of the latest block.
+func (c *Client) NativeBalance(ctx context.Context, holder string) (*big.Int, error) {
+	bal, err := c.eth.BalanceAt(ctx, common.HexToAddress(holder), nil)
+	if err != nil {
+		return nil, fmt.Errorf("evmbroadcast: reading BNB balance of %s: %w", holder, err)
+	}
+	return bal, nil
+}
+
 // SuggestGasPrice returns the node's own current suggested gas price.
 func (c *Client) SuggestGasPrice(ctx context.Context) (*big.Int, error) {
 	price, err := c.eth.SuggestGasPrice(ctx)
@@ -81,7 +135,6 @@ func (c *Client) SuggestGasPrice(ctx context.Context) (*big.Int, error) {
 	return price, nil
 }
 
-// Broadcast submits signed and returns its own transaction hash.
 // ChainID returns the connected node's own chain id -- 56 for BSC
 // mainnet, anything else means relayd is pointed at the wrong network.
 func (c *Client) ChainID(ctx context.Context) (*big.Int, error) {
@@ -109,6 +162,7 @@ func (c *Client) TokenDecimals(ctx context.Context, token string) (uint8, error)
 	return uint8(value.Uint64()), nil
 }
 
+// Broadcast submits signed and returns its own transaction hash.
 func (c *Client) Broadcast(ctx context.Context, signed *types.Transaction) (string, error) {
 	if err := c.eth.SendTransaction(ctx, signed); err != nil {
 		return "", fmt.Errorf("evmbroadcast: broadcasting: %w", err)

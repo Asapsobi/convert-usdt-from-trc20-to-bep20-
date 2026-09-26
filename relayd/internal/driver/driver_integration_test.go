@@ -25,6 +25,7 @@ import (
 	"relayd/internal/db"
 	"relayd/internal/driver"
 	"relayd/internal/ledgerclient"
+	"relayd/internal/pricing"
 	"relayd/internal/relay"
 	"relayd/internal/testledger"
 	"relayd/internal/upstream"
@@ -108,6 +109,22 @@ func fakeWatcherServerWithIndex(t *testing.T, depositAddress string, derivationI
 	}))
 }
 
+// validBEP20Destination is a real, correctly checksummed BSC address.
+const validBEP20Destination = "0x4192cC99D3CB95573DcAF8dd76921476e0C7bCaF"
+
+// testPricing stores admin pricing of profitBPS in the test database and
+// returns a store over it.
+func testPricing(t *testing.T, pool *db.Pool, profitBPS int64) *pricing.Store {
+	t.Helper()
+	store := pricing.NewStore(pool)
+	if err := store.Put(context.Background(), pricing.Config{
+		ProfitBPS: profitBPS, MinProfit: 0, MinAmountIn: 1_000000, MaxAmountIn: 10_000_000000,
+	}, "test"); err != nil {
+		t.Fatalf("storing test pricing: %v", err)
+	}
+	return store
+}
+
 var extIDSeq int64
 
 func uniqueExternalID(t *testing.T) string {
@@ -133,13 +150,14 @@ func TestCreateRelayLeg_TRC20ToBEP20(t *testing.T) {
 		TronWatcher:  watcherclient.New(tronSrv.URL, "tok"),
 		BEP20Watcher: watcherclient.New(bep20Srv.URL, "tok"),
 		Store:        store,
-		Cfg:          driver.Config{FeeBasisPoints: 30, QuoteValidity: 10 * time.Minute},
+		Pricing:      testPricing(t, pool, 30),
+		Cfg:          driver.Config{QuoteValidity: 10 * time.Minute, DepositWindow: 30 * time.Minute},
 	}
 
 	externalID := uniqueExternalID(t)
 	result, err := d.CreateRelayLeg(context.Background(), driver.CreateRelayLegRequest{
-		ExternalID: externalID, CustomerID: "cust-driver-1", Direction: relay.TRC20ToBEP20,
-		DestinationAddress: "0xcustomer-bep20-address", AmountIn: "100.000000",
+		ExternalID: externalID, CustomerLabel: "cust-driver-1", Direction: relay.TRC20ToBEP20,
+		DestinationAddress: validBEP20Destination, AmountIn: "100.000000",
 	})
 	if err != nil {
 		t.Fatalf("CreateRelayLeg: %v", err)
@@ -147,12 +165,16 @@ func TestCreateRelayLeg_TRC20ToBEP20(t *testing.T) {
 	if result.DepositAddress != "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj" {
 		t.Errorf("expected the TRON watcher's own deposit address, got %s", result.DepositAddress)
 	}
-	if result.AmountIn != "100.000000" {
-		t.Errorf("expected amount_in 100.000000, got %s", result.AmountIn)
+	if result.Quote.AmountIn.Units != 100_000000 {
+		t.Errorf("expected amount_in 100 USDT, got %v", result.Quote.AmountIn)
 	}
-	// 30 bps of 100 = 0.3
-	if result.FeeUnits != "0.300000" {
-		t.Errorf("expected fee_units 0.300000, got %s", result.FeeUnits)
+	// 30 bps of 100 = 0.3; the customer sees the rest split between the
+	// vendor's fee and their payout.
+	if result.Quote.OurFee.Units != 300000 {
+		t.Errorf("expected our fee 0.300000, got %v", result.Quote.OurFee)
+	}
+	if q := result.Quote; q.OurFee.Units+q.VendorFee.Units+q.AmountOut.Units != q.AmountIn.Units {
+		t.Errorf("breakdown doesn't add up: %v + %v + %v != %v", q.OurFee, q.VendorFee, q.AmountOut, q.AmountIn)
 	}
 
 	order := ledger.GetOrder(externalID)
@@ -210,12 +232,13 @@ func TestCreateRelayLeg_BEP20ToTRC20(t *testing.T) {
 		TronWatcher:  watcherclient.New(tronSrv.URL, "tok"),
 		BEP20Watcher: watcherclient.New(bep20Srv.URL, "tok"),
 		Store:        store,
-		Cfg:          driver.Config{FeeBasisPoints: 30, QuoteValidity: 10 * time.Minute},
+		Pricing:      testPricing(t, pool, 30),
+		Cfg:          driver.Config{QuoteValidity: 10 * time.Minute, DepositWindow: 30 * time.Minute},
 	}
 
 	externalID := uniqueExternalID(t)
 	result, err := d.CreateRelayLeg(context.Background(), driver.CreateRelayLegRequest{
-		ExternalID: externalID, CustomerID: "cust-driver-2", Direction: relay.BEP20ToTRC20,
+		ExternalID: externalID, CustomerLabel: "cust-driver-2", Direction: relay.BEP20ToTRC20,
 		DestinationAddress: "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj", AmountIn: "100.000000",
 	})
 	if err != nil {
@@ -260,20 +283,21 @@ func TestListLegs(t *testing.T) {
 	d := &driver.Driver{
 		Ledger: client, Upstream: upstream.NewMockProvider("mock", 1),
 		TronWatcher: watcherclient.New(tronSrv.URL, "tok"), BEP20Watcher: watcherclient.New(tronSrv.URL, "tok"),
-		Store: store, Cfg: driver.Config{FeeBasisPoints: 30, QuoteValidity: 10 * time.Minute},
+		Store: store, Pricing: testPricing(t, pool, 30),
+		Cfg: driver.Config{QuoteValidity: 10 * time.Minute, DepositWindow: 30 * time.Minute},
 	}
 
 	ext1 := uniqueExternalID(t)
 	if _, err := d.CreateRelayLeg(context.Background(), driver.CreateRelayLegRequest{
-		ExternalID: ext1, CustomerID: "cust-list-1", Direction: relay.TRC20ToBEP20,
-		DestinationAddress: "0xdest1", AmountIn: "50.000000",
+		ExternalID: ext1, CustomerLabel: "cust-list-1", Direction: relay.TRC20ToBEP20,
+		DestinationAddress: validBEP20Destination, AmountIn: "50.000000",
 	}); err != nil {
 		t.Fatalf("CreateRelayLeg 1: %v", err)
 	}
 	ext2 := uniqueExternalID(t)
 	if _, err := d.CreateRelayLeg(context.Background(), driver.CreateRelayLegRequest{
-		ExternalID: ext2, CustomerID: "cust-list-2", Direction: relay.TRC20ToBEP20,
-		DestinationAddress: "0xdest2", AmountIn: "75.000000",
+		ExternalID: ext2, CustomerLabel: "cust-list-2", Direction: relay.TRC20ToBEP20,
+		DestinationAddress: validBEP20Destination, AmountIn: "75.000000",
 	}); err != nil {
 		t.Fatalf("CreateRelayLeg 2: %v", err)
 	}
@@ -333,13 +357,14 @@ func TestBuildRefundEntry_HeldOrderProducesCorrectEntry(t *testing.T) {
 	d := &driver.Driver{
 		Ledger: client, Upstream: upstream.NewMockProvider("mock", 1),
 		TronWatcher: watcherclient.New(tronSrv.URL, "tok"), BEP20Watcher: watcherclient.New(tronSrv.URL, "tok"),
-		Store: store, Cfg: driver.Config{FeeBasisPoints: 30, QuoteValidity: 10 * time.Minute},
+		Store: store, Pricing: testPricing(t, pool, 30),
+		Cfg: driver.Config{QuoteValidity: 10 * time.Minute, DepositWindow: 30 * time.Minute},
 	}
 
 	externalID := uniqueExternalID(t)
 	result, err := d.CreateRelayLeg(context.Background(), driver.CreateRelayLegRequest{
-		ExternalID: externalID, CustomerID: "cust-refund-entry-1", Direction: relay.TRC20ToBEP20,
-		DestinationAddress: "0xdest", AmountIn: "100.000000",
+		ExternalID: externalID, CustomerLabel: "cust-refund-entry-1", Direction: relay.TRC20ToBEP20,
+		DestinationAddress: validBEP20Destination, AmountIn: "100.000000",
 	})
 	if err != nil {
 		t.Fatalf("CreateRelayLeg: %v", err)
@@ -362,8 +387,8 @@ func TestBuildRefundEntry_HeldOrderProducesCorrectEntry(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"liability:customer:cust-refund-entry-1:USDT_TRC20": "100.000000",
-		fmt.Sprintf("asset:relay:leg:%d", result.OrderID):   "-100.000000",
+		"liability:customer:" + driver.LedgerCustomerID("cust-refund-entry-1") + ":USDT_TRC20": "100.000000",
+		fmt.Sprintf("asset:relay:leg:%d", result.OrderID):                                      "-100.000000",
 	}
 	for _, l := range entry.Lines {
 		wantAmount, ok := want[l.AccountCode]
@@ -396,7 +421,8 @@ func TestBuildRefundEntry_RejectsIneligibleLeg(t *testing.T) {
 	d := &driver.Driver{
 		Ledger: client, Upstream: upstream.NewMockProvider("mock", 1),
 		TronWatcher: watcherclient.New(tronSrv.URL, "tok"), BEP20Watcher: watcherclient.New(tronSrv.URL, "tok"),
-		Store: store, Cfg: driver.Config{FeeBasisPoints: 30, QuoteValidity: 10 * time.Minute},
+		Store: store, Pricing: testPricing(t, pool, 30),
+		Cfg: driver.Config{QuoteValidity: 10 * time.Minute, DepositWindow: 30 * time.Minute},
 	}
 
 	// Case 1: order not held (still quoted -- deliberately NOT advanced
@@ -411,8 +437,8 @@ func TestBuildRefundEntry_RejectsIneligibleLeg(t *testing.T) {
 	// orchestrate phase, so it is safe to leave dangling.
 	externalID1 := uniqueExternalID(t)
 	if _, err := d.CreateRelayLeg(context.Background(), driver.CreateRelayLegRequest{
-		ExternalID: externalID1, CustomerID: "cust-ineligible-1", Direction: relay.TRC20ToBEP20,
-		DestinationAddress: "0xdest", AmountIn: "100.000000",
+		ExternalID: externalID1, CustomerLabel: "cust-ineligible-1", Direction: relay.TRC20ToBEP20,
+		DestinationAddress: validBEP20Destination, AmountIn: "100.000000",
 	}); err != nil {
 		t.Fatalf("CreateRelayLeg: %v", err)
 	}
@@ -426,8 +452,8 @@ func TestBuildRefundEntry_RejectsIneligibleLeg(t *testing.T) {
 	// this leg and must refuse.
 	externalID2 := uniqueExternalID(t)
 	if _, err := d.CreateRelayLeg(context.Background(), driver.CreateRelayLegRequest{
-		ExternalID: externalID2, CustomerID: "cust-ineligible-2", Direction: relay.TRC20ToBEP20,
-		DestinationAddress: "0xdest", AmountIn: "100.000000",
+		ExternalID: externalID2, CustomerLabel: "cust-ineligible-2", Direction: relay.TRC20ToBEP20,
+		DestinationAddress: validBEP20Destination, AmountIn: "100.000000",
 	}); err != nil {
 		t.Fatalf("CreateRelayLeg: %v", err)
 	}
@@ -465,14 +491,59 @@ func TestCreateRelayLeg_RejectsNonPositiveAmount(t *testing.T) {
 	d := &driver.Driver{
 		Ledger: client, Upstream: upstream.NewMockProvider("mock", 1),
 		TronWatcher: watcherclient.New(tronSrv.URL, "tok"), BEP20Watcher: watcherclient.New(tronSrv.URL, "tok"),
-		Store: store, Cfg: driver.Config{FeeBasisPoints: 30, QuoteValidity: 10 * time.Minute},
+		Store: store, Pricing: testPricing(t, pool, 30),
+		Cfg: driver.Config{QuoteValidity: 10 * time.Minute, DepositWindow: 30 * time.Minute},
 	}
 
 	_, err := d.CreateRelayLeg(context.Background(), driver.CreateRelayLegRequest{
-		ExternalID: uniqueExternalID(t), CustomerID: "cust-1", Direction: relay.TRC20ToBEP20,
-		DestinationAddress: "0xdest", AmountIn: "0.000000",
+		ExternalID: uniqueExternalID(t), CustomerLabel: "cust-1", Direction: relay.TRC20ToBEP20,
+		DestinationAddress: validBEP20Destination, AmountIn: "0.000000",
 	})
 	if err == nil {
 		t.Fatal("expected an error for a zero amount_in")
+	}
+}
+
+// An exact retry of a create returns the same order; the same external_id
+// with anything else -- another destination, or an order that isn't
+// ours -- is refused, never answered with that order's details.
+func TestCreateRelayLeg_ExternalIDReuseOnlyForTheSameRequest(t *testing.T) {
+	ledger := startLedger(t)
+	pool := testPool(t)
+	tronSrv := fakeWatcherServer(t, "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj")
+	defer tronSrv.Close()
+	d := &driver.Driver{
+		Ledger: ledgerclient.New(ledger.BaseURL(), ledger.Token()), Upstream: upstream.NewMockProvider("mock", 1),
+		TronWatcher: watcherclient.New(tronSrv.URL, "tok"), BEP20Watcher: watcherclient.New(tronSrv.URL, "tok"),
+		Store: relay.NewStore(pool), Pricing: testPricing(t, pool, 30),
+		Cfg: driver.Config{QuoteValidity: 10 * time.Minute, DepositWindow: 30 * time.Minute},
+	}
+	req := driver.CreateRelayLegRequest{
+		ExternalID: uniqueExternalID(t), CustomerLabel: "cust-reuse", Direction: relay.TRC20ToBEP20,
+		DestinationAddress: validBEP20Destination, AmountIn: "100.000000",
+	}
+	first, err := d.CreateRelayLeg(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := d.CreateRelayLeg(context.Background(), req)
+	if err != nil || again.OrderID != first.OrderID || !again.DepositDeadline.Equal(first.DepositDeadline) {
+		t.Fatalf("an exact retry must return the same order and deadline, got %+v (%v) vs %+v", again, err, first)
+	}
+
+	other := req
+	other.CustomerLabel = "someone-else"
+	if _, err := d.CreateRelayLeg(context.Background(), other); !errors.Is(err, driver.ErrConflict) {
+		t.Fatalf("expected ErrConflict for another customer's external_id, got %v", err)
+	}
+	other = req
+	other.AmountIn = "200.000000"
+	if _, err := d.CreateRelayLeg(context.Background(), other); !errors.Is(err, driver.ErrConflict) {
+		t.Fatalf("expected ErrConflict for a different amount, got %v", err)
+	}
+	short := req
+	short.ExternalID = "abc"
+	if _, err := d.CreateRelayLeg(context.Background(), short); !errors.Is(err, driver.ErrBadRequest) {
+		t.Fatalf("expected ErrBadRequest for a guessable external_id, got %v", err)
 	}
 }

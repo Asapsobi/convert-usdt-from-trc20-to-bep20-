@@ -561,7 +561,7 @@ func TestCheckFinality_OrphanedDeposit_RecordedExactlyOnce(t *testing.T) {
 	}
 }
 
-func TestCheckFinality_OrphanedDeposit_NotConfusedWithOtherPermanentFailures(t *testing.T) {
+func TestCheckFinality_EveryPermanentFailureIsRecordedForOperators(t *testing.T) {
 	// A plain ErrPermanentFailure (e.g. C2.7's idempotency_conflict, a
 	// structural bug alert, not customer money orphaned by an expired
 	// order) must never reach the recorder -- there is nothing to record,
@@ -583,8 +583,11 @@ func TestCheckFinality_OrphanedDeposit_NotConfusedWithOtherPermanentFailures(t *
 	if err := tracker.CheckFinality(context.Background(), pool); err != nil {
 		t.Fatalf("CheckFinality: %v", err)
 	}
-	if recorder.callCount() != 0 {
-		t.Fatalf("RecordOrphanedDeposit called %d times for a non-orphaned permanent failure, want 0", recorder.callCount())
+	// A deposit we can't report for any permanent reason -- here our own
+	// bug -- is real customer money, so it is recorded for an operator
+	// exactly like an orphaned one, never just logged.
+	if recorder.callCount() != 1 {
+		t.Fatalf("RecordOrphanedDeposit called %d times for a permanent failure, want 1", recorder.callCount())
 	}
 	if got := tracker.PendingCount(); got != 0 {
 		t.Fatalf("PendingCount() = %d, want 0", got)

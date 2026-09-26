@@ -39,6 +39,7 @@ import (
 	"relayd/internal/ledgerclient"
 	"relayd/internal/money"
 	"relayd/internal/orchestrate"
+	"relayd/internal/pricing"
 	"relayd/internal/relay"
 	"relayd/internal/signing"
 	"relayd/internal/testdepositwatcher"
@@ -46,6 +47,16 @@ import (
 	"relayd/internal/upstream"
 	"relayd/internal/watcherclient"
 )
+
+// e2ePricing stores 30 bps admin pricing in store's database.
+func e2ePricing(t *testing.T, store *relay.Store) *pricing.Store {
+	t.Helper()
+	ps := pricing.NewStore(store.DB())
+	if err := ps.Put(context.Background(), pricing.Config{ProfitBPS: 30, MinAmountIn: 1_000000, MaxAmountIn: 10_000_000000}, "test"); err != nil {
+		t.Fatalf("storing test pricing: %v", err)
+	}
+	return ps
+}
 
 // capturingEVMChain is a minimal fake BSC node that only ever records
 // the final SIGNED transaction it's asked to broadcast, keyed by its own
@@ -95,6 +106,27 @@ func (c *capturingEVMChain) Broadcast(ctx context.Context, signed *gethtypes.Tra
 	c.nonce++
 	c.mu.Unlock()
 	return hash, nil
+}
+
+// ConfirmedNonce never passes a sent transaction's nonce, so nothing is
+// ever treated as dropped unless a test says so.
+func (c *capturingEVMChain) ConfirmedNonce(ctx context.Context, address string) (uint64, error) {
+	return 0, nil
+}
+
+func (c *capturingEVMChain) TransactionMined(ctx context.Context, txHash string) (bool, error) {
+	return true, nil
+}
+
+// TokenBalance and NativeBalance report plenty of USDT and BNB for every
+// holder -- balance shortfalls are exercised by tests that configure them
+// explicitly.
+func (c *capturingEVMChain) TokenBalance(ctx context.Context, holder string) (*big.Int, error) {
+	return new(big.Int).Exp(big.NewInt(10), big.NewInt(30), nil), nil
+}
+
+func (c *capturingEVMChain) NativeBalance(ctx context.Context, holder string) (*big.Int, error) {
+	return new(big.Int).Exp(big.NewInt(10), big.NewInt(30), nil), nil
 }
 
 // CapturedFor returns the signed transaction this fake recorded for
@@ -173,11 +205,12 @@ func TestForwardBEP20_SignsFromLegsOwnRealDepositAddress(t *testing.T) {
 		Ledger: client, Upstream: mockProvider,
 		BEP20Watcher: watcherclient.New(watcher.BaseURL(), watcher.Token()),
 		Store:        store,
-		Cfg:          driver.Config{FeeBasisPoints: 30, QuoteValidity: 10 * time.Minute},
+		Pricing:      e2ePricing(t, store),
+		Cfg:          driver.Config{QuoteValidity: 10 * time.Minute, DepositWindow: 30 * time.Minute},
 	}
 
 	if _, err := d.CreateRelayLeg(context.Background(), driver.CreateRelayLegRequest{
-		ExternalID: externalID, CustomerID: "cust-e2e-sign", Direction: relay.BEP20ToTRC20,
+		ExternalID: externalID, CustomerLabel: "cust-e2e-sign", Direction: relay.BEP20ToTRC20,
 		DestinationAddress: "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj", AmountIn: "100.000000",
 	}); err != nil {
 		t.Fatalf("CreateRelayLeg: %v", err)

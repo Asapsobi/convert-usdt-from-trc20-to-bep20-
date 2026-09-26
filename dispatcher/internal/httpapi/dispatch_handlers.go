@@ -72,6 +72,10 @@ func (s *Server) postDispatch(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, newAPIError(http.StatusConflict, errOrderNotReady.Code, "order is "+order.State+", not screened"))
 		return
 	}
+	if !dispatch.DispatchableTier(order.Tier) {
+		writeAPIError(w, newAPIError(http.StatusConflict, errOrderNotReady.Code, "order is tier "+order.Tier+", which another service pays out"))
+		return
+	}
 
 	occurredAt := time.Now().UTC()
 	if existing, err := s.Dispatcher.Store.Get(r.Context(), order.ID); err == nil {

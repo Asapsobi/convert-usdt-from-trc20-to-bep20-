@@ -79,6 +79,21 @@ func (o *Orchestrator) RunTick(ctx context.Context) error {
 	if err := o.advanceRefundPendingLegs(ctx); err != nil {
 		return fmt.Errorf("orchestrate: advancing refund-pending legs: %w", err)
 	}
+	if err := o.trackTopUps(ctx); err != nil {
+		return fmt.Errorf("orchestrate: tracking treasury top-ups: %w", err)
+	}
+	if err := o.expireUnpaidLegs(ctx); err != nil {
+		return fmt.Errorf("orchestrate: expiring unpaid legs: %w", err)
+	}
+	if err := o.releaseFinishedLeases(ctx); err != nil {
+		return fmt.Errorf("orchestrate: releasing finished legs' wallets: %w", err)
+	}
+	if err := o.advanceSweeps(ctx); err != nil {
+		return fmt.Errorf("orchestrate: advancing sweeps: %w", err)
+	}
+	if err := o.startSweeps(ctx); err != nil {
+		return fmt.Errorf("orchestrate: starting sweeps: %w", err)
+	}
 	if err := o.checkStaleLegs(ctx); err != nil {
 		return fmt.Errorf("orchestrate: checking for stale legs: %w", err)
 	}
@@ -146,19 +161,21 @@ func (o *Orchestrator) startOne(ctx context.Context, externalID string) error {
 		if err != nil {
 			return fmt.Errorf("fetching order: %w", err)
 		}
-		// The upstream order must be created for exactly what
-		// advanceForwardingOneTRC20/BEP20 will actually send on-chain
-		// (leg.AmountIn minus our own fee, forwardAmount's own contract)
-		// -- never the raw deposit amount, or the upstream order sits
-		// forever underpaid by our fee, waiting for money that was never
-		// going to arrive. See this session's own real incident: a
-		// FixedFloat order created for the full amount while only the
-		// fee-deducted amount was ever going to be forwarded expired
-		// unfilled.
-		toForward, err := forwardAmount(leg.AmountIn, ledgerOrder.FeeUnits)
-		if err != nil {
-			return fmt.Errorf("computing forward amount: %w", err)
+		if ledgerOrder.Tier != "RELAY" {
+			return fmt.Errorf("C1 order %s is tier %q, not RELAY -- refusing to forward an order this service doesn't own", leg.ExternalID, ledgerOrder.Tier)
 		}
+		// Forward what actually arrived, minus our profit -- never the
+		// quoted amount, which the customer may not have sent exactly.
+		recorded, tooSmall, err := o.recordDeposit(ctx, leg, ledgerOrder)
+		if err != nil {
+			return fmt.Errorf("recording the deposit: %w", err)
+		}
+		if tooSmall {
+			slog.Warn("orchestrate: deposit is too small to forward, refunding it",
+				"external_id", leg.ExternalID, "received", fmtAmount(*recorded.ReceivedAmount))
+			return o.startAwaitingDepositRefund(ctx, recorded)
+		}
+		toForward := *recorded.ForwardAmount
 
 		pair := upstreamPairFor(leg.Direction)
 		order, err := o.Upstream.CreateOrder(ctx, pair, toForward, leg.DestinationAddress)
@@ -168,11 +185,16 @@ func (o *Orchestrator) startOne(ctx context.Context, externalID string) error {
 		if err := o.Store.MarkForwarding(ctx, leg.ExternalID, order.ProviderName, order.ProviderOrderID, order.DepositAddress); err != nil {
 			return fmt.Errorf("marking forwarding: %w", err)
 		}
+		if err := o.Store.RecordVendorFee(ctx, leg.ExternalID, toForward.Units-order.AmountOutExpected.Units); err != nil {
+			slog.Error("orchestrate: recording the estimated vendor fee failed", "external_id", leg.ExternalID, "error", err)
+		}
 		slog.Info("orchestrate: relay leg started forwarding", "external_id", leg.ExternalID,
+			"received", fmtAmount(*recorded.ReceivedAmount), "forward", fmtAmount(toForward),
 			"upstream_provider", order.ProviderName, "upstream_order_id", order.ProviderOrderID)
+		leg = recorded
 	}
 
-	return o.postForwardStartEntry(ctx, leg.OrderID, externalID)
+	return o.postForwardStartEntry(ctx, leg)
 }
 
 // postForwardStartEntry posts the screened->dispatching "relay_forward_start"
@@ -180,7 +202,8 @@ func (o *Orchestrator) startOne(ctx context.Context, externalID string) error {
 // already moved past screened (the idempotent-replay case: a prior
 // tick's own call already succeeded, or this is the resume path after a
 // crash between MarkForwarding and this call).
-func (o *Orchestrator) postForwardStartEntry(ctx context.Context, orderID int64, externalID string) error {
+func (o *Orchestrator) postForwardStartEntry(ctx context.Context, leg relay.Leg) error {
+	orderID, externalID := leg.OrderID, leg.ExternalID
 	order, err := o.Ledger.GetOrder(ctx, externalID)
 	if err != nil {
 		return fmt.Errorf("fetching order: %w", err)
@@ -191,19 +214,20 @@ func (o *Orchestrator) postForwardStartEntry(ctx context.Context, orderID int64,
 
 	fromAccount := relayLegAccountCode(orderID)
 	toAccount := relayLegForwardingAccountCode(orderID)
-	asset := string(order.AmountIn.Asset)
+	received := receivedFor(leg, order)
+	asset := string(received.Asset)
 	if err := o.Ledger.EnsureAccount(ctx, toAccount, ledgerclient.AccountAsset, asset, "relayd:ensure-account:"+toAccount); err != nil {
 		return fmt.Errorf("ensuring %s exists: %w", toAccount, err)
 	}
 
-	negAmountIn, err := order.AmountIn.Neg()
+	negReceived, err := received.Neg()
 	if err != nil {
-		return fmt.Errorf("negating amount_in: %w", err)
+		return fmt.Errorf("negating the received amount: %w", err)
 	}
 	idemKey := "relayd:forward_start:" + externalID
 	lines := []ledgerclient.EntryLine{
-		{AccountCode: toAccount, Asset: asset, Amount: order.AmountIn},
-		{AccountCode: fromAccount, Asset: asset, Amount: negAmountIn},
+		{AccountCode: toAccount, Asset: asset, Amount: received},
+		{AccountCode: fromAccount, Asset: asset, Amount: negReceived},
 	}
 	_, err = o.Ledger.TransitionWithEntry(ctx, externalID, "dispatching", order.Version,
 		"relay_forward_start", "relay_forward_start", time.Now().UTC(), lines, idemKey)

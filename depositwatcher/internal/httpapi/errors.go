@@ -35,6 +35,8 @@ var (
 	errOrphanedDepositNotFound = newAPIError(http.StatusNotFound, "orphaned_deposit_not_found", "no orphaned deposit exists with that id")
 	errOrphanedDepositResolved = newAPIError(http.StatusConflict, "already_resolved", "that orphaned deposit has already been resolved")
 	errSystemComponentNotReady = newAPIError(http.StatusServiceUnavailable, "system_component_not_ready", "this endpoint requires a component that is not yet configured on this instance")
+	errNoWalletAvailable       = newAPIError(http.StatusServiceUnavailable, "no_wallet_available", "every deposit wallet is in use and the pool is at its limit -- try again shortly")
+	errWalletNotFound          = newAPIError(http.StatusNotFound, "wallet_not_found", "no pool wallet has that address")
 )
 
 // mapError translates a domain error from any lower layer into the
@@ -52,6 +54,10 @@ func mapError(err error) *apiError {
 		return errOrphanedDepositNotFound
 	case errors.Is(err, orphaned.ErrAlreadyResolved):
 		return errOrphanedDepositResolved
+	case errors.Is(err, addresses.ErrNoWalletAvailable):
+		return errNoWalletAvailable
+	case errors.Is(err, addresses.ErrWalletNotFound):
+		return errWalletNotFound
 
 	default:
 		return errInternal

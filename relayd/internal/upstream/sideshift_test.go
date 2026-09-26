@@ -207,8 +207,8 @@ func TestStatusFromSideShift_MapsEveryKnownStatus(t *testing.T) {
 		"settling":   StatusSending,
 		"settled":    StatusComplete,
 		"refund":     StatusFailed, "refunding": StatusFailed,
-		"expired": StatusFailed, "review": StatusFailed, "multiple": StatusFailed,
-		"some-unrecognized-future-status": StatusFailed,
+		"expired": StatusFailed, "review": StatusNeedsAttention, "multiple": StatusFailed,
+		"some-unrecognized-future-status": StatusNeedsAttention,
 	}
 	for input, want := range cases {
 		if got := statusFromSideShift(input); got != want {

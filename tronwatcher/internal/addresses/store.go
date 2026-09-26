@@ -103,77 +103,50 @@ const selectSQL = `
 		status, quoted_at, quote_expires_at, assigned_at, retired_at, retired_reason, last_scanned_at
 	FROM watched_addresses`
 
-// Assign derives a new watch-only address at the next never-reused
-// derivation index and records it against orderID. Idempotent on
-// orderID.
+// Assign leases a deposit wallet to orderID: an idle, cooled-down pool
+// wallet, or a newly provisioned one while the pool is below its limit.
+// Idempotent on orderID -- a repeated call returns the same address. When
+// every wallet is busy and the pool is full it returns
+// ErrNoWalletAvailable.
 func Assign(ctx context.Context, q Queryer, orderID int64, externalID, customerID string, quotedAt, quoteExpiresAt time.Time) (Address, error) {
 	if xpub == "" && provisioner == nil {
 		return "", ErrNotConfigured
 	}
-
-	existing, err := GetByOrderID(ctx, q, orderID)
-	if err == nil {
+	if existing, err := GetByOrderID(ctx, q, orderID); err == nil {
 		return existing.Address, nil
-	}
-	if !errors.Is(err, ErrOrderNotFound) {
+	} else if !errors.Is(err, ErrOrderNotFound) {
 		return "", err
 	}
 
-	var index int64
-	if err := q.QueryRow(ctx, `SELECT nextval('watched_addresses_derivation_index_seq')`).Scan(&index); err != nil {
-		return "", fmt.Errorf("addresses: allocating derivation index: %w", err)
-	}
-
-	var addr Address
-	if provisioner != nil {
-		address, err := provisioner.ProvisionTronDepositKey(ctx, uint32(index))
+	for attempt := 0; attempt < 5; attempt++ {
+		addr, ok, err := leaseFromPool(ctx, q, orderID, externalID, customerID, quotedAt, quoteExpiresAt)
 		if err != nil {
-			return "", fmt.Errorf("addresses: provisioning address at index %d: %w", index, err)
+			return "", err
 		}
-		addr = Address(address)
-	} else {
-		addr, err = DeriveAddress(xpub, uint32(index))
+		if ok {
+			return addr, nil
+		}
+		// Nothing leased: a concurrent call for this same order may have
+		// won, another order may have taken the wallet first, or no wallet
+		// is free.
+		if existing, err := GetByOrderID(ctx, q, orderID); err == nil {
+			return existing.Address, nil
+		} else if !errors.Is(err, ErrOrderNotFound) {
+			return "", err
+		}
+		free, err := eligibleWallets(ctx, q)
 		if err != nil {
-			return "", fmt.Errorf("addresses: deriving address at index %d: %w", index, err)
+			return "", err
+		}
+		if free == 0 {
+			// Create a wallet and lease it to this order in one step, or
+			// fail with ErrNoWalletAvailable when the pool is full.
+			if _, err := provision(ctx, q, &leaseRequest{orderID, externalID, customerID, quotedAt, quoteExpiresAt}); err != nil {
+				return "", err
+			}
 		}
 	}
-
-	row := q.QueryRow(ctx, `
-		INSERT INTO watched_addresses
-			(address, derivation_index, order_id, external_id, customer_id,
-			 status, quoted_at, quote_expires_at)
-		VALUES ($1, $2, $3, $4, $5, 'WATCHING', $6, $7)
-		ON CONFLICT DO NOTHING
-		RETURNING address
-	`, string(addr), index, orderID, externalID, customerID, quotedAt, quoteExpiresAt)
-
-	var inserted string
-	err = row.Scan(&inserted)
-	if err == nil {
-		return Address(inserted), nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return "", fmt.Errorf("addresses: assigning order %d: %w", orderID, err)
-	}
-	// ON CONFLICT DO NOTHING (no target) returned no row: we lost a race
-	// against a concurrent Assign for the same order. Deliberately
-	// untargeted, not `ON CONFLICT (order_id)`: a true concurrent race
-	// (e.g. a caller retrying POST /v1/addresses while the original
-	// request is still in flight) sends the same order_id AND the same
-	// external_id together, and Postgres only suppresses a conflict on
-	// the constraint(s) named in the ON CONFLICT target -- targeting
-	// order_id alone left a simultaneous external_id conflict to raise a
-	// real unique_violation instead of being absorbed here, discovered
-	// by this package's own TestAssign_ConcurrentRaceProducesOneRowNoWastedIndex.
-	// Untargeted DO NOTHING suppresses a conflict on ANY unique
-	// constraint on this table, which is correct here since every
-	// legitimate conflict source (order_id, external_id) belongs to the
-	// same losing INSERT attempt.
-	winner, err := GetByOrderID(ctx, q, orderID)
-	if err != nil {
-		return "", fmt.Errorf("addresses: assign order %d: lost the race but couldn't read the winner: %w", orderID, err)
-	}
-	return winner.Address, nil
+	return "", fmt.Errorf("%w: kept losing wallets to concurrent orders", ErrNoWalletAvailable)
 }
 
 // GetByOrderID looks up the address assigned to orderID.
@@ -216,22 +189,37 @@ func MarkFunded(ctx context.Context, q Queryer, orderID int64) error {
 	return nil
 }
 
-// Retire transitions orderID's address to RETIRED with the given
-// reason.
+// Retire ends orderID's lease and starts its wallet's cooldown: short
+// after a completed order, long after one that expired unpaid (its
+// customer may still pay late). Idempotent: retiring an already-retired
+// lease changes nothing, so a retry never extends the cooldown.
 func Retire(ctx context.Context, q Queryer, orderID int64, reason string) error {
 	if reason == "" {
 		return fmt.Errorf("addresses: retire order %d: reason must not be empty", orderID)
 	}
-	tag, err := q.Exec(ctx, `
+	var addr string
+	err := q.QueryRow(ctx, `
 		UPDATE watched_addresses
 		SET status = 'RETIRED', retired_at = now(), retired_reason = $1
-		WHERE order_id = $2
-	`, reason, orderID)
+		WHERE order_id = $2 AND status <> 'RETIRED'
+		RETURNING address
+	`, reason, orderID).Scan(&addr)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if _, getErr := GetByOrderID(ctx, q, orderID); getErr != nil {
+			return getErr
+		}
+		return nil // already retired
+	}
 	if err != nil {
 		return mapTransitionError(err, orderID, StatusRetired)
 	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("%w: order %d", ErrOrderNotFound, orderID)
+	if _, err := q.Exec(ctx, `
+		UPDATE pool_wallets
+		SET available_after = now() + (SELECT CASE WHEN $2 = 'expired' THEN cooldown_after_expiry ELSE cooldown_after_use END
+			FROM pool_settings WHERE id = 1)
+		WHERE address = $1
+	`, addr, reason); err != nil {
+		return fmt.Errorf("addresses: starting the cooldown of %s: %w", addr, err)
 	}
 	return nil
 }

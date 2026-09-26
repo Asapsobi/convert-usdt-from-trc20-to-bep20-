@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"tronwatcher/internal/candidates"
 	"tronwatcher/internal/chain"
 	"tronwatcher/internal/db"
+	"tronwatcher/internal/deposits"
 	"tronwatcher/internal/finality"
 	"tronwatcher/internal/ledgerclient"
 	"tronwatcher/internal/money"
@@ -124,9 +126,19 @@ func newEngineFromEnv(pool *db.Pool) (*engine, error) {
 	tracker, err := finality.New(finality.Config{
 		OnFinal:                 ledger.ReportDepositFinal,
 		OrphanedDepositRecorder: orphanedRecorder{pool: pool, ledger: ledger},
+		Store:                   deposits.NewStore(pool),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("tronwatcherd: building finality tracker: %w", err)
+	}
+	// Deposits a previous run detected but never reported are picked up
+	// again before scanning resumes.
+	restored, err := tracker.Restore(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("tronwatcherd: %w", err)
+	}
+	if restored > 0 {
+		slog.Info("tronwatcherd: resumed deposits detected before the last restart", "count", restored)
 	}
 	e.tracker = tracker
 	return e, nil

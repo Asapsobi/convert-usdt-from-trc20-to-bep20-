@@ -17,6 +17,7 @@ package orchestrate_test
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"sync"
 	"testing"
 	"time"
@@ -31,6 +32,7 @@ import (
 	"relayd/internal/orchestrate"
 	"relayd/internal/relay"
 	"relayd/internal/signing"
+	"relayd/internal/tronbroadcast"
 	"relayd/internal/txbuild"
 	"relayd/internal/upstream"
 )
@@ -67,7 +69,7 @@ func (f *fakeChainByOwner) CurrentBlockReference(ctx context.Context) (txbuild.B
 
 func (f *fakeChainByOwner) BroadcastSigned(ctx context.Context, unsignedTx []byte, signature [65]byte) (string, error) {
 	digest := txbuild.Digest(unsignedTx)
-	txID := fmt.Sprintf("%x", digest[:8])
+	txID := fmt.Sprintf("%x", digest[:])
 
 	var raw core.TransactionRaw
 	if err := proto.Unmarshal(unsignedTx, &raw); err != nil {
@@ -87,6 +89,23 @@ func (f *fakeChainByOwner) BroadcastSigned(ctx context.Context, unsignedTx []byt
 	f.byOwner[ownerAddr] = txID
 	f.mu.Unlock()
 	return txID, nil
+}
+
+// TokenBalance reports plenty of USDT for every holder -- balance
+// shortfalls are exercised by tests that configure them explicitly.
+func (f *fakeChainByOwner) TokenBalance(ctx context.Context, holder string) (*big.Int, error) {
+	return new(big.Int).Exp(big.NewInt(10), big.NewInt(30), nil), nil
+}
+
+// AccountResources reports an activated account with plenty of energy,
+// bandwidth, and TRX -- resource shortfalls are exercised by tests that
+// configure them explicitly.
+func (f *fakeChainByOwner) AccountResources(ctx context.Context, holder string) (tronbroadcast.Resources, error) {
+	return tronbroadcast.Resources{Exists: true, Energy: 1_000_000_000, Bandwidth: 1_000_000, BalanceSun: 1_000_000_000}, nil
+}
+
+func (f *fakeChainByOwner) EstimateTransferEnergy(ctx context.Context, from, to string, raw *big.Int) (int64, error) {
+	return 64_285, nil
 }
 
 // TxIDFor returns the most recent txid this fake assigned to a
@@ -131,7 +150,7 @@ func TestForwardTRC20_RebuildsAndRetriesAfterAFailedExecution(t *testing.T) {
 	leg, err := store.Create(context.Background(), relay.Leg{
 		ExternalID: externalID, OrderID: order.ID, Direction: relay.TRC20ToBEP20,
 		CustomerID: "cust-exec-fail-1", DestinationAddress: "0xcustomer-bep20-address",
-		DepositAddress:         "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4",
+		DepositAddress:         signing.FakeTronDepositAddress(depositDerivationIndex),
 		DepositDerivationIndex: &depositDerivationIndex,
 		AmountIn:               money.Amount{Asset: money.USDT_TRC20, Units: 100_000000},
 		AmountOutExpected:      money.Amount{Asset: money.USDT_BEP20, Units: 99_700000},
@@ -150,7 +169,7 @@ func TestForwardTRC20_RebuildsAndRetriesAfterAFailedExecution(t *testing.T) {
 	evmFinality := newFakeEVMFinality()
 	alerter := &fakeAlerter{}
 	tronDepositWatcher := newFakeTronDepositWatcher()
-	tronDepositWatcher.set(order.ID, "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4", depositDerivationIndex)
+	tronDepositWatcher.set(order.ID, signing.FakeTronDepositAddress(depositDerivationIndex), depositDerivationIndex)
 
 	orch := orchestrate.New(store, client, mockProvider, newFakeEnergy(), signer, chain, finality, evmChain, evmFinality, alerter, nil, tronDepositWatcher, orchestrate.Config{
 		SlotID: 1, SlotAddress: "TLyqzVGLV1srkB7dToTAEqgDSfPtXRJZYH",
@@ -332,7 +351,7 @@ func TestRefundTRC20_RebuildsAndRetriesAfterAFailedExecution(t *testing.T) {
 	}
 
 	depositDerivationIndex := uint32(21)
-	depositAddress := "TLQ5Xwr2YEJWhNydyMt5rHN8KDZ4yduNs4"
+	depositAddress := signing.FakeTronDepositAddress(depositDerivationIndex)
 	if _, err := store.Create(context.Background(), relay.Leg{
 		ExternalID: externalID, OrderID: order.ID, Direction: relay.TRC20ToBEP20,
 		CustomerID: "cust-refund-exec-fail-1", DestinationAddress: "0xcustomer-bep20-address",

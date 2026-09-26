@@ -34,6 +34,9 @@ reaches a venture outcome."*
    defensible if paired with a public-page ban: sell it as embedded settlement infra
    behind someone else's product, not a public "convert my USDT" page.
 
+   _Superseded 26 Sep 2026: Model F is a public product — see
+   `model-d-model-f-product-separation.md` (update) and `../00-product-goals.md`._
+
 **Update, 14 Sep 2026 — this ban now stands on Model F's own reasoning, not Model D's.**
 Originally written as inheriting "the same move Model D already makes" (citing
 `docs/02-architecture/product-operations-architecture.md`'s own ban on a public swap

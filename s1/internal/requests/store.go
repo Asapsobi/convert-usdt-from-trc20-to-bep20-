@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -80,6 +81,48 @@ type Store struct {
 	bscDepositProvisioner  BSCDepositProvisioner  // nil disables ProvisionBSCDepositKey entirely -- see provisioning.go
 	signer                 Signer
 	cfg                    Config
+
+	// requestLocks serializes calls for one idempotency key, so a replay
+	// never signs while the first call's own signing is still under way:
+	// exactly one signer call per request, each with its audit row.
+	requestLocks keyedMutex
+}
+
+// keyedMutex is one mutex per key, created on demand and dropped once
+// nobody holds or waits for it.
+type keyedMutex struct {
+	mu    sync.Mutex
+	locks map[string]*keyedLock
+}
+
+type keyedLock struct {
+	sync.Mutex
+	users int
+}
+
+// lock blocks until key is free and returns its unlock.
+func (k *keyedMutex) lock(key string) func() {
+	k.mu.Lock()
+	if k.locks == nil {
+		k.locks = map[string]*keyedLock{}
+	}
+	l, ok := k.locks[key]
+	if !ok {
+		l = &keyedLock{}
+		k.locks[key] = l
+	}
+	l.users++
+	k.mu.Unlock()
+
+	l.Lock()
+	return func() {
+		l.Unlock()
+		k.mu.Lock()
+		if l.users--; l.users == 0 {
+			delete(k.locks, key)
+		}
+		k.mu.Unlock()
+	}
 }
 
 // NewStore wires a Store. depositKeys/tronDepositKeys/
@@ -117,6 +160,7 @@ var ErrTronDepositSigningNotConfigured = errors.New("requests: TRON deposit-swee
 // s1-key-management-build-prompts.md's own S1.3 for this method's exact
 // acceptance criteria.
 func (s *Store) RequestSignature(ctx context.Context, slotID int, digest [32]byte, estimatedUSD float64, idempotencyKey string) (SigningRequest, error) {
+	defer s.requestLocks.lock(idempotencyKey)()
 	ref := keyRef{slotID: &slotID}
 	req, created, err := s.insertPending(ctx, ref, digest, estimatedUSD, idempotencyKey)
 	if err != nil {
@@ -125,9 +169,10 @@ func (s *Store) RequestSignature(ctx context.Context, slotID int, digest [32]byt
 	if !created {
 		// Idempotent replay -- someone (possibly this exact call, racing
 		// a concurrent duplicate) already owns this idempotency key.
-		// Return its current state as-is; never sign a second time for
-		// it (invariant 2).
-		return req, nil
+		// Return its current state, finishing an auto-sign that failed
+		// (resumeAutoSign); a recorded signature is never replaced
+		// (invariant 2).
+		return s.resumeAutoSign(ctx, req, ref, digest)
 	}
 
 	if estimatedUSD >= s.cfg.ApprovalThresholdUSD {
@@ -151,6 +196,7 @@ func (s *Store) RequestSignature(ctx context.Context, slotID int, digest [32]byt
 // auto-sign cutoff, same PENDING/SIGNED semantics -- routed to
 // kmssign's own BSC-deposit derivation+signing instead of a fixed slot.
 func (s *Store) RequestDepositSweepSignature(ctx context.Context, index uint32, digest [32]byte, estimatedUSD float64, idempotencyKey string) (SigningRequest, error) {
+	defer s.requestLocks.lock(idempotencyKey)()
 	if s.depositKeys == nil {
 		return SigningRequest{}, ErrDepositSigningNotConfigured
 	}
@@ -160,7 +206,7 @@ func (s *Store) RequestDepositSweepSignature(ctx context.Context, index uint32, 
 		return SigningRequest{}, err
 	}
 	if !created {
-		return req, nil
+		return s.resumeAutoSign(ctx, req, ref, digest)
 	}
 
 	if estimatedUSD >= s.cfg.ApprovalThresholdUSD {
@@ -179,6 +225,7 @@ func (s *Store) RequestDepositSweepSignature(ctx context.Context, index uint32, 
 // shape, routed to kmssign's own TRON-deposit derivation+signing instead
 // of the BSC one.
 func (s *Store) RequestTronDepositSweepSignature(ctx context.Context, index uint32, digest [32]byte, estimatedUSD float64, idempotencyKey string) (SigningRequest, error) {
+	defer s.requestLocks.lock(idempotencyKey)()
 	if s.tronDepositKeys == nil {
 		return SigningRequest{}, ErrTronDepositSigningNotConfigured
 	}
@@ -188,7 +235,7 @@ func (s *Store) RequestTronDepositSweepSignature(ctx context.Context, index uint
 		return SigningRequest{}, err
 	}
 	if !created {
-		return req, nil
+		return s.resumeAutoSign(ctx, req, ref, digest)
 	}
 
 	if estimatedUSD >= s.cfg.ApprovalThresholdUSD {
@@ -200,6 +247,41 @@ func (s *Store) RequestTronDepositSweepSignature(ctx context.Context, index uint
 		return SigningRequest{}, fmt.Errorf("requests: auto-sign for request %d: %w", req.ID, err)
 	}
 	return signed, nil
+}
+
+// resumeAutoSign finishes an idempotent replay. A request below the
+// approval threshold is signed the moment it is created -- but when that
+// signing call fails (the signer briefly unreachable), the request stays
+// PENDING, and with no approver ever asked to act on it, only a replay
+// can sign it: the replay does, using the request's own stored digest
+// and key. Signing the same digest again can only ever produce the same
+// transaction, never a new one. A request waiting for approvers, or
+// already SIGNED or REJECTED, is returned as it is.
+func (s *Store) resumeAutoSign(ctx context.Context, req SigningRequest, ref keyRef, digest [32]byte) (SigningRequest, error) {
+	if req.Status != StatusPending {
+		return req, nil
+	}
+	detail, err := s.getPendingDetail(ctx, req.ID)
+	if err != nil {
+		return SigningRequest{}, err
+	}
+	if detail.status != StatusPending || detail.estimatedUSD >= s.cfg.ApprovalThresholdUSD {
+		return req, nil
+	}
+	if detail.digest != digest || !sameKeyRef(detail.ref, ref) {
+		return SigningRequest{}, fmt.Errorf("requests: idempotency key of request %d was reused for a different digest or key", req.ID)
+	}
+	signed, err := s.signAndRecord(ctx, req.ID, detail.ref, detail.digest, nil)
+	if err != nil {
+		return SigningRequest{}, fmt.Errorf("requests: retrying auto-sign for request %d: %w", req.ID, err)
+	}
+	return signed, nil
+}
+
+func sameKeyRef(a, b keyRef) bool {
+	eqInt := func(x, y *int) bool { return (x == nil) == (y == nil) && (x == nil || *x == *y) }
+	eqIdx := func(x, y *uint32) bool { return (x == nil) == (y == nil) && (x == nil || *x == *y) }
+	return eqInt(a.slotID, b.slotID) && eqIdx(a.bscDepositIndex, b.bscDepositIndex) && eqIdx(a.tronDepositIndex, b.tronDepositIndex)
 }
 
 // keyRef names exactly one of a slot id, a BSC deposit child index, or a
@@ -432,9 +514,10 @@ func (s *Store) EVMAddress(ctx context.Context, slotID int) (string, error) {
 const requiredApprovals = 2
 
 type pendingRequestDetail struct {
-	ref    keyRef
-	digest [32]byte
-	status Status
+	ref          keyRef
+	digest       [32]byte
+	status       Status
+	estimatedUSD float64
 }
 
 func (s *Store) getPendingDetail(ctx context.Context, requestID int64) (pendingRequestDetail, error) {
@@ -444,8 +527,8 @@ func (s *Store) getPendingDetail(ctx context.Context, requestID int64) (pendingR
 	var digest []byte
 	var status string
 	err := s.pool.QueryRow(ctx, `
-		SELECT slot_id, bsc_deposit_index, tron_deposit_index, digest, status FROM signing_requests WHERE id = $1
-	`, requestID).Scan(&slotID, &depositIndex, &tronDepositIndex, &digest, &status)
+		SELECT slot_id, bsc_deposit_index, tron_deposit_index, digest, status, estimated_usd FROM signing_requests WHERE id = $1
+	`, requestID).Scan(&slotID, &depositIndex, &tronDepositIndex, &digest, &status, &d.estimatedUSD)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return pendingRequestDetail{}, ErrRequestNotFound

@@ -39,9 +39,18 @@ import (
 // node, supporting exactly what ScanRange needs: eth_getLogs and
 // eth_getBlockByNumber for a specific numeric height (block time).
 type fakeNode struct {
-	mu     sync.Mutex
-	logs   []types.Log
-	blocks map[uint64]types.Header
+	mu        sync.Mutex
+	logs      []types.Log
+	blocks    map[uint64]types.Header
+	finalized uint64 // answer to eth_getBlockByNumber("finalized"); 0 means none yet
+}
+
+// setFinalized makes height (which must have a block time set) this
+// node's finalized block.
+func (n *fakeNode) setFinalized(height uint64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.finalized = height
 }
 
 func newFakeNode() *fakeNode { return &fakeNode{blocks: make(map[uint64]types.Header)} }
@@ -93,6 +102,15 @@ func (n *fakeNode) handle(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal(req.Params, &args)
 		var tag string
 		_ = json.Unmarshal(args[0], &tag)
+		if tag == "finalized" {
+			header, ok := n.blocks[n.finalized]
+			if !ok || n.finalized == 0 {
+				writeRPCError(w, req.ID, "fakeNode: no finalized block set")
+				return
+			}
+			writeRPCResult(w, req.ID, header)
+			return
+		}
 		var height uint64
 		if _, err := fmt.Sscanf(tag, "0x%x", &height); err != nil {
 			writeRPCError(w, req.ID, err.Error())
@@ -198,6 +216,11 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	}
 	if err := goose.Up(sqlDB, migrationsDir); err != nil {
 		t.Fatalf("running migrations: %v", err)
+	}
+	// The pool limit and cooldowns are exercised by their own tests; here
+	// every order simply gets a free wallet, as with one wallet per order.
+	if _, err := sqlDB.Exec(`UPDATE pool_settings SET max_wallets = 1000000, cooldown_after_use = '0', cooldown_after_expiry = '0'`); err != nil {
+		t.Fatalf("relaxing pool settings for tests: %v", err)
 	}
 
 	pool, err := pgxpool.New(context.Background(), dbURL)

@@ -119,6 +119,18 @@ func buildConversionLines(order ledgerclient.Order) []ledgerclient.EntryLine {
 	}
 }
 
+// ErrNotDispatchable means an order's tier is paid out by another
+// service, never by this dispatcher.
+var ErrNotDispatchable = errors.New("dispatch: this order's tier is not paid out by the dispatcher")
+
+// DispatchableTier reports whether this dispatcher pays out orders of
+// tier. Every other tier sharing the ledger belongs to another service --
+// above all RELAY, which relayd (Model F) forwards itself: dispatching a
+// RELAY order here as well would pay its customer twice.
+func DispatchableTier(tier string) bool {
+	return tier == "DIRECT" || tier == "STANDARD"
+}
+
 // EnterDispatching posts the E2 conversion entry and transitions order
 // into `dispatching`, then records the attempt locally. order must
 // already be in `screened` (the caller's job to have gotten it there);
@@ -156,6 +168,9 @@ func buildConversionLines(order ledgerclient.Order) []ledgerclient.EntryLine {
 //     C5.7's dispatch-failure handling; ctx cancellation is the only way
 //     out of this loop.
 func (d *Dispatcher) EnterDispatching(ctx context.Context, order ledgerclient.Order, slotID int, occurredAt time.Time) (Attempt, error) {
+	if !DispatchableTier(order.Tier) {
+		return Attempt{}, fmt.Errorf("%w: order %s is tier %q", ErrNotDispatchable, order.ExternalID, order.Tier)
+	}
 	conversionKey := conversionIdempotencyKey(order.ID)
 	trcLiability := customerAccountCode(order.CustomerID, "USDT_TRC20")
 

@@ -19,6 +19,13 @@ import (
 type Server struct {
 	Driver    *driver.Driver
 	BuildInfo func() (version, commit string)
+	// Admin is the administrator API (admin.go); nil or with no tokens,
+	// every admin route answers 404.
+	Admin *Admin
+	// QuoteLimit and OrderLimit bound each client's quotes and new orders;
+	// nil means unlimited.
+	QuoteLimit *RateLimit
+	OrderLimit *RateLimit
 }
 
 // NewRouter builds the full route table.
@@ -27,10 +34,15 @@ func NewRouter(s *Server) http.Handler {
 	r.Use(corsMiddleware)
 	r.Get("/healthz", s.healthz)
 	r.Route("/v1", func(r chi.Router) {
-		r.Post("/relay-legs", s.postRelayLeg)
-		r.Get("/relay-legs", s.getRelayLegs)
+		// Public: what a customer's storefront needs.
+		r.With(s.QuoteLimit.Middleware).Post("/quotes", s.postQuote)
+		r.With(s.OrderLimit.Middleware).Post("/relay-legs", s.postRelayLeg)
 		r.Get("/relay-legs/{external_id}", s.getRelayLeg)
-		r.Get("/relay-legs/{external_id}/refund-entry", s.getRelayLegRefundEntry)
+
+		// Every customer's orders: operators only.
+		r.With(s.Admin.require).Get("/relay-legs", s.getRelayLegs)
+		r.With(s.Admin.require).Get("/relay-legs/{external_id}/refund-entry", s.getRelayLegRefundEntry)
+		r.Route("/admin", s.adminRoutes)
 	})
 	return r
 }

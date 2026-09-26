@@ -75,3 +75,11 @@ func (c *Client) postTransition(ctx context.Context, externalID, idempotencyKey 
 	}
 	return resp.toOrder()
 }
+
+// Transition moves an order to toState without a journal entry -- for
+// the transitions C1 posts no entry for (quoted -> expired).
+func (c *Client) Transition(ctx context.Context, externalID, toState string, expectedVersion int32, reason string, occurredAt time.Time, idempotencyKey string) (Order, error) {
+	return c.postTransition(ctx, externalID, idempotencyKey, postTransitionRequest{
+		ToState: toState, ExpectedVersion: expectedVersion, Reason: reason, OccurredAt: occurredAt,
+	})
+}

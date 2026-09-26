@@ -6,6 +6,35 @@ doc is the single place that boundary is stated; `findings-and-recommendation.md
 `component-map.md`, and `model-f-relay-findings.md` each carry a short pointer back
 here rather than restating it._
 
+## Update — 26 Sep 2026: Model F is a public product
+
+**Decided by the product owner: Model F is sold to the public.** Anyone can use
+the web storefront (`relay-storefront/`) to convert USDT between TRC-20 and
+BEP-20. The goals it must meet are stated in
+[`../00-product-goals.md`](../00-product-goals.md), which is now the source of
+truth for this product. This withdraws the "embedded behind a partner's own
+product, no public page" constraint below, and the reasoning for it in
+`model-f-relay-findings.md`.
+
+What this changes:
+
+- **Pricing is visible.** An administrator sets our profit margin; the customer
+  sees *amount → vendor fee + our profit → final payout* before paying
+  (goals §2). It is no longer a hidden commission.
+- **The competitiveness risk is accepted knowingly.** This doc warned that a
+  public page lets customers compare the visible price against alternatives
+  (about $1 to move USDT between networks through a large exchange). Pricing and
+  vendor choice have to be watched against that.
+- **Public-facing requirements become mandatory:** a real AML/screening vendor
+  (screening still runs the non-production placeholder), abuse limits on order
+  creation, production hosting, and operator alerting.
+
+What doesn't change: the shared-infrastructure split below; Model D's own
+decisions; AML/screening and Tether freeze risk apply to both models.
+
+The 14 Sep audit below ("No frontend code exists anywhere in this repo") is a
+historical record: `storefront/` and `relay-storefront/` exist now.
+
 ## The decision
 
 **Model D and Model F are separate products built on shared infrastructure, not one
@@ -17,7 +46,8 @@ product with two faces.**
   channels (Telegram, bots, embedded widgets, none yet designed).
 - **Model F** is a separate zero-float TRC20↔BEP20 relay product, sold only as embedded
   infrastructure behind a partner's own product — no public page, own customers, own
-  pricing (commission), own roadmap.
+  pricing (commission), own roadmap. _Superseded 26 Sep 2026: Model F is public, with
+  administrator-set pricing shown to the customer — see the update above._
 
 Shared technical infrastructure (`ledger` C1, `screening` C3, `energybroker` C4, `s1`
 key management, the BSC-side deposit watcher C2, `opsconsole`) serves both without
@@ -47,7 +77,8 @@ As of 14 Sep 2026:
   business rather than an individual. Model D is now understood as infrastructure
   distributed through B2B, B2C, and potentially other channels, per the diagram and
   reasoning the user supplied when making this decision.
-- **Model F's ban is unchanged, but now stands on its own reasoning**, not on
+- _(Superseded 26 Sep 2026 — Model F is now public; see the update at the top.)_
+  **Model F's ban is unchanged, but now stands on its own reasoning**, not on
   inheritance from Model D's (since Model D's version no longer exists). If anything
   Model F's case for staying non-public is *stronger* than Model D's original one:
   Model F's margin (in the "quote your own rate" pricing mechanism) is a spread on top

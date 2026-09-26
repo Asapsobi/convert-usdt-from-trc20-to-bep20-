@@ -219,7 +219,7 @@ func TestTracker_CheckFinality_OrphanedDepositRecordedAndDropped(t *testing.T) {
 	}
 }
 
-func TestTracker_CheckFinality_PermanentNonOrphanedErrorDropsSilently(t *testing.T) {
+func TestTracker_CheckFinality_EveryPermanentFailureIsRecordedForOperators(t *testing.T) {
 	recorder := &fakeOrphanRecorder{}
 	tr, err := New(Config{
 		OnFinal: func(ctx context.Context, c Candidate) error {
@@ -243,8 +243,10 @@ func TestTracker_CheckFinality_PermanentNonOrphanedErrorDropsSilently(t *testing
 	}
 	recorder.mu.Lock()
 	defer recorder.mu.Unlock()
-	if len(recorder.recorded) != 0 {
-		t.Errorf("expected no orphan recording for a non-orphaned permanent failure, got %+v", recorder.recorded)
+	// Real customer money we can't report, for any permanent reason, is
+	// recorded for an operator -- never just dropped with a log line.
+	if len(recorder.recorded) != 1 {
+		t.Errorf("expected the permanent failure recorded for an operator, got %+v", recorder.recorded)
 	}
 }
 

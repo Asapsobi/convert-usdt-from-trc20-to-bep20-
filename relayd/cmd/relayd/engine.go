@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"relayd/internal/addrcheck"
 	"relayd/internal/alert"
 	"relayd/internal/db"
 	"relayd/internal/driver"
@@ -15,9 +16,12 @@ import (
 	"relayd/internal/evmbroadcast"
 	"relayd/internal/ledgerclient"
 	"relayd/internal/orchestrate"
+	"relayd/internal/pricing"
 	"relayd/internal/relay"
 	"relayd/internal/signing"
+	"relayd/internal/sweeps"
 	"relayd/internal/tronbroadcast"
+	"relayd/internal/vendors"
 	"relayd/internal/watcherclient"
 )
 
@@ -86,15 +90,12 @@ func buildDriverAndOrchestrator(ctx context.Context, pool *db.Pool) (*driver.Dri
 	}
 	bep20Watcher := watcherclient.New(bep20WatcherBaseURL, bep20WatcherToken)
 
-	energyBaseURL, err := requiredEnv("RELAYD_ENERGY_BASE_URL")
+	vendorStore := vendors.NewStore(pool)
+	energyClient, energySource, err := energyClientFromEnv(ctx, vendorStore)
 	if err != nil {
 		return nil, nil, err
 	}
-	energyToken, err := requiredEnv("RELAYD_ENERGY_TOKEN")
-	if err != nil {
-		return nil, nil, err
-	}
-	energyClient := energy.New(energyBaseURL, energyToken)
+	slog.Info("relayd: TRON energy provider configured", "provider", energySource)
 
 	signingBaseURL, err := requiredEnv("RELAYD_SIGNING_BASE_URL")
 	if err != nil {
@@ -135,6 +136,11 @@ func buildDriverAndOrchestrator(ctx context.Context, pool *db.Pool) (*driver.Dri
 	if err != nil {
 		return nil, nil, fmt.Errorf("relayd: connecting to TRON node %q: %w", tronGRPCAddr, err)
 	}
+	if key := os.Getenv("RELAYD_TRONGRID_API_KEY"); key != "" {
+		broadcastClient.SetAPIKey(key)
+	} else {
+		slog.Warn("relayd: RELAYD_TRONGRID_API_KEY is not set -- TronGrid rate-limits keyless calls (HTTP 429)")
+	}
 	tronAPIBaseURL, err := requiredEnv("RELAYD_TRON_API_BASE_URL")
 	if err != nil {
 		return nil, nil, err
@@ -150,7 +156,7 @@ func buildDriverAndOrchestrator(ctx context.Context, pool *db.Pool) (*driver.Dri
 		return nil, nil, fmt.Errorf("relayd: connecting to BSC node %q: %w", bscRPCURL, err)
 	}
 
-	swapProvider, providerName, err := upstreamProviderFromEnv()
+	swapProvider, providerName, err := upstreamProviderFromEnv(ctx, vendorStore)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -163,23 +169,23 @@ func buildDriverAndOrchestrator(ctx context.Context, pool *db.Pool) (*driver.Dri
 		return nil, nil, err
 	}
 
-	feeBasisPoints, err := requiredEnvInt64("RELAYD_FEE_BASIS_POINTS")
+	quoteValidity, err := optionalDuration("RELAYD_QUOTE_VALIDITY", 10*time.Minute)
 	if err != nil {
 		return nil, nil, err
 	}
-	quoteValidity := 10 * time.Minute
-	if raw := os.Getenv("RELAYD_QUOTE_VALIDITY"); raw != "" {
-		parsed, err := time.ParseDuration(raw)
-		if err != nil {
-			return nil, nil, fmt.Errorf("relayd: RELAYD_QUOTE_VALIDITY: %w", err)
-		}
-		quoteValidity = parsed
+	depositWindow, err := optionalDuration("RELAYD_DEPOSIT_WINDOW", 30*time.Minute)
+	if err != nil {
+		return nil, nil, err
+	}
+	depositGrace, err := optionalDuration("RELAYD_DEPOSIT_GRACE", 30*time.Minute)
+	if err != nil {
+		return nil, nil, err
+	}
+	pricingStore := pricing.NewStore(pool)
+	if _, err := pricingStore.Get(ctx); err != nil {
+		return nil, nil, fmt.Errorf("relayd: reading pricing settings: %w", err)
 	}
 
-	// Unset (zero) leaves R5's own automatic refund-by-timeout disabled --
-	// an explicit opt-in, not a default, matching this service's own
-	// no-hardcoded-real-money-defaults posture. See
-	// orchestrate.Config.ForwardingTimeout's own doc comment.
 	var forwardingTimeout time.Duration
 	if raw := os.Getenv("RELAYD_FORWARDING_TIMEOUT"); raw != "" {
 		parsed, err := time.ParseDuration(raw)
@@ -202,11 +208,28 @@ func buildDriverAndOrchestrator(ctx context.Context, pool *db.Pool) (*driver.Dri
 		staleLegAlertAfter = parsed
 	}
 
+	sweepToBSC, sweepToTRON := os.Getenv("RELAYD_SWEEP_TO_BSC"), os.Getenv("RELAYD_SWEEP_TO_TRON")
+	if sweepToBSC != "" {
+		if err := addrcheck.EVM(sweepToBSC); err != nil {
+			return nil, nil, fmt.Errorf("relayd: RELAYD_SWEEP_TO_BSC: %w", err)
+		}
+	}
+	if sweepToTRON != "" {
+		if err := addrcheck.TRON(sweepToTRON); err != nil {
+			return nil, nil, fmt.Errorf("relayd: RELAYD_SWEEP_TO_TRON: %w", err)
+		}
+	}
+	sweepStore := sweeps.NewStore(pool)
+	if _, err := sweepStore.Settings(ctx); err != nil {
+		return nil, nil, fmt.Errorf("relayd: reading sweep settings: %w", err)
+	}
+	slog.Info("relayd: profit sweeps go to", "bsc", firstNonEmpty(sweepToBSC, slotEVMAddress), "tron", firstNonEmpty(sweepToTRON, slotAddress))
+
 	store := relay.NewStore(pool)
 
 	d := &driver.Driver{
 		Ledger: ledger, Upstream: swapProvider, TronWatcher: tronWatcher, BEP20Watcher: bep20Watcher,
-		Store: store, Cfg: driver.Config{FeeBasisPoints: feeBasisPoints, QuoteValidity: quoteValidity},
+		Store: store, Pricing: pricingStore, Cfg: driver.Config{QuoteValidity: quoteValidity, DepositWindow: depositWindow},
 	}
 
 	orch := orchestrate.New(store, ledger, swapProvider, energyClient, signer, broadcastClient, finalityReader,
@@ -214,14 +237,66 @@ func buildDriverAndOrchestrator(ctx context.Context, pool *db.Pool) (*driver.Dri
 		orchestrate.Config{
 			SlotID: slotID, SlotAddress: slotAddress, SlotEVMAddress: slotEVMAddress,
 			EnergyPerTransferUnits: energyPerTransferUnits, ForwardingTimeout: forwardingTimeout,
-			StaleLegAlertAfter: staleLegAlertAfter,
+			StaleLegAlertAfter: staleLegAlertAfter, DepositGrace: depositGrace,
+			SweepToBSC: sweepToBSC, SweepToTRON: sweepToTRON,
 		})
+
+	orch.Pricing = pricingStore
+	orch.Sweeps = sweepStore
 
 	return d, orch, nil
 }
 
 // orchestrateInterval reads RELAYD_ORCHESTRATE_INTERVAL, defaulting to
 // orchestrate.DefaultInterval if unset.
+// energyClientFromEnv picks where TRON energy is rented: straight from
+// the vendors (RELAYD_CATFEE_API_KEY/SECRET -- routed, with failover, by
+// vendors.EnergyRouter), or through the energy broker service
+// (RELAYD_ENERGY_BASE_URL/TOKEN). With neither, TRON transfers that need
+// energy fail with a clear error; BSC is unaffected.
+func energyClientFromEnv(ctx context.Context, store *vendors.Store) (orchestrate.EnergyClient, string, error) {
+	vs := map[string]vendors.EnergyVendor{}
+	if key, secret := os.Getenv("RELAYD_CATFEE_API_KEY"), os.Getenv("RELAYD_CATFEE_API_SECRET"); key != "" || secret != "" {
+		catfee, err := vendors.NewCatFee(key, secret, os.Getenv("RELAYD_CATFEE_BASE_URL"))
+		if err != nil {
+			return nil, "", fmt.Errorf("relayd: RELAYD_CATFEE_API_KEY/RELAYD_CATFEE_API_SECRET: %w", err)
+		}
+		vs["catfee"] = catfee
+	}
+	if len(vs) > 0 {
+		router, err := vendors.NewEnergyRouter(ctx, store, vs)
+		if err != nil {
+			return nil, "", err
+		}
+		return router, "vendors", nil
+	}
+	if base := os.Getenv("RELAYD_ENERGY_BASE_URL"); base != "" {
+		token, err := requiredEnv("RELAYD_ENERGY_TOKEN")
+		if err != nil {
+			return nil, "", err
+		}
+		return energy.New(base, token), "broker", nil
+	}
+	slog.Warn("relayd: no TRON energy provider configured -- TRON transfers that need energy will fail until RELAYD_CATFEE_API_KEY/SECRET are set")
+	return nil, "none", nil
+}
+
+// optionalDuration reads a duration env var, or def when it is unset.
+func optionalDuration(name string, def time.Duration) (time.Duration, error) {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("relayd: %s: %w", name, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("relayd: %s must be positive, got %s", name, d)
+	}
+	return d, nil
+}
+
 func orchestrateInterval() (time.Duration, error) {
 	raw := os.Getenv("RELAYD_ORCHESTRATE_INTERVAL")
 	if raw == "" {
@@ -232,4 +307,13 @@ func orchestrateInterval() (time.Duration, error) {
 		return 0, fmt.Errorf("relayd: RELAYD_ORCHESTRATE_INTERVAL: %w", err)
 	}
 	return d, nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }

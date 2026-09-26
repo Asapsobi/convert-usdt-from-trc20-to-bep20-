@@ -411,12 +411,13 @@ type ffOrderData struct {
 // through WITHDRAW (their own payout broadcasting) is, from relayd's own
 // perspective, just "the vendor has it and hasn't finished or failed
 // yet," the same abstraction MockProvider's own StatusExchanging/
-// StatusSending already collapse to for a fake vendor. EMERGENCY (the
-// vendor's own manual-intervention state, e.g. amount mismatch) maps to
-// StatusFailed rather than a new SwapStatus value -- settle.go's own
-// advanceForwardedLeg already treats StatusFailed as "escalate to
-// UNRECOVERABLE," the correct outcome for a forward transfer FixedFloat
-// itself flagged as needing human review.
+// StatusSending already collapse to for a fake vendor. EMERGENCY is
+// FixedFloat's manual-intervention state (an amount mismatch, a deposit
+// after the order's deadline): the funds are held until someone chooses
+// to continue the exchange or refund, so it is not a failure --
+// StatusNeedsAttention, alerted on while the order is still followed. A
+// status this code doesn't know is treated the same way, never as a
+// failure.
 func statusFromFixedFloat(status string) SwapStatus {
 	switch status {
 	case "NEW":
@@ -431,10 +432,8 @@ func statusFromFixedFloat(status string) SwapStatus {
 		return StatusComplete
 	case "EXPIRED":
 		return StatusExpired
-	case "EMERGENCY":
-		return StatusFailed
-	default:
-		return StatusFailed
+	default: // "EMERGENCY", or a status this code doesn't know
+		return StatusNeedsAttention
 	}
 }
 

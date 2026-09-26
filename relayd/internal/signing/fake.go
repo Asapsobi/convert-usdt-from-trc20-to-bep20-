@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/sha256"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/crypto"
@@ -61,12 +62,28 @@ func (f *FakeSigningService) SetEVMAddress(slotID int, address string) {
 	f.evmAddresses[slotID] = address
 }
 
-// ForceError makes the next RequestSignature call for idempotencyKey
-// fail with err.
+// ForceError makes every signing request for idempotencyKey fail with
+// err -- including relayd's digest-scoped keys built on it
+// ("<idempotencyKey>:<digest>"), so a forced failure keeps failing for a
+// transaction that gets rebuilt.
 func (f *FakeSigningService) ForceError(idempotencyKey string, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.forceErr[idempotencyKey] = err
+}
+
+// forcedError returns the error ForceError set for idempotencyKey, or for
+// the key it was scoped from. Callers hold f.mu.
+func (f *FakeSigningService) forcedError(idempotencyKey string) (error, bool) {
+	if err, ok := f.forceErr[idempotencyKey]; ok {
+		return err, true
+	}
+	if i := strings.LastIndex(idempotencyKey, ":"); i > 0 {
+		if err, ok := f.forceErr[idempotencyKey[:i]]; ok {
+			return err, true
+		}
+	}
+	return nil, false
 }
 
 // ForceDuplicateSignature makes idempotencyKey's own signed_tx come out
@@ -137,7 +154,7 @@ func (f *FakeSigningService) RequestSignature(ctx context.Context, slotID int, d
 	if id, ok := f.byIdemKey[idempotencyKey]; ok {
 		return *f.byID[id], nil
 	}
-	if err, ok := f.forceErr[idempotencyKey]; ok {
+	if err, ok := f.forcedError(idempotencyKey); ok {
 		return SigningRequest{}, err
 	}
 
@@ -174,7 +191,7 @@ func (f *FakeSigningService) RequestDepositSweepSignature(ctx context.Context, i
 	if id, ok := f.byIdemKey[idempotencyKey]; ok {
 		return *f.byID[id], nil
 	}
-	if err, ok := f.forceErr[idempotencyKey]; ok {
+	if err, ok := f.forcedError(idempotencyKey); ok {
 		return SigningRequest{}, err
 	}
 
@@ -210,7 +227,7 @@ func (f *FakeSigningService) RequestTronDepositSweepSignature(ctx context.Contex
 	if id, ok := f.byIdemKey[idempotencyKey]; ok {
 		return *f.byID[id], nil
 	}
-	if err, ok := f.forceErr[idempotencyKey]; ok {
+	if err, ok := f.forcedError(idempotencyKey); ok {
 		return SigningRequest{}, err
 	}
 

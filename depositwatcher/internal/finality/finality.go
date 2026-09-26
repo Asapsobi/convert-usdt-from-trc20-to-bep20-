@@ -91,9 +91,40 @@ type ObservedLog struct {
 	// first" in the ledger repo's own build-prompts doc for the full
 	// path this closes.
 	SenderAddress string
+	// Address is the deposit wallet the Transfer paid -- the lease's
+	// address. Scopes this deposit's re-verification to logs paying it.
+	Address string
 }
 
 func (o ObservedLog) key() candidateKey { return candidateKey{o.TxHash, o.LogIndex} }
+
+// Deposit outcomes a DepositStore records.
+const (
+	DepositDetected = "DETECTED"
+	DepositReported = "REPORTED"
+	DepositOrphaned = "ORPHANED"
+	DepositDropped  = "DROPPED"
+)
+
+// DepositStore makes detected deposits durable. A deposit is saved before
+// the scan cursor moves past it, so a restart before it is reported
+// resumes it (Restore) instead of losing it. Optional: a nil store keeps
+// the tracker purely in memory, as in tests that don't need it.
+type DepositStore interface {
+	// Save records c as detected. known reports the deposit was already
+	// recorded; status is its recorded status then.
+	Save(ctx context.Context, c Candidate) (known bool, status string, err error)
+	// SetStatus records a deposit's outcome.
+	SetStatus(ctx context.Context, txHash common.Hash, logIndex uint, status, note string) error
+	// LoadDetected returns every deposit still awaiting a report.
+	LoadDetected(ctx context.Context) ([]Candidate, error)
+}
+
+// finalizedRetention bounds how long a reported deposit stays in memory
+// for the post-final reorg re-check. BEP-126 finality is irreversible in
+// practice; re-checking forever only grows the RPC bill with every
+// deposit ever seen.
+const finalizedRetention = 10 * time.Minute
 
 // DepositFinalIdempotencyKeyPrefix is invariant 2's own prefix for a
 // deposit_final entry's idempotency key. Exported so ledgerclient (the
@@ -119,6 +150,7 @@ type Candidate struct {
 	DetectedAt     time.Time
 
 	alertedStale bool
+	finalizedAt  time.Time
 	contradicted bool // set once a post-final reorg has been logged for this candidate -- see handlePostFinalReorg
 
 	// asyncConfirmations is Design B's own per-provider confirmation
@@ -199,6 +231,9 @@ type Config struct {
 	OnStalePending          StalePendingHandler // optional
 	ReorgReporter           ReorgReporter
 	OrphanedDepositRecorder OrphanedDepositRecorder
+
+	// Store makes detected deposits durable (see DepositStore). Optional.
+	Store DepositStore
 
 	// OnDisagreement is Design B's own alert hook (async_driver.go,
 	// Phase 2) -- optional, nil means "log only" (CheckFinalityAsync
@@ -338,13 +373,71 @@ func (t *Tracker) OnLogObserved(ctx context.Context, log ObservedLog, classifica
 		return nil
 	}
 
+	c := &Candidate{ObservedLog: log, Classification: classification, DetectedAt: t.cfg.Now()}
+	if t.cfg.Store != nil {
+		known, status, err := t.cfg.Store.Save(ctx, *c)
+		if err != nil {
+			return fmt.Errorf("finality: recording deposit %s:%d: %w", log.TxHash, log.LogIndex, err)
+		}
+		if known && status != DepositDetected {
+			return nil // already reported, orphaned, or dropped by an earlier run
+		}
+	}
+
 	slog.Info("finality: deposit.detected (0-conf, advisory only)",
 		"tx_hash", log.TxHash, "log_index", log.LogIndex, "height", log.Height,
 		"order_id", log.OrderID, "amount", log.Amount, "classification", classification)
 
-	t.pending[key] = &Candidate{ObservedLog: log, Classification: classification, DetectedAt: t.cfg.Now()}
+	t.pending[key] = c
 	t.recordDetected()
 	return nil
+}
+
+// Restore reloads every deposit a previous run detected but never
+// reported, so they are finalized now instead of being lost.
+func (t *Tracker) Restore(ctx context.Context) (int, error) {
+	if t.cfg.Store == nil {
+		return 0, nil
+	}
+	cands, err := t.cfg.Store.LoadDetected(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("finality: restoring detected deposits: %w", err)
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for i := range cands {
+		c := cands[i]
+		if t.pending[c.key()] == nil {
+			t.pending[c.key()] = &c
+		}
+	}
+	return len(cands), nil
+}
+
+// setStatus records a deposit's outcome, logging (not returning) a store
+// failure -- the in-memory decision has been made; at worst the deposit
+// is re-checked after a restart, and the ledger's idempotency makes a
+// repeated report harmless.
+func (t *Tracker) setStatus(ctx context.Context, c *Candidate, status, note string) {
+	if t.cfg.Store == nil {
+		return
+	}
+	if err := t.cfg.Store.SetStatus(ctx, c.TxHash, c.LogIndex, status, note); err != nil {
+		slog.Error("finality: recording a deposit outcome failed", "tx_hash", c.TxHash, "log_index", c.LogIndex, "status", status, "error", err)
+	}
+}
+
+// topicsFor scopes a re-verification query to logs paying the candidates'
+// own deposit wallets, when they are known.
+func (t *Tracker) topicsFor(cands []*Candidate) [][]common.Hash {
+	var to []common.Hash
+	for _, c := range cands {
+		if c.Address == "" {
+			return [][]common.Hash{{t.cfg.TransferTopic}}
+		}
+		to = append(to, common.BytesToHash(common.HexToAddress(c.Address).Bytes()))
+	}
+	return [][]common.Hash{{t.cfg.TransferTopic}, {}, to}
 }
 
 // CheckFinality polls pool.LatestFinalized, promotes every pending
@@ -385,7 +478,7 @@ func (t *Tracker) CheckFinality(ctx context.Context, pool *chain.Pool) error {
 	}
 
 	for height, candidates := range byHeight {
-		logs, err := pool.LogsAt(ctx, height, height, t.cfg.ContractAddress, [][]common.Hash{{t.cfg.TransferTopic}})
+		logs, err := pool.LogsAt(ctx, height, height, t.cfg.ContractAddress, t.topicsFor(candidates))
 		if err != nil {
 			// Can't re-verify this height this tick -- leave these
 			// candidates pending rather than guessing either way.
@@ -405,6 +498,7 @@ func (t *Tracker) CheckFinality(ctx context.Context, pool *chain.Pool) error {
 				slog.Info("finality: candidate no longer present at its height, dropping silently (pre-final reorg)",
 					"tx_hash", c.TxHash, "log_index", c.LogIndex, "height", c.Height)
 				t.drop(c.key())
+				t.setStatus(ctx, c, DepositDropped, "no longer present at its height before finality (pre-final reorg)")
 				continue
 			}
 			t.finalize(ctx, c)
@@ -458,28 +552,17 @@ func (t *Tracker) finalize(ctx context.Context, c *Candidate) {
 	key := c.key()
 	if err := t.cfg.OnFinal(ctx, *c); err != nil {
 		if errors.Is(err, ErrPermanentFailure) {
-			if errors.Is(err, ErrOrphanedDeposit) {
-				// Real customer money, an order C1 no longer has open
-				// for it: must be recorded, not merely logged, before
-				// this candidate is allowed to stop being tracked. If
-				// recording itself fails (e.g. a transient DB error),
-				// leave it pending -- retrying HandleUnreportable next
-				// tick is safe (Record is idempotent on tx_hash:log_index)
-				// and strictly better than losing track of an orphaned
-				// deposit because its OWN recording attempt happened to
-				// fail once.
-				if handleErr := t.HandleUnreportable(ctx, *c, err); handleErr != nil {
-					slog.Error("finality: HandleUnreportable failed, will retry next tick",
-						"tx_hash", c.TxHash, "log_index", c.LogIndex, "error", handleErr)
-					return
-				}
-			} else {
-				// A structural bug in this service's own code (e.g.
-				// idempotency_conflict), not a customer-money case --
-				// nothing to record, just needs a person to look at it.
-				slog.Error("finality: OnFinal permanently failed, dropping from tracking",
-					"tx_hash", c.TxHash, "log_index", c.LogIndex, "order_id", c.OrderID, "external_id", c.ExternalID, "error", err)
+			// Real customer money C1 won't accept for this order (it is no
+			// longer open, or our own request was malformed): record it
+			// for an operator before it stops being tracked -- never just
+			// a log line. If recording fails, leave it pending and retry
+			// next tick (Record is idempotent on tx_hash:log_index).
+			if handleErr := t.HandleUnreportable(ctx, *c, err); handleErr != nil {
+				slog.Error("finality: HandleUnreportable failed, will retry next tick",
+					"tx_hash", c.TxHash, "log_index", c.LogIndex, "error", handleErr)
+				return
 			}
+			t.setStatus(ctx, c, DepositOrphaned, err.Error())
 			t.mu.Lock()
 			delete(t.pending, key)
 			t.mu.Unlock()
@@ -489,7 +572,9 @@ func (t *Tracker) finalize(ctx context.Context, c *Candidate) {
 			"tx_hash", c.TxHash, "log_index", c.LogIndex, "error", err)
 		return
 	}
+	t.setStatus(ctx, c, DepositReported, "")
 	t.mu.Lock()
+	c.finalizedAt = t.cfg.Now()
 	t.finalized[key] = c
 	delete(t.pending, key)
 	t.mu.Unlock()
@@ -534,8 +619,13 @@ func (t *Tracker) HandleUnreportable(ctx context.Context, c Candidate, c1Error e
 // trivially satisfies it, so this change is non-breaking for Design A.
 func (t *Tracker) checkPostFinalReorgs(ctx context.Context, pool AsyncChainQuerier) {
 	byHeight := make(map[uint64][]*Candidate)
+	now := t.cfg.Now()
 	t.mu.Lock()
-	for _, c := range t.finalized {
+	for key, c := range t.finalized {
+		if !c.finalizedAt.IsZero() && now.Sub(c.finalizedAt) > finalizedRetention {
+			delete(t.finalized, key)
+			continue
+		}
 		byHeight[c.Height] = append(byHeight[c.Height], c)
 	}
 	t.mu.Unlock()
@@ -544,7 +634,7 @@ func (t *Tracker) checkPostFinalReorgs(ctx context.Context, pool AsyncChainQueri
 	}
 
 	for height, candidates := range byHeight {
-		logs, err := pool.LogsAt(ctx, height, height, t.cfg.ContractAddress, [][]common.Hash{{t.cfg.TransferTopic}})
+		logs, err := pool.LogsAt(ctx, height, height, t.cfg.ContractAddress, t.topicsFor(candidates))
 		if err != nil {
 			slog.Error("finality: re-verifying already-finalized candidates at height failed, will retry next tick",
 				"height", height, "error", err)

@@ -86,9 +86,30 @@ type ObservedTransfer struct {
 	// it and has no chain access of its own, mirroring
 	// depositwatcher/internal/finality.ObservedLog's identical field.
 	SenderAddress string
+	// Address is the deposit wallet the transfer paid -- the lease's.
+	Address string
 }
 
 func (o ObservedTransfer) key() string { return o.TxID }
+
+// Deposit outcomes a DepositStore records.
+const (
+	DepositDetected = "DETECTED"
+	DepositReported = "REPORTED"
+	DepositOrphaned = "ORPHANED"
+	DepositDropped  = "DROPPED"
+)
+
+// DepositStore makes detected deposits durable: a deposit is saved before
+// its wallet's scan cursor moves past it, so a restart before it is
+// reported resumes it (Restore) instead of losing it. Optional.
+type DepositStore interface {
+	// Save records c as detected. known reports it was already recorded;
+	// status is its recorded status then.
+	Save(ctx context.Context, c Candidate) (known bool, status string, err error)
+	SetStatus(ctx context.Context, txID, status, note string) error
+	LoadDetected(ctx context.Context) ([]Candidate, error)
+}
 
 // Candidate is a tracked deposit: observed and classified, not yet
 // final.
@@ -137,7 +158,9 @@ type Config struct {
 	OnFinal                 FinalHandler
 	OnStalePending          StalePendingHandler // optional
 	OrphanedDepositRecorder OrphanedDepositRecorder
-	Metrics                 MetricsRecorder // optional
+	// Store makes detected deposits durable (see DepositStore). Optional.
+	Store   DepositStore
+	Metrics MetricsRecorder // optional
 
 	// StalePendingCeiling defaults to DefaultStalePendingCeiling if <= 0.
 	StalePendingCeiling time.Duration
@@ -213,9 +236,49 @@ func (t *Tracker) OnTransferObserved(ctx context.Context, transfer ObservedTrans
 	slog.Info("finality: deposit.detected (advisory, not yet solidity-confirmed)",
 		"tx_id", transfer.TxID, "order_id", transfer.OrderID, "amount", transfer.Amount, "classification", classification)
 
-	t.pending[key] = &Candidate{ObservedTransfer: transfer, Classification: classification, DetectedAt: t.cfg.Now()}
+	c := &Candidate{ObservedTransfer: transfer, Classification: classification, DetectedAt: t.cfg.Now()}
+	if t.cfg.Store != nil {
+		known, status, err := t.cfg.Store.Save(ctx, *c)
+		if err != nil {
+			return fmt.Errorf("finality: recording deposit %s: %w", transfer.TxID, err)
+		}
+		if known && status != DepositDetected {
+			return nil // already reported, orphaned, or dropped by an earlier run
+		}
+	}
+	t.pending[key] = c
 	t.recordDetected()
 	return nil
+}
+
+// Restore reloads every deposit a previous run detected but never
+// reported, so they are finalized now instead of being lost.
+func (t *Tracker) Restore(ctx context.Context) (int, error) {
+	if t.cfg.Store == nil {
+		return 0, nil
+	}
+	cands, err := t.cfg.Store.LoadDetected(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("finality: restoring detected deposits: %w", err)
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for i := range cands {
+		c := cands[i]
+		if t.pending[c.key()] == nil {
+			t.pending[c.key()] = &c
+		}
+	}
+	return len(cands), nil
+}
+
+func (t *Tracker) setStatus(ctx context.Context, c *Candidate, status, note string) {
+	if t.cfg.Store == nil {
+		return
+	}
+	if err := t.cfg.Store.SetStatus(ctx, c.TxID, status, note); err != nil {
+		slog.Error("finality: recording a deposit outcome failed", "tx_id", c.TxID, "status", status, "error", err)
+	}
 }
 
 // CheckFinality calls checker.IsFinal for every pending candidate and
@@ -275,16 +338,15 @@ func (t *Tracker) finalize(ctx context.Context, c *Candidate) {
 	key := c.key()
 	if err := t.cfg.OnFinal(ctx, *c); err != nil {
 		if errors.Is(err, ErrPermanentFailure) {
-			if errors.Is(err, ErrOrphanedDeposit) {
-				if handleErr := t.HandleUnreportable(ctx, *c, err); handleErr != nil {
-					slog.Error("finality: HandleUnreportable failed, will retry next tick",
-						"tx_id", c.TxID, "error", handleErr)
-					return
-				}
-			} else {
-				slog.Error("finality: OnFinal permanently failed, dropping from tracking",
-					"tx_id", c.TxID, "order_id", c.OrderID, "external_id", c.ExternalID, "error", err)
+			// Real customer money C1 won't accept for this order: record it
+			// for an operator before it stops being tracked -- never just a
+			// log line. If recording fails, retry next tick.
+			if handleErr := t.HandleUnreportable(ctx, *c, err); handleErr != nil {
+				slog.Error("finality: HandleUnreportable failed, will retry next tick",
+					"tx_id", c.TxID, "error", handleErr)
+				return
 			}
+			t.setStatus(ctx, c, DepositOrphaned, err.Error())
 			t.mu.Lock()
 			delete(t.pending, key)
 			t.mu.Unlock()
@@ -294,6 +356,7 @@ func (t *Tracker) finalize(ctx context.Context, c *Candidate) {
 			"tx_id", c.TxID, "error", err)
 		return
 	}
+	t.setStatus(ctx, c, DepositReported, "")
 	t.mu.Lock()
 	delete(t.pending, key)
 	t.mu.Unlock()

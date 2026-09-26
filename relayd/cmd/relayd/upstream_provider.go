@@ -1,35 +1,31 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
 
 	"relayd/internal/upstream"
+	"relayd/internal/vendors"
 )
 
-// upstreamProviderFromEnv reads UPSTREAM_PROVIDER. Mirrors screening's
-// own screeningProviderFromEnv double-gate convention exactly (see
-// screening/cmd/screend/main.go): unset means no real vendor is wired
-// (relayd's own front door and orchestrate loop cannot run without one
-// -- unlike screening's own optional engine, a swap provider is not
-// optional here), "placeholder" requires UPSTREAM_ALLOW_PLACEHOLDER=true
-// alongside it so a real deployment can never reach
-// upstream.PlaceholderProvider through one mistyped env var alone.
-// "fixedfloat"/"changenow" are R4's own real vendors, per R2's decision
-// record (docs/01-strategy/model-f-relay-findings.md) -- every one of
-// their own credential/currency-code fields is required with no
-// default, the same "no hardcoded defaults for anything real-money-
-// shaped" discipline this function's own placeholder branch already
-// follows for UPSTREAM_ALLOW_PLACEHOLDER. "best_rate" wires
-// upstream.MultiProvider across 2+ of the above, per
-// UPSTREAM_BEST_RATE_PROVIDERS -- see that branch's own comment.
-func upstreamProviderFromEnv() (upstream.SwapProvider, string, error) {
+// upstreamProviderFromEnv builds the conversion vendor(s) UPSTREAM_PROVIDER
+// names. Every real vendor goes through vendors.ConversionRouter -- even a
+// single one -- so its health is tracked, an administrator can disable it,
+// and adding a second vendor later is only configuration:
+//   - "fixedfloat", "changenow", "sideshift": that one vendor
+//   - "router" (or "best_rate"): every vendor listed in UPSTREAM_VENDORS
+//     (or UPSTREAM_BEST_RATE_PROVIDERS), e.g. "fixedfloat,changenow" --
+//     each opted in explicitly, never just because credentials exist
+//   - "placeholder" (with UPSTREAM_ALLOW_PLACEHOLDER=true): no vendor at all
+func upstreamProviderFromEnv(ctx context.Context, store *vendors.Store) (upstream.SwapProvider, string, error) {
 	name := os.Getenv("UPSTREAM_PROVIDER")
+	var names []string
 	switch name {
 	case "":
 		return nil, "", fmt.Errorf("relayd: UPSTREAM_PROVIDER is not set -- set UPSTREAM_PROVIDER=fixedfloat, " +
-			"UPSTREAM_PROVIDER=changenow, UPSTREAM_PROVIDER=sideshift, or UPSTREAM_PROVIDER=best_rate for a real vendor (or vendors), " +
+			"UPSTREAM_PROVIDER=changenow, UPSTREAM_PROVIDER=sideshift, or UPSTREAM_PROVIDER=router for a real vendor (or vendors), " +
 			"or UPSTREAM_PROVIDER=placeholder and UPSTREAM_ALLOW_PLACEHOLDER=true to run against a placeholder")
 	case "placeholder":
 		if os.Getenv("UPSTREAM_ALLOW_PLACEHOLDER") != "true" {
@@ -37,33 +33,51 @@ func upstreamProviderFromEnv() (upstream.SwapProvider, string, error) {
 				"-- upstream.PlaceholderProvider answers every call with ErrNoVendorConfigured, never a real quote")
 		}
 		return upstream.PlaceholderProvider{}, "placeholder", nil
-	case "fixedfloat":
-		provider, err := buildFixedFloatProviderFromEnv()
-		if err != nil {
-			return nil, "", err
+	case "fixedfloat", "changenow", "sideshift":
+		names = []string{name}
+	case "router", "best_rate":
+		raw := os.Getenv("UPSTREAM_VENDORS")
+		if raw == "" {
+			raw = os.Getenv("UPSTREAM_BEST_RATE_PROVIDERS")
 		}
-		return provider, "fixedfloat", nil
-	case "changenow":
-		provider, err := buildChangeNowProviderFromEnv()
-		if err != nil {
-			return nil, "", err
+		if raw == "" {
+			return nil, "", fmt.Errorf("relayd: UPSTREAM_PROVIDER=%s also requires UPSTREAM_VENDORS "+
+				"(comma-separated vendor names, e.g. \"fixedfloat,changenow\") -- no default, so a deployment can "+
+				"never silently start routing through a vendor nobody explicitly opted in", name)
 		}
-		return provider, "changenow", nil
-	case "sideshift":
-		provider, err := buildSideshiftProviderFromEnv()
-		if err != nil {
-			return nil, "", err
+		for _, n := range strings.Split(raw, ",") {
+			if n = strings.TrimSpace(n); n != "" {
+				names = append(names, n)
+			}
 		}
-		return provider, "sideshift", nil
-	case "best_rate":
-		provider, err := buildBestRateProviderFromEnv()
-		if err != nil {
-			return nil, "", err
-		}
-		return provider, "best_rate", nil
 	default:
-		return nil, "", fmt.Errorf("relayd: unrecognized UPSTREAM_PROVIDER %q (supported: unset, \"placeholder\", \"fixedfloat\", \"changenow\", \"best_rate\")", name)
+		return nil, "", fmt.Errorf("relayd: unrecognized UPSTREAM_PROVIDER %q (supported: \"fixedfloat\", \"changenow\", \"sideshift\", \"router\", \"placeholder\")", name)
 	}
+
+	providers := make(map[string]upstream.SwapProvider, len(names))
+	for _, n := range names {
+		var p upstream.SwapProvider
+		var err error
+		switch n {
+		case "fixedfloat":
+			p, err = buildFixedFloatProviderFromEnv()
+		case "changenow":
+			p, err = buildChangeNowProviderFromEnv()
+		case "sideshift":
+			p, err = buildSideshiftProviderFromEnv()
+		default:
+			return nil, "", fmt.Errorf("relayd: unrecognized conversion vendor %q (supported: \"fixedfloat\", \"changenow\", \"sideshift\")", n)
+		}
+		if err != nil {
+			return nil, "", err
+		}
+		providers[n] = p
+	}
+	router, err := vendors.NewConversionRouter(ctx, store, providers)
+	if err != nil {
+		return nil, "", err
+	}
+	return router, strings.Join(names, ","), nil
 }
 
 // buildFixedFloatProviderFromEnv wires upstream.FixedFloatProvider from
@@ -127,58 +141,4 @@ func buildSideshiftProviderFromEnv() (*upstream.SideshiftProvider, error) {
 			"SIDESHIFT_COIN_USDT_BEP20/SIDESHIFT_NETWORK_USDT_BEP20 (\"USDT\"/\"bsc\", verified live)", err)
 	}
 	return provider, nil
-}
-
-// buildBestRateProviderFromEnv wires upstream.MultiProvider across every
-// vendor named in UPSTREAM_BEST_RATE_PROVIDERS (comma-separated, e.g.
-// "fixedfloat,changenow") -- required with no default, same reasoning
-// as every other real-money-shaped config in this function: a
-// deployment must explicitly opt every vendor in, never silently route
-// through whichever ones happen to have credentials set. Each named
-// vendor's own credentials are read from that vendor's own env vars
-// (FIXEDFLOAT_*/CHANGENOW_*), exactly as the standalone "fixedfloat"/
-// "changenow" branches above read them -- adding a real vendor to the
-// router later needs no new plumbing here beyond adding its name to the
-// list, once that vendor has its own build*ProviderFromEnv function.
-func buildBestRateProviderFromEnv() (*upstream.MultiProvider, error) {
-	raw := os.Getenv("UPSTREAM_BEST_RATE_PROVIDERS")
-	if raw == "" {
-		return nil, fmt.Errorf("relayd: UPSTREAM_PROVIDER=best_rate also requires UPSTREAM_BEST_RATE_PROVIDERS " +
-			"(comma-separated vendor names, e.g. \"fixedfloat,changenow\") -- no default, so a deployment can " +
-			"never silently start routing through a vendor nobody explicitly opted in")
-	}
-	names := strings.Split(raw, ",")
-
-	providers := make([]upstream.NamedProvider, 0, len(names))
-	for _, name := range names {
-		name = strings.TrimSpace(name)
-		switch name {
-		case "fixedfloat":
-			provider, err := buildFixedFloatProviderFromEnv()
-			if err != nil {
-				return nil, err
-			}
-			providers = append(providers, upstream.NamedProvider{Name: "fixedfloat", Provider: provider})
-		case "changenow":
-			provider, err := buildChangeNowProviderFromEnv()
-			if err != nil {
-				return nil, err
-			}
-			providers = append(providers, upstream.NamedProvider{Name: "changenow", Provider: provider})
-		case "sideshift":
-			provider, err := buildSideshiftProviderFromEnv()
-			if err != nil {
-				return nil, err
-			}
-			providers = append(providers, upstream.NamedProvider{Name: "sideshift", Provider: provider})
-		default:
-			return nil, fmt.Errorf("relayd: UPSTREAM_BEST_RATE_PROVIDERS names unrecognized vendor %q (supported: \"fixedfloat\", \"changenow\", \"sideshift\")", name)
-		}
-	}
-
-	router, err := upstream.NewMultiProvider(providers)
-	if err != nil {
-		return nil, fmt.Errorf("relayd: configuring best_rate router: %w", err)
-	}
-	return router, nil
 }

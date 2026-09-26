@@ -49,6 +49,15 @@ type RelayLeg struct {
 	RefundTxID           *string `json:"refund_tx_id,omitempty"`
 	CreatedAt            string  `json:"created_at"`
 	UpdatedAt            string  `json:"updated_at"`
+
+	CustomerLabel   *string `json:"customer_label,omitempty"`
+	DepositAddress  string  `json:"deposit_address"`
+	SenderAddress   *string `json:"sender_address,omitempty"`
+	ProfitBPS       *int64  `json:"profit_bps,omitempty"`
+	ReceivedAmount  *string `json:"received_amount,omitempty"`
+	ProfitAmount    *string `json:"profit_amount,omitempty"`
+	ForwardAmount   *string `json:"forward_amount,omitempty"`
+	VendorFeeAmount *string `json:"vendor_fee_amount,omitempty"`
 }
 
 // ListRelayLegs calls relayd's own GET /v1/relay-legs?status=. An empty
