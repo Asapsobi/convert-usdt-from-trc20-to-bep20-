@@ -26,9 +26,10 @@ const (
 
 // Selection strategies an administrator can choose per service.
 const (
-	BestRate = "best_rate" // conversion: the vendor paying the customer the most
-	Cheapest = "cheapest"  // energy: the vendor charging the least
-	Priority = "priority"  // either: the administrator's priority order
+	BestRate   = "best_rate"   // conversion: the vendor paying the customer the most
+	BestMargin = "best_margin" // conversion: the vendor paying us the most (its revenue share), then the best rate
+	Cheapest   = "cheapest"    // energy: the vendor charging the least
+	Priority   = "priority"    // either: the administrator's priority order
 )
 
 // Vendor is one vendor's registry row.
@@ -43,6 +44,10 @@ type Vendor struct {
 	LastErrorAt         *time.Time
 	LastSuccessAt       *time.Time
 	UpdatedAt           time.Time
+	// RevenueBPS is what the vendor pays us, in basis points of what we
+	// send it; Notes are the administrator's.
+	RevenueBPS int
+	Notes      string
 }
 
 // Available reports whether v may be used at now: enabled, and not
@@ -74,14 +79,14 @@ func NewStore(pool *db.Pool) *Store { return &Store{pool: pool} }
 
 const vendorSelect = `
 	SELECT service, name, enabled, priority, consecutive_failures, unavailable_until,
-		last_error, last_error_at, last_success_at, updated_at
+		last_error, last_error_at, last_success_at, updated_at, revenue_bps, notes
 	FROM vendors`
 
 func scanVendor(row interface{ Scan(...any) error }) (Vendor, error) {
 	var v Vendor
 	var service string
 	err := row.Scan(&service, &v.Name, &v.Enabled, &v.Priority, &v.ConsecutiveFailures, &v.UnavailableUntil,
-		&v.LastError, &v.LastErrorAt, &v.LastSuccessAt, &v.UpdatedAt)
+		&v.LastError, &v.LastErrorAt, &v.LastSuccessAt, &v.UpdatedAt, &v.RevenueBPS, &v.Notes)
 	v.Service = Service(service)
 	return v, err
 }
@@ -201,11 +206,29 @@ func (s *Store) Strategy(ctx context.Context, service Service) (string, error) {
 	return defaultStrategy(service), nil
 }
 
+// SetTerms records a vendor's terms: what it pays us, in basis points of
+// what we send it, and the administrator's notes on it.
+func (s *Store) SetTerms(ctx context.Context, service Service, name string, revenueBPS int, notes string) error {
+	if revenueBPS < 0 || revenueBPS >= 10_000 {
+		return fmt.Errorf("vendors: revenue_bps must be 0..9999, got %d", revenueBPS)
+	}
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE vendors SET revenue_bps = $3, notes = $4, updated_at = now() WHERE service = $1 AND name = $2
+	`, string(service), name, revenueBPS, notes)
+	if err != nil {
+		return fmt.Errorf("vendors: setting %s vendor %s's terms: %w", service, name, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("vendors: no %s vendor named %q", service, name)
+	}
+	return nil
+}
+
 // SetStrategy stores the selection strategy for service.
 func (s *Store) SetStrategy(ctx context.Context, service Service, strategy string) error {
 	switch {
 	case strategy == Priority:
-	case service == Conversion && strategy == BestRate:
+	case service == Conversion && (strategy == BestRate || strategy == BestMargin):
 	case service == Energy && strategy == Cheapest:
 	default:
 		return fmt.Errorf("vendors: %q is not a strategy for %s vendors", strategy, service)

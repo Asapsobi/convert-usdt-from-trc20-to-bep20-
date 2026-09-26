@@ -118,8 +118,18 @@ func (r *ConversionRouter) rank(ctx context.Context, pair upstream.Pair, amountI
 		}
 		ok = append(ok, res)
 	}
-	if strategy == BestRate {
+	switch strategy {
+	case BestRate:
 		sort.SliceStable(ok, func(a, b int) bool { return ok[a].quote.AmountOut.Units > ok[b].quote.AmountOut.Units })
+	case BestMargin:
+		// Our own profit is the same whichever vendor takes the order, so
+		// the vendor's revenue share decides; the customer's rate breaks ties.
+		sort.SliceStable(ok, func(a, b int) bool {
+			if ok[a].vendor.RevenueBPS != ok[b].vendor.RevenueBPS {
+				return ok[a].vendor.RevenueBPS > ok[b].vendor.RevenueBPS
+			}
+			return ok[a].quote.AmountOut.Units > ok[b].quote.AmountOut.Units
+		})
 	}
 	return ok, failures, nil
 }
@@ -197,4 +207,23 @@ func (r *ConversionRouter) SelfCheck(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// VendorQuote is one vendor's live price for an amount, or why it has none.
+type VendorQuote struct {
+	Vendor string
+	Quote  upstream.Quote
+	Err    error
+}
+
+// QuoteEach asks every configured vendor -- enabled or not -- for its
+// price on pair/amountIn: the administrator's live pricing view.
+func (r *ConversionRouter) QuoteEach(ctx context.Context, pair upstream.Pair, amountIn money.Amount) []VendorQuote {
+	out := make([]VendorQuote, 0, len(r.vendors))
+	for name, v := range r.vendors {
+		q, err := v.Quote(ctx, pair, amountIn)
+		out = append(out, VendorQuote{Vendor: name, Quote: q, Err: err})
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].Vendor < out[b].Vendor })
+	return out
 }

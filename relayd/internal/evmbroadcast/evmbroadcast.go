@@ -228,3 +228,44 @@ func (c *Client) IsFinal(ctx context.Context, txHash string) (bool, error) {
 	}
 	return receipt.BlockNumber.Uint64() <= finalizedHeight, nil
 }
+
+// transferTopic is the ERC-20 Transfer(address,address,uint256) event.
+var transferTopic = common.HexToHash("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
+
+// TokenTransfer is one ERC-20 Transfer a transaction made.
+type TokenTransfer struct {
+	Token  string // the token contract
+	To     string
+	Amount *big.Int // raw on-chain units
+}
+
+// TokenTransfers reads the ERC-20 transfers txHash made and whether it is
+// final -- how relayd checks a vendor's payout to a customer. A
+// transaction not mined yet has no transfers and is not final; a
+// reverted one is final and moved nothing.
+func (c *Client) TokenTransfers(ctx context.Context, txHash string) ([]TokenTransfer, bool, error) {
+	receipt, err := c.eth.TransactionReceipt(ctx, common.HexToHash(txHash))
+	if err != nil {
+		if err == ethereum.NotFound {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("evmbroadcast: fetching receipt for %s: %w", txHash, err)
+	}
+	finalizedHeight, err := c.latestFinalizedHeight(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	final := receipt.BlockNumber.Uint64() <= finalizedHeight
+	if receipt.Status != types.ReceiptStatusSuccessful {
+		return nil, final, nil
+	}
+	var out []TokenTransfer
+	for _, lg := range receipt.Logs {
+		if len(lg.Topics) != 3 || lg.Topics[0] != transferTopic {
+			continue
+		}
+		out = append(out, TokenTransfer{Token: lg.Address.Hex(), To: common.BytesToAddress(lg.Topics[2].Bytes()).Hex(),
+			Amount: new(big.Int).SetBytes(lg.Data)})
+	}
+	return out, final, nil
+}

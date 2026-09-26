@@ -94,6 +94,31 @@ func (o *Orchestrator) advanceForwardedOne(ctx context.Context, leg relay.Leg) e
 		return fmt.Errorf("order is in state %q, not dispatching -- cannot settle", order.State)
 	}
 
+	// The vendor says it paid; the chain has to agree before the customer
+	// is told their order is complete.
+	if upstreamOrder.PayoutTxID != nil {
+		verdict, paid, why, err := o.checkPayout(ctx, leg, *upstreamOrder.PayoutTxID)
+		if err != nil {
+			return fmt.Errorf("checking the vendor's payout %s on-chain: %w", *upstreamOrder.PayoutTxID, err)
+		}
+		switch verdict {
+		case payoutPending:
+			return nil // not final yet -- check again next tick
+		case payoutWrong:
+			o.alertOnce(ctx, leg.ExternalID, "relay_leg_payout_unverified", alert.SeverityCritical,
+				fmt.Sprintf("relay leg %s: vendor %s reports order %s complete, but %s -- NOT marking it complete; check with the vendor",
+					leg.ExternalID, valueOrEmpty(leg.UpstreamProviderName), valueOrEmpty(leg.UpstreamOrderID), why))
+			return nil
+		case payoutPaid:
+			if paid.Units*100 < upstreamOrder.AmountOutActual.Units*99 {
+				o.alertOnce(ctx, leg.ExternalID, "relay_leg_payout_short", alert.SeverityWarning,
+					fmt.Sprintf("relay leg %s: the vendor's payout paid %s on-chain, below the %s it reported",
+						leg.ExternalID, fmtAmount(paid), fmtAmount(*upstreamOrder.AmountOutActual)))
+			}
+			upstreamOrder.AmountOutActual = &paid
+		}
+	}
+
 	received := receivedFor(leg, order)
 	profit := profitFor(leg, order)
 	inAsset := string(received.Asset)

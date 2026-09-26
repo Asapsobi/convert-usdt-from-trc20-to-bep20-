@@ -79,7 +79,8 @@ const (
 // signer is which key signs for a transfer's sender.
 type signer struct {
 	depositIndex *uint32 // a deposit wallet's own key
-	slot         bool    // the treasury key (S1 slot Config.SlotID)
+	slot         bool    // a treasury key: S1 slot slotID (0 means Config.SlotID)
+	slotID       int
 }
 
 // transferRequest is one transfer relayd must get onto the chain exactly
@@ -280,7 +281,11 @@ func (o *Orchestrator) requestSignature(ctx context.Context, req transferRequest
 	key, usd := req.signingKey(digest), req.estimatedUSD()
 	switch {
 	case req.signer.slot:
-		return o.Signing.RequestSignature(ctx, o.Cfg.SlotID, digest, usd, key)
+		slot := req.signer.slotID
+		if slot == 0 {
+			slot = o.Cfg.SlotID
+		}
+		return o.Signing.RequestSignature(ctx, slot, digest, usd, key)
 	case req.chain == transfers.BSC:
 		return o.Signing.RequestDepositSweepSignature(ctx, *req.signer.depositIndex, digest, usd, key)
 	default:

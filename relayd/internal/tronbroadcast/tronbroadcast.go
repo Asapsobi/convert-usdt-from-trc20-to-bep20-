@@ -234,6 +234,11 @@ type transactionInfoResponse struct {
 	Receipt struct {
 		Result string `json:"result"` // "SUCCESS", or the specific failure reason
 	} `json:"receipt"`
+	Log []struct {
+		Address string   `json:"address"` // the contract, hex without the 41 prefix
+		Topics  []string `json:"topics"`
+		Data    string   `json:"data"`
+	} `json:"log"`
 }
 
 func (r *FinalityReader) fetchTransactionInfo(ctx context.Context, tronTxID string) (transactionInfoResponse, error) {
@@ -296,4 +301,67 @@ func (r *FinalityReader) CheckExecution(ctx context.Context, tronTxID string) (f
 		return true, true, "", nil
 	}
 	return true, false, info.Receipt.Result, nil
+}
+
+// TokenTransfer is one TRC-20 Transfer a transaction made.
+type TokenTransfer struct {
+	Token  string // the token contract, base58
+	To     string // base58
+	Amount *big.Int
+}
+
+// trc20TransferTopic is the Transfer(address,address,uint256) event.
+const trc20TransferTopic = "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+// tronAddressFromHex turns a 20-byte hex address (a log's contract, or the
+// last 20 bytes of a topic) into its base58 form.
+func tronAddressFromHex(h string) (string, error) {
+	raw, err := hex.DecodeString(strings.TrimPrefix(h, "0x"))
+	if err != nil {
+		return "", err
+	}
+	if len(raw) > 20 {
+		raw = raw[len(raw)-20:]
+	}
+	if len(raw) != 20 {
+		return "", fmt.Errorf("tronbroadcast: %q is not a 20-byte address", h)
+	}
+	return address.Address(append([]byte{0x41}, raw...)).String(), nil
+}
+
+// TokenTransfers reads the TRC-20 transfers tronTxID made, from the
+// solidified (final) chain -- how relayd checks a vendor's payout to a
+// customer. A transaction not yet solidified has no transfers and is not
+// final; a failed one is final and moved nothing.
+func (r *FinalityReader) TokenTransfers(ctx context.Context, tronTxID string) ([]TokenTransfer, bool, error) {
+	info, err := r.fetchTransactionInfo(ctx, tronTxID)
+	if err != nil {
+		return nil, false, err
+	}
+	if info.ID != tronTxID {
+		return nil, false, nil
+	}
+	if info.Receipt.Result != "SUCCESS" {
+		return nil, true, nil
+	}
+	var out []TokenTransfer
+	for _, lg := range info.Log {
+		if len(lg.Topics) != 3 || strings.TrimPrefix(lg.Topics[0], "0x") != trc20TransferTopic {
+			continue
+		}
+		token, err := tronAddressFromHex(lg.Address)
+		if err != nil {
+			continue
+		}
+		to, err := tronAddressFromHex(lg.Topics[2])
+		if err != nil {
+			continue
+		}
+		amount, ok := new(big.Int).SetString(strings.TrimPrefix(lg.Data, "0x"), 16)
+		if !ok {
+			continue
+		}
+		out = append(out, TokenTransfer{Token: token, To: to, Amount: amount})
+	}
+	return out, true, nil
 }

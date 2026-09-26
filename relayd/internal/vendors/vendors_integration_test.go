@@ -251,3 +251,42 @@ func TestEnergyRouter_RentsFromTheCheapestAndFailsOver(t *testing.T) {
 		t.Fatalf("expected %s out of the pool after its outage", cheap)
 	}
 }
+
+// Under best_margin the vendor paying us the larger revenue share takes
+// the order even at a slightly worse customer rate; under best_rate the
+// customer's rate decides. Terms are kept on the vendor's record.
+func TestConversionRouter_BestMarginPrefersOurRevenue(t *testing.T) {
+	store, _ := testStore(t)
+	ctx := context.Background()
+	generous, cheap := uniqueName("generous"), uniqueName("cheap")
+	a, b := upstream.NewMockProvider(generous, 1), upstream.NewMockProvider(cheap, 2)
+	a.ForceAmountOut(usdtOut(98_500000))
+	b.ForceAmountOut(usdtOut(99_000000))
+	router, err := vendors.NewConversionRouter(ctx, store, map[string]upstream.SwapProvider{generous: a, cheap: b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetTerms(ctx, vendors.Conversion, generous, 50, "pays 0.5% referral"); err != nil {
+		t.Fatal(err)
+	}
+	if v := vendorRow(t, store, vendors.Conversion, generous); v.RevenueBPS != 50 || v.Notes != "pays 0.5% referral" {
+		t.Fatalf("expected the terms kept on the vendor record, got %+v", v)
+	}
+	t.Cleanup(func() { _ = store.SetStrategy(context.Background(), vendors.Conversion, vendors.BestRate) })
+
+	if err := store.SetStrategy(ctx, vendors.Conversion, vendors.BestMargin); err != nil {
+		t.Fatal(err)
+	}
+	if q, err := router.Quote(ctx, pair, hundred); err != nil || q.ProviderName != generous {
+		t.Fatalf("best_margin: expected %s (it pays us), got %s (%v)", generous, q.ProviderName, err)
+	}
+	if err := store.SetStrategy(ctx, vendors.Conversion, vendors.BestRate); err != nil {
+		t.Fatal(err)
+	}
+	if q, err := router.Quote(ctx, pair, hundred); err != nil || q.ProviderName != cheap {
+		t.Fatalf("best_rate: expected %s (better for the customer), got %s (%v)", cheap, q.ProviderName, err)
+	}
+	if err := store.SetTerms(ctx, vendors.Conversion, generous, 10_000, ""); err == nil {
+		t.Fatal("a revenue share of 100% or more must be refused")
+	}
+}
