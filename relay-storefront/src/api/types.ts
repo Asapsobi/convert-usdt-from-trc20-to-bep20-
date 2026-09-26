@@ -66,4 +66,5 @@ export interface RelayLeg {
   deposit_deadline: string;
   forward_tx_id?: string;
   refund_tx_id?: string;
+  payout_tx_id?: string;
 }

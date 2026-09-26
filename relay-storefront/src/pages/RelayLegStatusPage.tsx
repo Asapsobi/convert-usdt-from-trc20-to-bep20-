@@ -154,6 +154,12 @@ export function RelayLegStatusPage() {
               <span className="k">Destination</span>
               <span className="mono">{leg.destination_address}</span>
             </div>
+            {leg.payout_tx_id && (
+              <div className="summary-row">
+                <span className="k">Payout transaction (to your wallet)</span>
+                <span className="mono">{leg.payout_tx_id}</span>
+              </div>
+            )}
             {leg.refund_tx_id && (
               <div className="summary-row">
                 <span className="k">Refund transaction</span>

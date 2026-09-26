@@ -3,10 +3,16 @@ import { useNavigate } from "react-router-dom";
 import { api, ApiError } from "../api/client";
 import type { Direction, QuoteResponse } from "../api/types";
 
-const DIRECTION_OPTIONS: { value: Direction; sendLabel: string; sendBadge: string; receiveLabel: string; receiveBadge: string }[] = [
-  { value: "BEP20_TO_TRC20", sendLabel: "BSC · BEP20", sendBadge: "net-bsc", receiveLabel: "TRON · TRC20", receiveBadge: "net-tron" },
-  { value: "TRC20_TO_BEP20", sendLabel: "TRON · TRC20", sendBadge: "net-tron", receiveLabel: "BSC · BEP20", receiveBadge: "net-bsc" },
+// The assets a customer can send and receive: USDT on each supported
+// network. Converting always goes from one network to the other.
+type AssetKey = "USDT_BEP20" | "USDT_TRC20";
+const ASSETS: { key: AssetKey; label: string; badge: string }[] = [
+  { key: "USDT_BEP20", label: "USDT · BEP-20 (BSC)", badge: "net-bsc" },
+  { key: "USDT_TRC20", label: "USDT · TRC-20 (TRON)", badge: "net-tron" },
 ];
+const DIRECTION_FOR: Record<AssetKey, Direction> = { USDT_BEP20: "BEP20_TO_TRC20", USDT_TRC20: "TRC20_TO_BEP20" };
+const other = (a: AssetKey): AssetKey => (a === "USDT_BEP20" ? "USDT_TRC20" : "USDT_BEP20");
+const assetInfo = (a: AssetKey) => ASSETS.find((x) => x.key === a)!;
 
 function formatAmountInput(raw: string): string {
   const n = Number(raw);
@@ -22,7 +28,9 @@ function errorMessage(err: unknown, fallback: string): string {
 export function CreateRelayLegPage() {
   const navigate = useNavigate();
 
-  const [direction, setDirection] = useState<Direction>("BEP20_TO_TRC20");
+  const [sendAsset, setSendAsset] = useState<AssetKey>("USDT_BEP20");
+  const receiveAsset = other(sendAsset);
+  const direction = DIRECTION_FOR[sendAsset];
   const [customerLabel, setCustomerLabel] = useState("");
   const [destinationAddress, setDestinationAddress] = useState("");
   const [amountIn, setAmountIn] = useState("");
@@ -30,7 +38,12 @@ export function CreateRelayLegPage() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const opt = DIRECTION_OPTIONS.find((o) => o.value === direction)!;
+  const opt = {
+    sendLabel: assetInfo(sendAsset).label,
+    sendBadge: assetInfo(sendAsset).badge,
+    receiveLabel: assetInfo(receiveAsset).label,
+    receiveBadge: assetInfo(receiveAsset).badge,
+  };
 
   // Any change to what is being converted invalidates the quote shown.
   function changed<T>(set: (v: T) => void) {
@@ -105,11 +118,24 @@ export function CreateRelayLegPage() {
         {error && <div className="error-banner">{error}</div>}
 
         <form onSubmit={onGetQuote}>
-          <label htmlFor="direction">Direction</label>
-          <select id="direction" value={direction} onChange={(e) => changed(setDirection)(e.target.value as Direction)}>
-            {DIRECTION_OPTIONS.map((o) => (
-              <option key={o.value} value={o.value}>
-                {o.sendLabel} → {o.receiveLabel}
+          <label htmlFor="sendAsset">You send</label>
+          <select id="sendAsset" value={sendAsset} onChange={(e) => changed(setSendAsset)(e.target.value as AssetKey)}>
+            {ASSETS.map((a) => (
+              <option key={a.key} value={a.key}>
+                {a.label}
+              </option>
+            ))}
+          </select>
+
+          <label htmlFor="receiveAsset">You receive</label>
+          <select
+            id="receiveAsset"
+            value={receiveAsset}
+            onChange={(e) => changed(setSendAsset)(other(e.target.value as AssetKey))}
+          >
+            {ASSETS.map((a) => (
+              <option key={a.key} value={a.key}>
+                {a.label}
               </option>
             ))}
           </select>

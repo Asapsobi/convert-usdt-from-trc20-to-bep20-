@@ -7,7 +7,7 @@ export default function App() {
     <BrowserRouter>
       <div className="header">
         <Link to="/" className="brand">
-          Model F Relay
+          USDT Network Converter
         </Link>
       </div>
       <Routes>
