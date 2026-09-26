@@ -638,3 +638,36 @@ func TestTransfer_ExpiredTRONForwardIsDroppedThenRebuilt(t *testing.T) {
 }
 
 var _ alert.Alerter = (*fakeAlerter)(nil)
+
+// A vendor order that expires while the forward is still held up (here,
+// waiting on gas) is replaced by a fresh one -- nothing was ever sent to
+// it -- and the forward goes to the replacement.
+func TestForward_ExpiredVendorOrderIsReplacedBeforeAnythingIsSent(t *testing.T) {
+	f := newBEP20Fixture(t, 86)
+	f.chain.setNative(f.deposit, big.NewInt(0))
+	f.chain.setNative(signing.FakeSlotEVMAddress(1), big.NewInt(0)) // the treasury can't pay the gas yet
+	o := f.newOrchestrator(0)
+	f.tick(o)
+	leg := f.leg()
+	if leg.Status != relay.StatusForwarding || len(f.attempts()) != 0 {
+		t.Fatalf("expected FORWARDING with nothing sent yet, got %s / %+v", leg.Status, f.attempts())
+	}
+	first := *leg.UpstreamOrderID
+	if err := f.vendor.SetOrderStatus(first, "expired", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	f.chain.setNative(f.deposit, big.NewInt(1_000_000_000_000_000)) // gas arrives
+	f.tick(o)
+	leg = f.leg()
+	if *leg.UpstreamOrderID == first {
+		t.Fatalf("expected the expired vendor order %s replaced", first)
+	}
+	attempts := f.attempts()
+	if len(attempts) != 1 || !attempts[0].Status.MayLand() || attempts[0].ToAddress != *leg.UpstreamDepositAddress {
+		t.Fatalf("expected the forward sent to the replacement order, got %+v", attempts)
+	}
+	if n := f.alertsWithReason("relay_leg_vendor_order_renewed"); n != 1 {
+		t.Fatalf("expected one renewal alert, got %d", n)
+	}
+}

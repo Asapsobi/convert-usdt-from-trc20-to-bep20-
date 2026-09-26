@@ -6,9 +6,11 @@ import (
 	"log/slog"
 	"time"
 
+	"relayd/internal/alert"
 	"relayd/internal/money"
 	"relayd/internal/relay"
 	"relayd/internal/transfers"
+	"relayd/internal/upstream"
 )
 
 // defaultEnergyDeadlineWindow bounds how long a single energy
@@ -48,6 +50,11 @@ func (o *Orchestrator) advanceForwardingOne(ctx context.Context, leg relay.Leg) 
 	amount, err := o.forwardAmountFor(ctx, leg)
 	if err != nil {
 		return err
+	}
+	if renewed, err := o.renewExpiredVendorOrder(ctx, leg, amount); err != nil {
+		return err
+	} else if renewed != nil {
+		leg = *renewed
 	}
 
 	done, err := o.driveTransfer(ctx, legTransfer(leg, transfers.Forward, *leg.UpstreamDepositAddress, amount))
@@ -89,4 +96,61 @@ func (o *Orchestrator) forwardAmountFor(ctx context.Context, leg relay.Leg) (mon
 // money.Amount end to end).
 func estimatedUSDFor(amount money.Amount) float64 {
 	return float64(amount.Units) / 1_000_000
+}
+
+// maxVendorOrderRenewals caps how often one leg's expired vendor order is
+// replaced; past it, the leg waits for its forwarding timeout's refund.
+const maxVendorOrderRenewals = 3
+
+// renewExpiredVendorOrder replaces leg's vendor order when it expired or
+// failed before any forward to it was signed: nothing was sent to it, so a
+// fresh order -- same amount, the customer's own destination -- takes its
+// place, rather than refunding a customer only because the vendor's quote
+// window passed while their deposit was being processed. Returns the
+// updated leg, or nil when the order stands.
+func (o *Orchestrator) renewExpiredVendorOrder(ctx context.Context, leg relay.Leg, amount money.Amount) (*relay.Leg, error) {
+	if leg.UpstreamOrderID == nil {
+		return nil, nil
+	}
+	if a, ok, err := o.Transfers.Open(ctx, leg.ExternalID, transfers.Forward); err != nil {
+		return nil, err
+	} else if ok && a.Status.MayLand() {
+		return nil, nil // a forward may already be on its way to this order
+	}
+	if _, ok, err := o.Transfers.Confirmed(ctx, leg.ExternalID, transfers.Forward); err != nil || ok {
+		return nil, err
+	}
+	current, err := o.vendorOrder(ctx, leg)
+	if err != nil {
+		return nil, nil // can't tell right now; the send path re-checks before anything is broadcast
+	}
+	if current.Status != upstream.StatusExpired && current.Status != upstream.StatusFailed {
+		return nil, nil
+	}
+	o.mu.Lock()
+	if o.vendorRenewals == nil {
+		o.vendorRenewals = make(map[string]int)
+	}
+	n := o.vendorRenewals[leg.ExternalID]
+	o.mu.Unlock()
+	if n >= maxVendorOrderRenewals {
+		return nil, nil
+	}
+	order, err := o.Upstream.CreateOrder(ctx, upstreamPairFor(leg.Direction), amount, leg.DestinationAddress)
+	if err != nil {
+		return nil, fmt.Errorf("replacing %s vendor order %s: %w", current.Status, *leg.UpstreamOrderID, err)
+	}
+	if err := o.Store.ReplaceVendorOrder(ctx, leg.ExternalID, *leg.UpstreamOrderID, order.ProviderName, order.ProviderOrderID, order.DepositAddress); err != nil {
+		return nil, err
+	}
+	o.mu.Lock()
+	o.vendorRenewals[leg.ExternalID] = n + 1
+	o.mu.Unlock()
+	o.fire(ctx, alert.Alert{Severity: alert.SeverityWarning, ExternalID: leg.ExternalID, Reason: "relay_leg_vendor_order_renewed",
+		Detail: fmt.Sprintf("relay leg %s: vendor order %s was %s before anything was sent to it; replaced by %s order %s",
+			leg.ExternalID, *leg.UpstreamOrderID, current.Status, order.ProviderName, order.ProviderOrderID)})
+	slog.Info("orchestrate: expired vendor order replaced", "external_id", leg.ExternalID,
+		"old", *leg.UpstreamOrderID, "new", order.ProviderOrderID, "vendor", order.ProviderName)
+	leg.UpstreamProviderName, leg.UpstreamOrderID, leg.UpstreamDepositAddress = &order.ProviderName, &order.ProviderOrderID, &order.DepositAddress
+	return &leg, nil
 }

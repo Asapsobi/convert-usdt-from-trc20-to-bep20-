@@ -292,6 +292,24 @@ func (s *Store) MarkForwarding(ctx context.Context, externalID, upstreamProvider
 	return nil
 }
 
+// ReplaceVendorOrder swaps a FORWARDING leg's vendor order for a new one --
+// guarded on the order being replaced, so two callers can never overwrite
+// each other's replacement.
+func (s *Store) ReplaceVendorOrder(ctx context.Context, externalID, oldOrderID, provider, orderID, depositAddress string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE relay_legs
+		SET upstream_provider_name = $3, upstream_order_id = $4, upstream_deposit_address = $5, updated_at = now()
+		WHERE external_id = $1 AND status = 'FORWARDING' AND upstream_order_id = $2
+	`, externalID, oldOrderID, provider, orderID, depositAddress)
+	if err != nil {
+		return fmt.Errorf("relay: replacing %s's vendor order: %w", externalID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: leg %s is not FORWARDING with vendor order %s", ErrNotInExpectedStatus, externalID, oldOrderID)
+	}
+	return nil
+}
+
 // MarkForwarded transitions externalID from FORWARDING to FORWARDED,
 // recording the broadcast forward-leg transaction id.
 func (s *Store) MarkForwarded(ctx context.Context, externalID, forwardTxID string) error {
