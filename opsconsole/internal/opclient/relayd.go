@@ -19,7 +19,9 @@ type RelaydClient struct {
 // NewRelaydClient returns a RelaydClient for baseURL, authenticating
 // every call with token.
 func NewRelaydClient(baseURL, token string) *RelaydClient {
-	return &RelaydClient{baseURL: strings.TrimRight(baseURL, "/"), token: token, http: &http.Client{Timeout: 5 * time.Second}}
+	// Admin pages that read live balances and vendor prices off the chains
+	// and vendors take longer than a plain lookup.
+	return &RelaydClient{baseURL: strings.TrimRight(baseURL, "/"), token: token, http: &http.Client{Timeout: 30 * time.Second}}
 }
 
 // Healthz reports whether relayd's own /healthz responds 200.

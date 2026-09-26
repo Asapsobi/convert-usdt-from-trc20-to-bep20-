@@ -12,6 +12,12 @@
       "runtimeExecutable": "sh",
       "runtimeArgs": ["-c", "cd relay-storefront && npm run dev -- --host --port 5181 --strictPort"],
       "port": 5181
+    },
+    {
+      "name": "opsconsole",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": ["-c", "cd opsconsole && set -a && . ./.env.opsconsoled-live && set +a && exec go run ./cmd/opsconsoled"],
+      "port": 18190
     }
   ]
 }

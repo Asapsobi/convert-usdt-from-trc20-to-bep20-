@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -490,9 +491,27 @@ func (s *Server) getProfitWallets(w http.ResponseWriter, r *http.Request) {
 			Legs: wl.Legs, Asset: string(asset), Earned: fmtUnits(asset, wl.Earned.Units), Swept: fmtUnits(asset, wl.Swept.Units),
 			Unswept: fmtUnits(asset, unswept.Units), Busy: wl.Busy, SweepPending: wl.Pending, LastFailedAt: wl.LastFailedAt,
 		})
-		if withBalances {
-			out[len(out)-1].OnChain = s.balanceOf(balanceCtx, string(wl.Chain), wl.Address)
+	}
+	if withBalances {
+		// Read the wallets' balances in parallel, a few at a time per chain:
+		// one by one is slower than a page should be, and TronGrid turns
+		// away bursts.
+		var wg sync.WaitGroup
+		slots := map[string]chan struct{}{"BSC": make(chan struct{}, 8), "TRON": make(chan struct{}, 2)}
+		for i := range out {
+			sem, ok := slots[out[i].Chain]
+			if !ok {
+				continue
+			}
+			wg.Add(1)
+			go func(i int, sem chan struct{}) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				out[i].OnChain = s.balanceOf(balanceCtx, out[i].Chain, out[i].Address)
+			}(i, sem)
 		}
+		wg.Wait()
 	}
 	unsweptTotals := map[string]string{}
 	for asset, units := range totals {
