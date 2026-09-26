@@ -135,6 +135,12 @@ func (r transferRequest) signingKey(digest [32]byte) string {
 	case transfers.Refund:
 		return fmt.Sprintf("relayd:refund-sign:%s:%x", r.job, digest)
 	}
+	if r.signer.slot {
+		// An EVM digest doesn't cover the sender: the same top-up from two
+		// treasuries hashes identically, so the treasury's slot is part of
+		// the key -- or S1 would answer one slot's request with another's.
+		return fmt.Sprintf("relayd:%s-sign:slot%d:%s:%x", r.kind(), r.signer.slotID, r.job, digest)
+	}
 	return fmt.Sprintf("relayd:%s-sign:%s:%x", r.kind(), r.job, digest)
 }
 
