@@ -176,6 +176,9 @@ func buildDriverAndOrchestrator(ctx context.Context, pool *db.Pool) (*driver.Dri
 		return nil, nil, err
 	}
 	finalityReader := tronbroadcast.NewFinalityReader(tronAPIBaseURL)
+	if key := os.Getenv("RELAYD_TRONGRID_API_KEY"); key != "" {
+		finalityReader.SetAPIKey(key)
+	}
 
 	bscRPCURL, err := requiredEnv("RELAYD_BSC_RPC_URL")
 	if err != nil {

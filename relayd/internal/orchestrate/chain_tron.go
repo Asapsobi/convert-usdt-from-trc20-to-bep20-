@@ -23,9 +23,10 @@ import (
 const tronTransferBandwidth = 400
 
 // tronTreasuryReserveSun is what the TRON treasury keeps on top of a TRX
-// top-up's amount: sending TRX to a never-activated address also burns a
-// ~1 TRX account-creation fee, plus the transfer's own bandwidth.
-const tronTreasuryReserveSun = 1_500_000
+// top-up's amount: sending TRX to a never-activated address burns TRON's
+// 1 TRX account-creation fee, plus 0.1 TRX when the sender lacks staked
+// bandwidth for an account-creating transfer.
+const tronTreasuryReserveSun = 1_100_000
 
 // tronAdapter sends transfers on TRON.
 type tronAdapter struct{ o *Orchestrator }
@@ -173,6 +174,11 @@ func (t tronAdapter) outcome(ctx context.Context, a transfers.Attempt, now time.
 		return sentOutcome{state: outcomeConfirmed}, nil
 	case final && reason != "":
 		return sentOutcome{state: outcomeFailed, reason: reason}, nil
+	case final && a.Amount.Asset == assetTRX:
+		// A TRX transfer is not a contract call: its receipt never carries
+		// a verdict, and one that can't apply is rejected before it is ever
+		// included -- solidified means the TRX moved.
+		return sentOutcome{state: outcomeConfirmed}, nil
 	case final:
 		// Solidified, but the receipt carries no verdict. Never guess
 		// "failed" -- a wrong guess rebuilds a transfer that landed.

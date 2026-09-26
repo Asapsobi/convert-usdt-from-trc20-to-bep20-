@@ -205,8 +205,14 @@ func (c *GrpcBroadcastClient) BroadcastSigned(ctx context.Context, unsignedTx []
 // against api.trongrid.io.
 type FinalityReader struct {
 	baseURL string
+	apiKey  string
 	http    *http.Client
 }
+
+// SetAPIKey sends a TronGrid API key (TRON-PRO-API-KEY) with every call:
+// TronGrid rate-limits keyless calls, which would leave a sent TRON
+// transfer unconfirmed.
+func (r *FinalityReader) SetAPIKey(key string) { r.apiKey = key }
 
 // NewFinalityReader returns a FinalityReader for baseURL (e.g.
 // "https://api.trongrid.io").
@@ -246,6 +252,9 @@ func (r *FinalityReader) fetchTransactionInfo(ctx context.Context, tronTxID stri
 		r.baseURL+"/walletsolidity/gettransactioninfobyid?value="+tronTxID, nil)
 	if err != nil {
 		return transactionInfoResponse{}, fmt.Errorf("tronbroadcast: building finality request: %w", err)
+	}
+	if r.apiKey != "" {
+		req.Header.Set("TRON-PRO-API-KEY", r.apiKey)
 	}
 	resp, err := r.http.Do(req)
 	if err != nil {

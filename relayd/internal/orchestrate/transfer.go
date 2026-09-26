@@ -437,7 +437,7 @@ func (o *Orchestrator) trackSent(ctx context.Context, ad chainAdapter, req trans
 // landed is the outcome check's call.
 func alreadyOnChain(err error) bool {
 	msg := strings.ToLower(err.Error())
-	for _, s := range []string{"already known", "known transaction", "nonce too low", "dup_transaction_error"} {
+	for _, s := range []string{"already known", "known transaction", "nonce too low", "dup_transaction_error", "dup transaction"} {
 		if strings.Contains(msg, s) {
 			return true
 		}
