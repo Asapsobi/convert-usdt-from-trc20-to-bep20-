@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"os"
 	"strconv"
 	"strings"
@@ -237,6 +238,21 @@ func buildDriverAndOrchestrator(ctx context.Context, pool *db.Pool) (*driver.Dri
 		staleLegAlertAfter = parsed
 	}
 
+	// The least a treasury top-up sends: unset keeps the defaults (0.0005
+	// BNB, 2 TRX), which top a pooled wallet up rarely; lower values keep
+	// less in each wallet.
+	gasTopUpWei, err := optionalUnits("RELAYD_GAS_TOPUP_MIN_BNB", 18)
+	if err != nil {
+		return nil, nil, err
+	}
+	trxTopUpSun, err := optionalUnits("RELAYD_TRX_TOPUP_MIN_TRX", 6)
+	if err != nil {
+		return nil, nil, err
+	}
+	if gasTopUpWei > 0 || trxTopUpSun > 0 {
+		slog.Info("relayd: treasury top-up minimums", "bnb", os.Getenv("RELAYD_GAS_TOPUP_MIN_BNB"), "trx", os.Getenv("RELAYD_TRX_TOPUP_MIN_TRX"))
+	}
+
 	sweepToBSC, sweepToTRON := os.Getenv("RELAYD_SWEEP_TO_BSC"), os.Getenv("RELAYD_SWEEP_TO_TRON")
 	if sweepToBSC != "" {
 		if err := addrcheck.EVM(sweepToBSC); err != nil {
@@ -268,6 +284,7 @@ func buildDriverAndOrchestrator(ctx context.Context, pool *db.Pool) (*driver.Dri
 			EnergyPerTransferUnits: energyPerTransferUnits, ForwardingTimeout: forwardingTimeout,
 			StaleLegAlertAfter: staleLegAlertAfter, DepositGrace: depositGrace,
 			SweepToBSC: sweepToBSC, SweepToTRON: sweepToTRON, Treasuries: treasuries,
+			GasTopUpWei: gasTopUpWei, TRXTopUpSun: trxTopUpSun,
 		})
 
 	orch.Pricing = pricingStore
@@ -346,4 +363,22 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// optionalUnits reads an optional positive decimal amount ("0.00001") from
+// name in units of 10^-decimals (wei for BNB, sun for TRX); 0 when unset.
+func optionalUnits(name string, decimals int) (int64, error) {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return 0, nil
+	}
+	r, ok := new(big.Rat).SetString(raw)
+	if !ok || r.Sign() <= 0 {
+		return 0, fmt.Errorf("relayd: %s must be a positive decimal amount, got %q", name, raw)
+	}
+	r.Mul(r, new(big.Rat).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil)))
+	if !r.IsInt() || !r.Num().IsInt64() {
+		return 0, fmt.Errorf("relayd: %s has more than %d decimal places or is too large: %q", name, decimals, raw)
+	}
+	return r.Num().Int64(), nil
 }
