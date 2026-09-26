@@ -181,6 +181,9 @@ func (m *MockProvider) SetOrderStatus(providerOrderID string, status SwapStatus,
 	}
 	order.Status = status
 	order.AmountOutActual = amountOutActual
+	if status == StatusComplete {
+		order.PayoutTxID = nonEmpty("mock-payout-" + providerOrderID)
+	}
 	m.orders[providerOrderID] = order
 	return nil
 }

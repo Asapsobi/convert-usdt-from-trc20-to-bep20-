@@ -3,6 +3,7 @@ package pricing
 import (
 	"encoding/json"
 	"errors"
+	"reflect"
 	"testing"
 
 	"relayd/internal/money"
@@ -67,7 +68,40 @@ func TestJSONRoundTripUsesDecimalStrings(t *testing.T) {
 		t.Fatalf("unexpected JSON %s", raw)
 	}
 	var back Config
-	if err := json.Unmarshal(raw, &back); err != nil || back != c {
+	if err := json.Unmarshal(raw, &back); err != nil || !reflect.DeepEqual(back, c) {
 		t.Fatalf("round trip: got %+v, %v", back, err)
+	}
+}
+
+// A direction can carry its own profit rule; orders in the other
+// direction keep the default one.
+func TestPerDirectionMargins(t *testing.T) {
+	c := Config{ProfitBPS: 25, MinAmountIn: 5_000000, MaxAmountIn: 10_000_000000,
+		Directions: map[string]Margin{"TRC20_TO_BEP20": {ProfitBPS: 40, MinProfit: 1_500000}}}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	tron := c.For("TRC20_TO_BEP20")
+	if tron.ProfitBPS != 40 || tron.MinProfit != 1_500000 || tron.Profit(100_000000) != 1_500000 || tron.Profit(1000_000000) != 4_000000 {
+		t.Fatalf("TRON-sourced orders must use their own margin, got %+v (profit on 100: %d)", tron, tron.Profit(100_000000))
+	}
+	if bsc := c.For("BEP20_TO_TRC20"); bsc.ProfitBPS != 25 || bsc.MinProfit != 0 {
+		t.Fatalf("the other direction keeps the default margin, got %+v", bsc)
+	}
+	raw, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Config
+	if err := json.Unmarshal(raw, &back); err != nil || !reflect.DeepEqual(back, c) {
+		t.Fatalf("round trip: got %+v (%s), %v", back, raw, err)
+	}
+	for name, bad := range map[string]Config{
+		"unknown direction": {ProfitBPS: 25, MinAmountIn: 5_000000, MaxAmountIn: 10_000000, Directions: map[string]Margin{"ETH": {}}},
+		"min_profit >= min": {ProfitBPS: 25, MinAmountIn: 5_000000, MaxAmountIn: 10_000000, Directions: map[string]Margin{"TRC20_TO_BEP20": {MinProfit: 5_000000}}},
+	} {
+		if err := bad.Validate(); !errors.Is(err, ErrInvalid) {
+			t.Errorf("%s: expected ErrInvalid, got %v", name, err)
+		}
 	}
 }

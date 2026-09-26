@@ -30,6 +30,28 @@ type Config struct {
 	// deposit below MinAmountIn is refunded rather than forwarded.
 	MinAmountIn int64
 	MaxAmountIn int64
+	// Directions overrides the profit rule for one direction
+	// ("TRC20_TO_BEP20" or "BEP20_TO_TRC20"). Sending from a TRON deposit
+	// wallet rents energy (around 1 USD); a BSC one costs cents of gas --
+	// one margin rarely suits both.
+	Directions map[string]Margin
+}
+
+// Margin is one direction's profit rule.
+type Margin struct {
+	ProfitBPS int64
+	MinProfit int64
+}
+
+// directions are the keys Directions accepts.
+var directions = map[string]bool{"TRC20_TO_BEP20": true, "BEP20_TO_TRC20": true}
+
+// For is c with direction's own profit rule, when it has one.
+func (c Config) For(direction string) Config {
+	if m, ok := c.Directions[direction]; ok {
+		c.ProfitBPS, c.MinProfit = m.ProfitBPS, m.MinProfit
+	}
+	return c
 }
 
 // ErrInvalid means a Config fails validation.
@@ -49,6 +71,18 @@ func (c Config) Validate() error {
 		return fmt.Errorf("%w: max_amount_in must be at least min_amount_in", ErrInvalid)
 	case c.MinProfit >= c.MinAmountIn:
 		return fmt.Errorf("%w: min_profit must be below min_amount_in, or the smallest order forwards nothing", ErrInvalid)
+	}
+	for direction, m := range c.Directions {
+		switch {
+		case !directions[direction]:
+			return fmt.Errorf("%w: unknown direction %q (use TRC20_TO_BEP20 or BEP20_TO_TRC20)", ErrInvalid, direction)
+		case m.ProfitBPS < 0 || m.ProfitBPS >= 10_000:
+			return fmt.Errorf("%w: %s profit_bps must be 0..9999, got %d", ErrInvalid, direction, m.ProfitBPS)
+		case m.MinProfit < 0:
+			return fmt.Errorf("%w: %s min_profit must not be negative", ErrInvalid, direction)
+		case m.MinProfit >= c.MinAmountIn:
+			return fmt.Errorf("%w: %s min_profit must be below min_amount_in, or the smallest order forwards nothing", ErrInvalid, direction)
+		}
 	}
 	return nil
 }
@@ -77,10 +111,16 @@ func (c Config) Split(received money.Amount) (profit, forward money.Amount, ok b
 // wire is the settings row's JSON shape. Amounts are decimal USDT
 // strings so an admin reads "0.50", not 500000.
 type wire struct {
-	ProfitBPS   int64  `json:"profit_bps"`
-	MinProfit   string `json:"min_profit"`
-	MinAmountIn string `json:"min_amount_in"`
-	MaxAmountIn string `json:"max_amount_in"`
+	ProfitBPS   int64                 `json:"profit_bps"`
+	MinProfit   string                `json:"min_profit"`
+	MinAmountIn string                `json:"min_amount_in"`
+	MaxAmountIn string                `json:"max_amount_in"`
+	Directions  map[string]wireMargin `json:"directions,omitempty"`
+}
+
+type wireMargin struct {
+	ProfitBPS int64  `json:"profit_bps"`
+	MinProfit string `json:"min_profit"`
 }
 
 func parseUSDT(field, s string) (int64, error) {
@@ -101,10 +141,17 @@ func formatUSDT(units int64) string {
 
 // MarshalJSON renders c in the settings row's shape.
 func (c Config) MarshalJSON() ([]byte, error) {
-	return json.Marshal(wire{
+	w := wire{
 		ProfitBPS: c.ProfitBPS, MinProfit: formatUSDT(c.MinProfit),
 		MinAmountIn: formatUSDT(c.MinAmountIn), MaxAmountIn: formatUSDT(c.MaxAmountIn),
-	})
+	}
+	for direction, m := range c.Directions {
+		if w.Directions == nil {
+			w.Directions = map[string]wireMargin{}
+		}
+		w.Directions[direction] = wireMargin{ProfitBPS: m.ProfitBPS, MinProfit: formatUSDT(m.MinProfit)}
+	}
+	return json.Marshal(w)
 }
 
 // UnmarshalJSON parses the settings row's shape.
@@ -123,6 +170,16 @@ func (c *Config) UnmarshalJSON(b []byte) error {
 	}
 	if out.MaxAmountIn, err = parseUSDT("max_amount_in", w.MaxAmountIn); err != nil {
 		return err
+	}
+	for direction, m := range w.Directions {
+		minProfit, err := parseUSDT(direction+" min_profit", m.MinProfit)
+		if err != nil {
+			return err
+		}
+		if out.Directions == nil {
+			out.Directions = map[string]Margin{}
+		}
+		out.Directions[direction] = Margin{ProfitBPS: m.ProfitBPS, MinProfit: minProfit}
 	}
 	*c = out
 	return nil

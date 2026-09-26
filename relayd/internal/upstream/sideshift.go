@@ -308,6 +308,7 @@ type sideShiftShiftResponse struct {
 	DepositAmount  string `json:"depositAmount"`
 	SettleAmount   string `json:"settleAmount"`
 	Status         string `json:"status"`
+	SettleHash     string `json:"settleHash"`
 }
 
 func (p *SideshiftProvider) toSwapOrder(data sideShiftShiftResponse) (SwapOrder, error) {
@@ -343,6 +344,7 @@ func (p *SideshiftProvider) toSwapOrder(data sideShiftShiftResponse) (SwapOrder,
 		AmountIn:           amountIn,
 		AmountOutExpected:  amountOutExpected,
 		AmountOutActual:    amountOutActual,
+		PayoutTxID:         nonEmpty(data.SettleHash),
 		CreatedAt:          time.Now().UTC(),
 	}, nil
 }

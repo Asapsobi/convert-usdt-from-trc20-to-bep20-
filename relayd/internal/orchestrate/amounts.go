@@ -77,7 +77,8 @@ func (o *Orchestrator) pricingFor(ctx context.Context, leg relay.Leg, order ledg
 		return pricing.Config{ProfitBPS: *leg.ProfitBPS, MinProfit: minProfit}, nil
 	}
 	if o.Pricing != nil {
-		return o.Pricing.Get(ctx)
+		cfg, err := o.Pricing.Get(ctx)
+		return cfg.For(string(leg.Direction)), err
 	}
 	return pricing.Config{MinProfit: order.FeeUnits.Units}, nil
 }

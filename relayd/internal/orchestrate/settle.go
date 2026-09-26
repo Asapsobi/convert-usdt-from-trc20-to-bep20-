@@ -83,6 +83,11 @@ func (o *Orchestrator) advanceForwardedOne(ctx context.Context, leg relay.Leg) e
 	}
 	if order.State == "settled" {
 		// Already posted by a prior tick -- just finish the local mark.
+		if upstreamOrder.PayoutTxID != nil {
+			if err := o.Store.RecordPayoutTx(ctx, leg.ExternalID, *upstreamOrder.PayoutTxID); err != nil {
+				return err
+			}
+		}
 		return o.Store.MarkSettled(ctx, leg.ExternalID, *upstreamOrder.AmountOutActual)
 	}
 	if order.State != "dispatching" {
@@ -150,6 +155,11 @@ func (o *Orchestrator) advanceForwardedOne(ctx context.Context, leg relay.Leg) e
 
 	if err := o.Store.MarkSettled(ctx, leg.ExternalID, *upstreamOrder.AmountOutActual); err != nil {
 		return fmt.Errorf("marking settled: %w", err)
+	}
+	if upstreamOrder.PayoutTxID != nil {
+		if err := o.Store.RecordPayoutTx(ctx, leg.ExternalID, *upstreamOrder.PayoutTxID); err != nil {
+			slog.Error("orchestrate: recording the vendor's payout transaction failed", "external_id", leg.ExternalID, "error", err)
+		}
 	}
 	if leg.ForwardAmount != nil {
 		if err := o.Store.RecordVendorFee(ctx, leg.ExternalID, leg.ForwardAmount.Units-upstreamOrder.AmountOutActual.Units); err != nil {

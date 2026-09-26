@@ -51,6 +51,32 @@ type Admin struct {
 	Watchers map[string]WatcherForwarder
 	// Treasury describes where top-ups come from and sweeps go, for display.
 	Treasury map[string]string
+	// Balance reads what an address holds on chain ("BSC" or "TRON").
+	// Optional.
+	Balance func(ctx context.Context, chain, address string) (WalletBalance, error)
+}
+
+// WalletBalance is what one address holds on chain, formatted.
+type WalletBalance struct {
+	USDT      string `json:"usdt"`
+	Native    string `json:"native"`
+	NativeFor string `json:"native_asset"` // BNB or TRX
+	Energy    *int64 `json:"energy,omitempty"`
+	Bandwidth *int64 `json:"bandwidth,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// balanceOf reads one address's on-chain balance, never failing the
+// whole response: an unreachable node shows as the entry's error.
+func (s *Server) balanceOf(ctx context.Context, chain, address string) *WalletBalance {
+	if s.Admin.Balance == nil || address == "" {
+		return nil
+	}
+	b, err := s.Admin.Balance(ctx, chain, address)
+	if err != nil {
+		return &WalletBalance{Error: err.Error()}
+	}
+	return &b
 }
 
 type operatorKey struct{}
@@ -102,6 +128,7 @@ func (s *Server) adminRoutes(r chi.Router) {
 	r.Put("/sweeps/settings", s.putSweepSettings)
 	r.Post("/sweeps/run", s.postSweepRun)
 	r.Get("/wallets", s.getProfitWallets)
+	r.Get("/treasury", s.getTreasury)
 	r.Get("/legs", s.getRelayLegs)
 	r.Get("/legs/{external_id}", s.getAdminLeg)
 	r.Get("/pool/{chain}/wallets", s.forwardToWatcher("/v1/wallets"))
@@ -400,6 +427,8 @@ type profitWalletResponse struct {
 	Busy          bool       `json:"busy"`
 	SweepPending  bool       `json:"sweep_pending"`
 	LastFailedAt  *time.Time `json:"last_failed_sweep_at,omitempty"`
+	// OnChain is what the wallet holds right now (?balances=1).
+	OnChain *WalletBalance `json:"on_chain,omitempty"`
 }
 
 // getProfitWallets is the profit held in each deposit wallet, per the
@@ -417,6 +446,9 @@ func (s *Server) getProfitWallets(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]profitWalletResponse, 0, len(wallets))
 	totals := map[string]int64{}
+	withBalances := r.URL.Query().Get("balances") == "1"
+	balanceCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
 	for _, wl := range wallets {
 		asset := wl.Earned.Asset
 		unswept := wl.Unswept()
@@ -426,6 +458,9 @@ func (s *Server) getProfitWallets(w http.ResponseWriter, r *http.Request) {
 			Legs: wl.Legs, Asset: string(asset), Earned: fmtUnits(asset, wl.Earned.Units), Swept: fmtUnits(asset, wl.Swept.Units),
 			Unswept: fmtUnits(asset, unswept.Units), Busy: wl.Busy, SweepPending: wl.Pending, LastFailedAt: wl.LastFailedAt,
 		})
+		if withBalances {
+			out[len(out)-1].OnChain = s.balanceOf(balanceCtx, string(wl.Chain), wl.Address)
+		}
 	}
 	unsweptTotals := map[string]string{}
 	for asset, units := range totals {
@@ -610,4 +645,22 @@ func (s *Server) forwardToWatcher(pathTemplate string) http.HandlerFunc {
 		w.WriteHeader(status)
 		_, _ = w.Write(respBody)
 	}
+}
+
+// getTreasury is each chain's treasury -- where gas and TRX top-ups come
+// from -- and sweep destination, with what they hold on chain now.
+func (s *Server) getTreasury(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	out := map[string]any{}
+	for _, chain := range []string{"BSC", "TRON"} {
+		key := strings.ToLower(chain)
+		treasury, sweepTo := s.Admin.Treasury[key+"_treasury"], s.Admin.Treasury[key+"_sweep_to"]
+		entry := map[string]any{"treasury": treasury, "sweep_to": sweepTo, "balance": s.balanceOf(ctx, chain, treasury)}
+		if sweepTo != "" && sweepTo != treasury {
+			entry["sweep_to_balance"] = s.balanceOf(ctx, chain, sweepTo)
+		}
+		out[key] = entry
+	}
+	respondJSON(w, http.StatusOK, out)
 }

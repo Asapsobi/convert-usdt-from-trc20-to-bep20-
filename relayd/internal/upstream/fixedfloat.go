@@ -393,6 +393,14 @@ type ffOrderSide struct {
 	Code    string      `json:"code"`
 	Address string      `json:"address"`
 	Amount  json.Number `json:"amount"`
+	Tx      *ffTx       `json:"tx"`
+}
+
+// ffTx is the on-chain transaction of one side of an order: for "to", the
+// payout to the customer once FixedFloat has sent it.
+type ffTx struct {
+	ID     string      `json:"id"`
+	Amount json.Number `json:"amount"`
 }
 
 type ffOrderData struct {
@@ -465,8 +473,21 @@ func (p *FixedFloatProvider) toSwapOrder(data ffOrderData, destinationAddress st
 
 	status := statusFromFixedFloat(data.Status)
 	var amountOutActual *money.Amount
+	var payoutTxID *string
 	if status == StatusComplete {
 		amountOutActual = &amountOutExpected
+		if tx := data.To.Tx; tx != nil {
+			if tx.ID != "" {
+				id := tx.ID
+				payoutTxID = &id
+			}
+			// The amount actually paid out, when FixedFloat reports it.
+			if tx.Amount != "" {
+				if paid, err := money.ParseDecimal(truncateToDecimals(tx.Amount.String(), toDecimals), toAsset); err == nil && paid.Units > 0 {
+					amountOutActual = &paid
+				}
+			}
+		}
 	}
 
 	return SwapOrder{
@@ -478,6 +499,7 @@ func (p *FixedFloatProvider) toSwapOrder(data ffOrderData, destinationAddress st
 		AmountIn:           amountIn,
 		AmountOutExpected:  amountOutExpected,
 		AmountOutActual:    amountOutActual,
+		PayoutTxID:         payoutTxID,
 		CreatedAt:          time.Now().UTC(),
 	}, nil
 }

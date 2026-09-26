@@ -60,6 +60,9 @@ func TestAmounts_OverpaidDepositIsForwardedInFull(t *testing.T) {
 	if got := f.leg().Status; got != relay.StatusSettled {
 		t.Fatalf("expected SETTLED, got %s", got)
 	}
+	if tx := f.leg().PayoutTxID; tx == nil || *tx != "mock-payout-"+*leg.UpstreamOrderID {
+		t.Fatalf("expected the vendor's payout transaction recorded on the leg, got %v", tx)
+	}
 
 	ledger := f.ledger
 	for account, want := range map[string]int64{

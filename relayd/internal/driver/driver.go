@@ -116,6 +116,7 @@ func (d *Driver) Quote(ctx context.Context, req QuoteRequest) (Quote, error) {
 	if err != nil {
 		return Quote{}, err
 	}
+	cfg = cfg.For(string(req.Direction))
 	if amountIn.Units < cfg.MinAmountIn || amountIn.Units > cfg.MaxAmountIn {
 		return Quote{}, fmt.Errorf("%w: amount must be between %s and %s USDT", ErrBadRequest,
 			formatUnits(cfg.MinAmountIn, inAsset), formatUnits(cfg.MaxAmountIn, inAsset))
