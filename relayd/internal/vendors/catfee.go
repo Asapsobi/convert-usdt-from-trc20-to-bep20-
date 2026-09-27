@@ -112,6 +112,23 @@ func (c *CatFee) QuoteSun(ctx context.Context, units int64) (int64, error) {
 	return totalSun, nil
 }
 
+// Account implements EnergyAccountReader. CatFee reports the balance in
+// sun.
+func (c *CatFee) Account(ctx context.Context) (EnergyAccount, error) {
+	data, err := c.do(ctx, http.MethodGet, "/v1/account", nil)
+	if err != nil {
+		return EnergyAccount{}, err
+	}
+	var acct struct {
+		Balance         int64  `json:"balance"`
+		RechargeAddress string `json:"recharge_address"`
+	}
+	if err := json.Unmarshal(data, &acct); err != nil {
+		return EnergyAccount{}, fmt.Errorf("catfee: decoding /v1/account: %w", err)
+	}
+	return EnergyAccount{BalanceSun: acct.Balance, TopUpAddress: acct.RechargeAddress}, nil
+}
+
 // Rent implements EnergyVendor.
 func (c *CatFee) Rent(ctx context.Context, target string, units int64) (Rental, error) {
 	data, err := c.do(ctx, http.MethodPost, "/v1/order", url.Values{

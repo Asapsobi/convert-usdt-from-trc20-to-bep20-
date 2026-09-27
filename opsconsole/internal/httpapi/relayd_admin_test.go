@@ -39,7 +39,8 @@ func TestRelaydAdminPagesRender(t *testing.T) {
 		}, Prices: &opclient.VendorPrices{Amount: "100",
 			BSCToTRON: []map[string]string{{"vendor": "fixedfloat", "customer_receives": "98.9", "vendor_fee": "1.1"}},
 			TRONToBSC: []map[string]string{{"vendor": "fixedfloat", "error": "timeout"}},
-			Energy:    []map[string]string{{"vendor": "catfee", "units": "65000", "cost_trx": "3.9"}}}},
+			Energy: []map[string]string{{"vendor": "catfee", "units": "65000", "cost_trx": "1.95", "order_units": "131000",
+				"order_cost_trx": "3.93", "balance_trx": "1.11145", "orders_covered": "0", "top_up_address": "TTopUp"}}}},
 		"relayd_sweeps": relaydSweepsData{
 			Settings: &opclient.SweepSettings{Enabled: true, IntervalMinutes: 60, MinAmount: map[string]string{"USDT_BEP20": "10", "USDT_TRC20": "50"}},
 			Wallets: opclient.ProfitWallets{Wallets: []opclient.ProfitWallet{
@@ -71,5 +72,26 @@ func TestRelaydAdminPagesRender(t *testing.T) {
 		if !strings.Contains(buf.String(), "</html>") {
 			t.Errorf("%s: rendered an incomplete page", name)
 		}
+	}
+}
+
+// The Vendors page warns when an energy vendor's prepaid balance can't pay
+// for one TRON -> BSC order, and stays quiet when it can.
+func TestRelaydVendorsWarnsOnLowEnergyBalance(t *testing.T) {
+	tpl := MustLoadTemplates()
+	page := func(covered string) string {
+		var buf bytes.Buffer
+		if err := tpl.pages["relayd_vendors"].Execute(&buf, relaydVendorsData{Prices: &opclient.VendorPrices{Amount: "100",
+			Energy: []map[string]string{{"vendor": "catfee", "units": "65000", "cost_trx": "1.95", "order_cost_trx": "3.93",
+				"balance_trx": "1.11145", "orders_covered": covered, "top_up_address": "TTopUp"}}}}); err != nil {
+			t.Fatal(err)
+		}
+		return buf.String()
+	}
+	if low := page("0"); !strings.Contains(low, "not enough for the energy of one TRON") || !strings.Contains(low, "TTopUp") {
+		t.Fatal("no low-balance warning with a balance that covers no order")
+	}
+	if ok := page("3"); strings.Contains(ok, "not enough for the energy") || !strings.Contains(ok, "3 order(s)") {
+		t.Fatal("wrong output with a balance that covers 3 orders")
 	}
 }

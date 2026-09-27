@@ -95,7 +95,8 @@ type Vendor struct {
 }
 
 // VendorPrices is every vendor's live price: conversion per direction,
-// and energy for one transfer.
+// and energy for one transfer, with each energy vendor's prepaid balance
+// (balance_trx, orders_covered, top_up_address).
 type VendorPrices struct {
 	Amount    string              `json:"amount"`
 	BSCToTRON []map[string]string `json:"USDT_BEP20_TO_USDT_TRC20"`

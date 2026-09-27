@@ -171,8 +171,14 @@ its orders already in progress are still followed.</p>
 {{ range .BSCToTRON }}<tr><td>BSC → TRON</td><td>{{ index . "vendor" }}</td><td>{{ index . "customer_receives" }}</td><td>{{ index . "vendor_fee" }}{{ index . "error" }}</td></tr>{{ end }}
 {{ range .TRONToBSC }}<tr><td>TRON → BSC</td><td>{{ index . "vendor" }}</td><td>{{ index . "customer_receives" }}</td><td>{{ index . "vendor_fee" }}{{ index . "error" }}</td></tr>{{ end }}
 </table>
-{{ if .Energy }}<table><tr><th>Energy vendor</th><th>Energy</th><th>Cost (TRX)</th></tr>
-{{ range .Energy }}<tr><td>{{ index . "vendor" }}</td><td>{{ index . "units" }}</td><td>{{ index . "cost_trx" }}{{ index . "error" }}</td></tr>{{ end }}</table>{{ end }}
+{{ if .Energy }}
+{{ range .Energy }}{{ if eq (index . "orders_covered") "0" }}<div class="flash flash-error">{{ index . "vendor" }}'s prepaid balance is {{ index . "balance_trx" }} TRX: not enough for the energy of one TRON → BSC order (up to {{ index . "order_cost_trx" }} TRX). Those orders wait at the energy step until it is topped up. Send TRX to <code>{{ index . "top_up_address" }}</code>.</div>{{ end }}{{ end }}
+<table><tr><th>Energy vendor</th><th>Energy</th><th>Cost (TRX)</th><th>One TRON → BSC order</th><th>Prepaid balance</th><th>Covers</th><th>Top up by sending TRX to</th></tr>
+{{ range .Energy }}<tr{{ if eq (index . "orders_covered") "0" }} class="row-alert"{{ end }}><td>{{ index . "vendor" }}</td><td>{{ index . "units" }}</td><td>{{ index . "cost_trx" }}{{ index . "error" }}</td>
+  <td>{{ with index . "order_cost_trx" }}up to {{ . }} TRX{{ end }}</td>
+  <td>{{ with index . "balance_trx" }}{{ . }} TRX{{ end }}{{ index . "balance_error" }}</td>
+  <td>{{ with index . "orders_covered" }}{{ . }} order(s){{ end }}</td>
+  <td>{{ with index . "top_up_address" }}<code>{{ . }}</code>{{ end }}</td></tr>{{ end }}</table>{{ end }}
 {{ else }}<p>Prices unavailable right now.</p>{{ end }}
 `
 
