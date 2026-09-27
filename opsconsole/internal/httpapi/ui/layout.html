@@ -1,0 +1,59 @@
+{{ define "layout" }}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ if .Title }}{{ .Title }} · {{ end }}USDT Converter Admin</title>
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body{{ if .Refresh }} data-refresh="{{ .Refresh }}"{{ end }}>
+{{ if .Session }}
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand"><div class="brand-mark">⇄</div><div>USDT Converter<small>Admin panel</small></div></div>
+    <nav class="nav">
+      <a href="/" class="{{ if eq .Nav "overview" }}active{{ end }}">Overview{{ with .Counts.Warnings }}<span class="count count-warn">{{ . }}</span>{{ end }}</a>
+      <div class="nav-group">Operations</div>
+      <a href="/orders" class="{{ if eq .Nav "orders" }}active{{ end }}">Orders{{ with .Counts.Attention }}<span class="count count-bad" title="orders needing attention">{{ . }}</span>{{ end }}</a>
+      <a href="/deposits" class="{{ if eq .Nav "deposits" }}active{{ end }}">Unmatched deposits{{ with .Counts.Unmatched }}<span class="count count-bad">{{ . }}</span>{{ end }}</a>
+      <a href="/screening" class="{{ if eq .Nav "screening" }}active{{ end }}">Screening{{ with .Counts.Holds }}<span class="count count-warn">{{ . }}</span>{{ end }}</a>
+      <a href="/approvals" class="{{ if eq .Nav "approvals" }}active{{ end }}">Signing approvals{{ with .Counts.Approvals }}<span class="count count-warn">{{ . }}</span>{{ end }}</a>
+      <div class="nav-group">Money</div>
+      <a href="/treasury" class="{{ if eq .Nav "treasury" }}active{{ end }}">Treasury &amp; profit</a>
+      <a href="/wallets" class="{{ if eq .Nav "wallets" }}active{{ end }}">Deposit wallets</a>
+      <div class="nav-group">Settings</div>
+      <a href="/pricing" class="{{ if eq .Nav "pricing" }}active{{ end }}">Pricing</a>
+      <a href="/vendors" class="{{ if eq .Nav "vendors" }}active{{ end }}">Vendors</a>
+      <a href="/system" class="{{ if eq .Nav "system" }}active{{ end }}">System</a>
+      <a href="/audit" class="{{ if eq .Nav "audit" }}active{{ end }}">Audit log</a>
+      {{ with .Legacy }}
+      <div class="nav-group">Model D (not in use)</div>
+      {{ if .Broker }}<a href="/legacy/broker" class="{{ if eq $.Nav "legacy-broker" }}active{{ end }}">Energy broker</a>{{ end }}
+      {{ if .Dispatcher }}<a href="/legacy/dispatcher" class="{{ if eq $.Nav "legacy-dispatcher" }}active{{ end }}">Payout dispatcher</a>{{ end }}
+      {{ end }}
+    </nav>
+  </aside>
+  <div class="main">
+    <header class="topbar">
+      <div><h1>{{ .Title }}</h1>{{ with .Subtitle }}<div class="subtitle">{{ . }}</div>{{ end }}</div>
+      <div class="topbar-right">
+        {{ with .EnvLabel }}<span class="env{{ if $.EnvLive }} env-live{{ end }}">{{ . }}</span>{{ end }}
+        <span>{{ .Session.DisplayName }}</span>
+        <form class="inline" method="post" action="/logout"><button class="btn btn-ghost btn-sm" type="submit">Log out</button></form>
+      </div>
+    </header>
+    {{ if .Halted }}<div class="banner banner-bad">The ledger is halted ({{ .HaltReason }}): no money moves until it is cleared. <a href="/system">Manage</a></div>{{ end }}
+    {{ if or .Err .OK }}<div class="flash">
+      {{ with .Err }}<div class="alert alert-bad"><div class="body">{{ . }}</div></div>{{ end }}
+      {{ with .OK }}<div class="alert alert-ok"><div class="body">{{ . }}</div></div>{{ end }}
+    </div>{{ end }}
+    <main class="content">{{ template "content" . }}</main>
+  </div>
+</div>
+{{ else }}
+<div class="login-wrap">{{ template "content" . }}</div>
+{{ end }}
+</body>
+</html>
+{{ end }}

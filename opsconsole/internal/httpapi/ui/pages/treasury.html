@@ -1,0 +1,85 @@
+{{ define "content" }}
+<div class="stack">
+  <div class="grid grid-3">
+    {{ with .Treasury }}
+    {{ range .Wallets }}
+    <div class="card balance">
+      <h3>Treasury · slot {{ .SlotID }}</h3>
+      <div>{{ template "chain" "BSC" }} {{ template "addr" .BSC }}</div>
+      <div class="value">{{ template "balance" .BSCBalance }}</div>
+      <div>{{ template "chain" "TRON" }} {{ template "addr" .TRON }}</div>
+      <div class="value">{{ template "balance" .TRONBalance }}</div>
+      <div class="muted small">Pays BNB gas and TRX activation for deposit wallets. Keep a little of each.</div>
+    </div>
+    {{ end }}
+    {{ end }}
+    {{ range .Energy }}
+    <div class="card balance">
+      <h3>{{ index . "vendor" }} · prepaid energy</h3>
+      <div class="value">{{ with index . "balance_trx" }}{{ num . }} TRX{{ else }}<span class="muted">unknown</span>{{ end }}</div>
+      {{ with index . "orders_covered" }}<div>{{ if eq . "0" }}<span class="badge tone-bad">Can't pay for one TRON → BSC order</span>{{ else }}<span class="badge tone-ok">Covers {{ . }} TRON → BSC orders</span>{{ end }}</div>{{ end }}
+      <div class="muted small">One order's energy costs up to {{ num (index . "order_cost_trx") }} TRX. Top up by sending TRX to:</div>
+      <div>{{ template "addrfull" (index . "top_up_address") }}</div>
+    </div>
+    {{ end }}
+    <div class="card balance">
+      <h3>Unswept profit</h3>
+      {{ range $asset, $amount := .Wallets.UnsweptTotals }}<div><span class="chip chip-{{ if eq $asset "USDT_BEP20" }}bsc">BSC{{ else }}tron">TRON{{ end }}</span> <span class="value">{{ num $amount }} USDT</span></div>{{ else }}<div class="muted">None yet.</div>{{ end }}
+      <div class="muted small">Our fees, still in the deposit wallets. Sweeps move them to{{ with .Treasury }} {{ template "addr" .BSC.SweepTo }} and {{ template "addr" .TRON.SweepTo }}{{ end }}.</div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="card" style="flex:1 1 320px">
+      <h2>Sweeps</h2>
+      <p class="muted">When a deposit wallet's profit reaches the minimum and no order is using it, relayd moves the profit to the treasury in one transfer. Only profit from completed orders is ever swept.</p>
+      {{ with .Settings }}
+      <form method="post" action="/treasury/sweeps/settings">
+        <div class="field"><label class="check"><input type="checkbox" name="enabled" value="true"{{ if .Enabled }} checked{{ end }}> Sweep automatically</label></div>
+        <div class="form-grid">
+          <div class="field"><label>Check every (minutes)</label><input type="number" name="interval_minutes" min="5" value="{{ .IntervalMinutes }}"></div>
+          <div class="field"><label>Least worth sweeping on BSC (USDT)</label><input type="text" name="min_bep20" value="{{ index .MinAmount "USDT_BEP20" }}"></div>
+          <div class="field"><label>Least worth sweeping on TRON (USDT)</label><input type="text" name="min_trc20" value="{{ index .MinAmount "USDT_TRC20" }}"><div class="hint">A TRON sweep rents energy, so keep this higher.</div></div>
+        </div>
+        <div class="btn-row"><button class="btn btn-primary" type="submit">Save</button></div>
+      </form>
+      {{ end }}
+      <form method="post" action="/treasury/sweeps/run" style="margin-top:12px" data-confirm="Look for wallets to sweep now?"><button class="btn" type="submit">Check for sweeps now</button></form>
+    </div>
+    <div class="card card-flush" style="flex:2 1 520px">
+      <div class="card-head"><h2>Profit per deposit wallet</h2></div>
+      <div class="table-wrap" style="margin-top:12px"><table>
+        <thead><tr><th>Wallet</th><th class="num">Orders</th><th class="num">Earned</th><th class="num">Swept</th><th class="num">Unswept</th><th>On chain now</th><th>State</th></tr></thead>
+        <tbody>
+        {{ range .Wallets.Wallets }}
+        <tr>
+          <td class="nowrap">{{ template "chain" .Chain }} {{ template "addr" .Address }}</td>
+          <td class="num">{{ .Legs }}</td><td class="num">{{ num .Earned }}</td><td class="num">{{ num .Swept }}</td><td class="num"><b>{{ num .Unswept }}</b></td>
+          <td class="small">{{ template "balance" .OnChain }}</td>
+          <td>{{ if .SweepPending }}<span class="badge tone-info">Sweeping</span>{{ else if .Busy }}<span class="badge tone-info">Serving an order</span>{{ else if .LastFailedAt }}<span class="badge tone-bad" title="{{ .LastFailedAt }}">Last sweep failed</span>{{ else }}<span class="badge tone-neutral">Idle</span>{{ end }}</td>
+        </tr>
+        {{ else }}<tr><td colspan="7" class="empty">No deposit wallet has earned anything yet.</td></tr>{{ end }}
+        </tbody>
+      </table></div>
+    </div>
+  </div>
+
+  <div class="card card-flush">
+    <div class="card-head"><h2>Sweep history</h2></div>
+    <div class="table-wrap" style="margin-top:12px"><table>
+      <thead><tr><th>Started</th><th>Chain</th><th>From</th><th class="num">Amount</th><th>Status</th><th>Transaction</th><th>Costs</th></tr></thead>
+      <tbody>
+      {{ range .Sweeps }}
+      <tr class="{{ if eq .Status "FAILED" }}row-bad{{ end }}">
+        <td class="nowrap">{{ template "time" .CreatedAt }}</td><td>{{ template "chain" .Chain }}</td><td>{{ template "addr" .FromAddress }}</td>
+        <td class="num">{{ num .Amount }} <span class="muted small">USDT</span></td>
+        <td>{{ template "status" .Status }}{{ with .Error }}<div class="muted small">{{ . }}</div>{{ end }}</td>
+        <td>{{ template "tx" (dict "Chain" .Chain "Hash" (deref .TxHash)) }}</td>
+        <td class="small">{{ with .Costs }}{{ num .GasBNB }} BNB · {{ num .TopUpTRX }} TRX · energy {{ num .RentalsTRX }} TRX{{ end }}</td>
+      </tr>
+      {{ else }}<tr><td colspan="7" class="empty">No sweeps yet.</td></tr>{{ end }}
+      </tbody>
+    </table></div>
+  </div>
+</div>
+{{ end }}

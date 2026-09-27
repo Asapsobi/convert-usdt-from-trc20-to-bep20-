@@ -1,0 +1,31 @@
+{{ define "content" }}
+<div class="tabs">
+  <a href="/screening" class="{{ if eq .Status "OPEN" }}active{{ end }}">Waiting for you</a>
+  <a href="/screening?status=RELEASED" class="{{ if eq .Status "RELEASED" }}active{{ end }}">Released</a>
+  <a href="/screening?status=REJECTED" class="{{ if eq .Status "REJECTED" }}active{{ end }}">Rejected</a>
+</div>
+<div class="alert alert-warn" style="margin-bottom:16px"><div class="body">Screening currently uses a placeholder that approves every order, so nothing is held yet. A real screening vendor is needed before public launch.</div></div>
+<div class="card card-flush">
+  <div class="table-wrap"><table>
+    <thead><tr><th>Held since</th><th>Order</th><th>Reason</th><th>Status</th>{{ if eq .Status "OPEN" }}<th>Decision</th>{{ end }}</tr></thead>
+    <tbody>
+    {{ range .Holds }}
+    <tr>
+      <td class="nowrap">{{ template "time" .OpenedAt }}</td>
+      <td><a href="/orders/{{ .ExternalID }}">{{ short .ExternalID }}</a></td>
+      <td><span class="mono">{{ .ReasonCode }}</span></td>
+      <td>{{ template "status" .Status }}</td>
+      {{ if eq .Status "OPEN" }}<td>
+        <form class="inline" method="post" action="/screening/{{ .ID }}/release" data-confirm="Release this order? It continues and the customer is paid.">
+          <input type="text" name="note" placeholder="note" class="w-md"><button class="btn btn-sm" type="submit">Release</button></form>
+        <form class="inline" method="post" action="/screening/{{ .ID }}/reject" data-confirm="Reject this order? The customer is refunded.">
+          <input type="hidden" name="note" value="rejected from the admin panel"><button class="btn btn-sm btn-danger" type="submit">Reject &amp; refund</button></form>
+      </td>{{ end }}
+    </tr>
+    {{ else }}
+    <tr><td colspan="5" class="empty">Nothing here.</td></tr>
+    {{ end }}
+    </tbody>
+  </table></div>
+</div>
+{{ end }}

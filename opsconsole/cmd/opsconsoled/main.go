@@ -56,17 +56,25 @@ func run() error {
 	defer audit.Close()
 
 	server := &httpapi.Server{
-		Ledger:     opclient.NewLedgerClient(cfg.ledgerBaseURL, cfg.ledgerToken),
-		Watcher:    opclient.NewWatcherClient(cfg.watcherBaseURL, cfg.watcherToken),
-		Screening:  opclient.NewScreeningClient(cfg.screeningBaseURL, cfg.screeningToken),
-		Broker:     opclient.NewBrokerClient(cfg.brokerBaseURL, cfg.brokerToken),
-		Dispatcher: opclient.NewDispatcherClient(cfg.dispatcherBaseURL, cfg.dispatcherToken),
-		S1:         opclient.NewS1Client(cfg.s1BaseURL, cfg.s1C5Token),
-		Operators:  operators,
-		Sessions:   sessions,
-		Audit:      audit,
-		AuditPath:  cfg.auditLogPath,
-		BuildInfo:  buildInfo,
+		Ledger:    opclient.NewLedgerClient(cfg.ledgerBaseURL, cfg.ledgerToken),
+		Watcher:   opclient.NewWatcherClient(cfg.watcherBaseURL, cfg.watcherToken),
+		Screening: opclient.NewScreeningClient(cfg.screeningBaseURL, cfg.screeningToken),
+		S1:        opclient.NewS1Client(cfg.s1BaseURL, cfg.s1C5Token),
+		Operators: operators,
+		Sessions:  sessions,
+		Audit:     audit,
+		AuditPath: cfg.auditLogPath,
+		BuildInfo: buildInfo,
+		EnvLabel:  os.Getenv("OC_ENV_LABEL"),
+	}
+	// The Model D services (energy broker, payout dispatcher) are optional:
+	// the running product doesn't use them, and their pages appear only
+	// when they are configured.
+	if cfg.brokerBaseURL != "" && cfg.brokerToken != "" {
+		server.Broker = opclient.NewBrokerClient(cfg.brokerBaseURL, cfg.brokerToken)
+	}
+	if cfg.dispatcherBaseURL != "" && cfg.dispatcherToken != "" {
+		server.Dispatcher = opclient.NewDispatcherClient(cfg.dispatcherBaseURL, cfg.dispatcherToken)
 	}
 	// Model F's own two services are optional -- see httpapi.Server's own
 	// doc comment on why an unset OC_RELAYD_BASE_URL/OC_TRONWATCHER_BASE_URL
@@ -139,8 +147,6 @@ func configFromEnv() (config, error) {
 		{"OC_LEDGER_BASE_URL", &cfg.ledgerBaseURL}, {"OC_LEDGER_TOKEN", &cfg.ledgerToken},
 		{"OC_WATCHER_BASE_URL", &cfg.watcherBaseURL}, {"OC_WATCHER_TOKEN", &cfg.watcherToken},
 		{"OC_SCREENING_BASE_URL", &cfg.screeningBaseURL}, {"OC_SCREENING_TOKEN", &cfg.screeningToken},
-		{"OC_BROKER_BASE_URL", &cfg.brokerBaseURL}, {"OC_BROKER_TOKEN", &cfg.brokerToken},
-		{"OC_DISPATCHER_BASE_URL", &cfg.dispatcherBaseURL}, {"OC_DISPATCHER_TOKEN", &cfg.dispatcherToken},
 		{"OC_S1_BASE_URL", &cfg.s1BaseURL}, {"OC_S1_C5_TOKEN", &cfg.s1C5Token},
 		{"OC_SESSION_SECRET", &cfg.sessionSecret},
 		{"OC_OPERATORS", &cfg.operatorsRaw},
@@ -166,6 +172,8 @@ func configFromEnv() (config, error) {
 	// a considered "leave it off" choice, so it's left for main's own
 	// both-set check to silently treat as unconfigured rather than
 	// half-wiring a client that will fail every real call with a 401.
+	cfg.brokerBaseURL, cfg.brokerToken = os.Getenv("OC_BROKER_BASE_URL"), os.Getenv("OC_BROKER_TOKEN")
+	cfg.dispatcherBaseURL, cfg.dispatcherToken = os.Getenv("OC_DISPATCHER_BASE_URL"), os.Getenv("OC_DISPATCHER_TOKEN")
 	cfg.relaydBaseURL = os.Getenv("OC_RELAYD_BASE_URL")
 	cfg.relaydToken = os.Getenv("OC_RELAYD_TOKEN")
 	cfg.tronwatcherBaseURL = os.Getenv("OC_TRONWATCHER_BASE_URL")

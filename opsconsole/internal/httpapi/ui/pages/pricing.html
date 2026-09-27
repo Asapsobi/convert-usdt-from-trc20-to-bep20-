@@ -1,0 +1,56 @@
+{{ define "content" }}
+<div class="row">
+  <div class="card" style="flex:3 1 440px">
+    <h2>Our fee</h2>
+    {{ with .Pricing }}
+    <form method="post" action="/pricing" data-confirm="Change what customers pay? New quotes use it at once.">
+      <p class="muted">A customer pays the exchange's fee plus ours. Ours is a percentage with a minimum, so small orders still cover our network costs.</p>
+      <div class="form-grid">
+        <div class="field"><label>Default fee (basis points)</label><input type="number" name="profit_bps" min="0" max="10000" value="{{ .ProfitBPS }}"><div class="hint">{{ bps .ProfitBPS }} of the amount. 100 basis points = 1%.</div></div>
+        <div class="field"><label>Default minimum fee (USDT)</label><input type="text" name="min_profit" value="{{ .MinProfit }}"></div>
+      </div>
+      <h3 style="margin-top:6px">Per direction <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">(leave empty to use the default)</span></h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Direction</th><th>Fee (basis points)</th><th>Minimum fee (USDT)</th></tr></thead>
+        <tbody>
+        {{ range $.DirectionRows }}
+        <tr><td>{{ .Label }}</td>
+          <td><input type="number" name="{{ .Key }}_profit_bps" min="0" max="10000" value="{{ .ProfitBPS }}" placeholder="{{ $.Pricing.ProfitBPS }}"></td>
+          <td><input type="text" name="{{ .Key }}_min_profit" value="{{ .MinProfit }}" placeholder="{{ $.Pricing.MinProfit }}"></td></tr>
+        {{ end }}
+        </tbody>
+      </table></div>
+      <p class="muted small" style="margin-top:8px">A TRON → BSC order costs us about 1 USD in energy, so that direction needs a minimum fee of its own.</p>
+      <h3 style="margin-top:14px">Order size</h3>
+      <div class="form-grid">
+        <div class="field"><label>Smallest order (USDT)</label><input type="text" name="min_amount_in" value="{{ .MinAmountIn }}"></div>
+        <div class="field"><label>Largest order (USDT)</label><input type="text" name="max_amount_in" value="{{ .MaxAmountIn }}"></div>
+      </div>
+      <div class="btn-row"><button class="btn btn-primary" type="submit">Save pricing</button></div>
+    </form>
+    {{ end }}
+  </div>
+  <div class="card" style="flex:2 1 320px">
+    <h2>Price check</h2>
+    <p class="muted">Exactly what a customer would be offered right now, with live exchange rates.</p>
+    <form method="get" action="/pricing">
+      <div class="field"><label>Customer sends (USDT)</label><input type="text" name="amount" value="{{ .CalcAmount }}"></div>
+      <div class="field"><label>Direction</label>
+        <select name="direction">
+          <option value="BEP20_TO_TRC20"{{ if eq .CalcDir "BEP20_TO_TRC20" }} selected{{ end }}>BSC → TRON</option>
+          <option value="TRC20_TO_BEP20"{{ if eq .CalcDir "TRC20_TO_BEP20" }} selected{{ end }}>TRON → BSC</option>
+        </select></div>
+      <div class="btn-row"><button class="btn" type="submit">Check</button></div>
+    </form>
+    {{ with .Calc }}
+    <table class="money" style="margin-top:14px">
+      <tr><td>Customer sends</td><td>{{ num .AmountIn }} USDT</td></tr>
+      <tr class="minus"><td>Our fee</td><td>− {{ num .OurFee }}</td></tr>
+      <tr class="minus"><td>Exchange fee ({{ .Vendor }})</td><td>− {{ num .VendorFee }}</td></tr>
+      <tr class="total"><td>Customer receives</td><td>{{ num .AmountOut }} USDT</td></tr>
+    </table>
+    {{ end }}
+    {{ with .CalcErr }}<div class="alert alert-warn" style="margin-top:14px"><div class="body">{{ . }}</div></div>{{ end }}
+  </div>
+</div>
+{{ end }}

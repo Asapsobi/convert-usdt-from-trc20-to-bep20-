@@ -1,0 +1,76 @@
+{{ define "content" }}
+<div class="stack">
+  {{ with .Prices }}{{ range .Energy }}{{ if eq (index . "orders_covered") "0" }}
+  <div class="alert alert-bad"><div>
+    <div class="title">{{ index . "vendor" }} can't pay for one TRON → BSC order</div>
+    <div class="body">Prepaid balance {{ num (index . "balance_trx") }} TRX; one order's energy costs up to {{ num (index . "order_cost_trx") }} TRX. Those orders wait at the energy step until you send TRX to <span class="mono">{{ index . "top_up_address" }}</span>.</div>
+  </div></div>
+  {{ end }}{{ end }}{{ end }}
+
+  <div class="card card-flush">
+    <div class="card-head"><h2>Vendors</h2><span class="muted small">A vendor that fails is taken out automatically and returns once it answers again.</span></div>
+    <div class="table-wrap" style="margin-top:12px"><table>
+      <thead><tr><th>Vendor</th><th>Service</th><th>Health</th><th>Priority</th><th>Pays us / notes</th><th></th></tr></thead>
+      <tbody>
+      {{ range .View.Vendors }}
+      <tr class="{{ if and .Enabled (not .Available) }}row-warn{{ end }}">
+        <td><b>{{ .Name }}</b>{{ if not .Enabled }} <span class="badge tone-neutral">Disabled</span>{{ end }}</td>
+        <td>{{ if eq .Service "conversion" }}Conversion{{ else if eq .Service "energy" }}TRON energy{{ else }}{{ .Service }}{{ end }}</td>
+        <td>{{ if .Available }}<span class="badge tone-ok">Available</span>{{ else }}<span class="badge tone-bad">Out{{ with .UnavailableUntil }} until {{ .Format "15:04" }}{{ end }}</span><div class="muted small">{{ .ConsecutiveFailures }} failures{{ with .LastError }}: {{ . }}{{ end }}</div>{{ end }}
+          {{ with .LastSuccessAt }}<div class="muted small">last worked {{ template "ago" . }}</div>{{ end }}</td>
+        <td><form class="inline" method="post" action="/vendors/{{ .Service }}/{{ .Name }}"><input type="number" name="priority" value="{{ .Priority }}" class="w-sm"><button class="btn btn-sm" type="submit">Set</button></form></td>
+        <td><form class="inline" method="post" action="/vendors/{{ .Service }}/{{ .Name }}/terms">
+          <input type="number" name="revenue_bps" min="0" max="9999" value="{{ .RevenueBPS }}" class="w-sm" title="revenue share, basis points">
+          <input type="text" name="notes" value="{{ .Notes }}" placeholder="terms, limits, contact" class="w-md"><button class="btn btn-sm" type="submit">Save</button></form></td>
+        <td class="right"><form class="inline" method="post" action="/vendors/{{ .Service }}/{{ .Name }}"{{ if .Enabled }} data-confirm="Disable {{ .Name }}? It gets no new orders until you enable it again."{{ end }}>
+          {{ if .Enabled }}<input type="hidden" name="enabled" value="false"><button class="btn btn-sm btn-danger" type="submit">Disable</button>
+          {{ else }}<input type="hidden" name="enabled" value="true"><button class="btn btn-sm" type="submit">Enable</button>{{ end }}</form></td>
+      </tr>
+      {{ else }}<tr><td colspan="6" class="empty">No vendors configured.</td></tr>{{ end }}
+      </tbody>
+    </table></div>
+  </div>
+
+  <div class="grid grid-2">
+    {{ range $service, $strategy := .View.Strategies }}
+    <form method="post" action="/vendors/{{ $service }}/strategy" class="card">
+      <h2>{{ if eq $service "conversion" }}How to pick an exchange{{ else }}How to pick an energy provider{{ end }}</h2>
+      <div class="field"><select name="strategy">
+        {{ if eq $service "conversion" }}<option value="best_rate"{{ if eq $strategy "best_rate" }} selected{{ end }}>Best rate for the customer</option>
+        <option value="best_margin"{{ if eq $strategy "best_margin" }} selected{{ end }}>Most revenue for us (revenue share)</option>{{ end }}
+        {{ if eq $service "energy" }}<option value="cheapest"{{ if eq $strategy "cheapest" }} selected{{ end }}>Cheapest</option>{{ end }}
+        <option value="priority"{{ if eq $strategy "priority" }} selected{{ end }}>Fixed priority (lowest number first)</option>
+      </select></div>
+      <button class="btn" type="submit">Save</button>
+    </form>
+    {{ end }}
+  </div>
+
+  <div class="card card-flush">
+    <div class="card-head"><h2>Live prices{{ with .Prices }} for {{ .Amount }} USDT{{ end }}</h2></div>
+    {{ with .Prices }}
+    <div class="table-wrap" style="margin-top:12px"><table>
+      <thead><tr><th>Direction</th><th>Exchange</th><th class="num">Customer receives</th><th class="num">Exchange fee</th></tr></thead>
+      <tbody>
+      {{ range .BSCToTRON }}<tr><td>{{ template "dir" "BEP20_TO_TRC20" }}</td><td>{{ index . "vendor" }}</td><td class="num">{{ num (index . "customer_receives") }}</td><td class="num">{{ num (index . "vendor_fee") }}{{ with index . "error" }}<span class="badge tone-bad" title="{{ . }}">error</span>{{ end }}</td></tr>{{ end }}
+      {{ range .TRONToBSC }}<tr><td>{{ template "dir" "TRC20_TO_BEP20" }}</td><td>{{ index . "vendor" }}</td><td class="num">{{ num (index . "customer_receives") }}</td><td class="num">{{ num (index . "vendor_fee") }}{{ with index . "error" }}<span class="badge tone-bad" title="{{ . }}">error</span>{{ end }}</td></tr>{{ end }}
+      </tbody>
+    </table></div>
+    {{ if .Energy }}
+    <div class="table-wrap" style="margin-top:6px"><table>
+      <thead><tr><th>Energy provider</th><th class="num">65,000 energy</th><th class="num">One TRON → BSC order</th><th class="num">Prepaid balance</th><th>Covers</th><th>Top up by sending TRX to</th></tr></thead>
+      <tbody>
+      {{ range .Energy }}<tr class="{{ if eq (index . "orders_covered") "0" }}row-bad{{ end }}">
+        <td>{{ index . "vendor" }}</td>
+        <td class="num">{{ with index . "cost_trx" }}{{ num . }} TRX{{ end }}{{ index . "error" }}</td>
+        <td class="num">{{ with index . "order_cost_trx" }}up to {{ num . }} TRX{{ end }}</td>
+        <td class="num">{{ with index . "balance_trx" }}{{ num . }} TRX{{ end }}{{ index . "balance_error" }}</td>
+        <td>{{ with index . "orders_covered" }}{{ . }} order(s){{ end }}</td>
+        <td>{{ template "addr" (index . "top_up_address") }}</td></tr>{{ end }}
+      </tbody>
+    </table></div>
+    {{ end }}
+    {{ else }}<div class="empty">Live prices are unavailable right now.</div>{{ end }}
+  </div>
+</div>
+{{ end }}

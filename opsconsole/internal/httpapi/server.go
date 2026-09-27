@@ -1,6 +1,5 @@
-// Package httpapi is the ops console's own HTTP boundary: routes plus
-// html/template rendering. See docs/03-build/ops-console-build-prompts.md
-// for the chunk each file implements.
+// Package httpapi is the admin panel's HTTP boundary: routes and
+// server-rendered pages (templates and styles in ui/).
 package httpapi
 
 import (
@@ -22,17 +21,8 @@ type Operator struct {
 	DisplayName string
 }
 
-// Server holds every dependency the console's handlers need: the six
-// Model D downstream clients, the session signer, the operator
-// directory, and the audit log -- plus, optionally, Model F's own two
-// (Relayd, Tronwatcher). Unlike the Model D six, those two are allowed
-// to be nil: Model F is a separate, optional product line
-// (README.md's own "Model F" section), not every deployment of this
-// console runs it, and this console should still work for a Model-D-only
-// deployment rather than refusing to start over an unset OC_RELAYD_BASE_URL.
-// Every handler that reads Relayd/Tronwatcher checks for nil first and
-// degrades that one card/page, never the whole console (the same
-// invariant-4 posture every other per-service failure already gets).
+// Server holds every client the panel talks to. Broker and Dispatcher
+// (Model D) are optional and nil when not configured.
 type Server struct {
 	Ledger     *opclient.LedgerClient
 	Watcher    *opclient.WatcherClient
@@ -47,10 +37,15 @@ type Server struct {
 	Operators []Operator
 	Sessions  *session.Signer
 	Audit     *auditlog.Log
-	AuditPath string // the file Audit itself writes to -- getAudit's own read view (OC.8) tails this directly
+	AuditPath string // the file Audit writes to; the audit page tails it
+
+	// EnvLabel is shown in the top bar, e.g. "Live" or "Local test".
+	EnvLabel string
 
 	Templates *Templates
 	BuildInfo func() (version, commit string)
+
+	nav navCache
 }
 
 func (s *Server) findOperator(username string) (Operator, bool) {
@@ -62,9 +57,8 @@ func (s *Server) findOperator(username string) (Operator, bool) {
 	return Operator{}, false
 }
 
-// NewRouter builds the full route table. /healthz and /metrics are
-// unauthenticated, same reasoning as every sibling service. Everything
-// else requires a valid session (requireSession, auth.go).
+// NewRouter builds the full route table. /healthz, /metrics and /static
+// are public; everything else requires a session.
 func NewRouter(s *Server) http.Handler {
 	if s.Templates == nil {
 		s.Templates = MustLoadTemplates()
@@ -76,6 +70,7 @@ func NewRouter(s *Server) http.Handler {
 	router := chi.NewRouter()
 	router.Get("/healthz", s.healthzHandler)
 	router.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+	router.Handle("/static/*", staticHandler())
 
 	router.Get("/login", s.getLogin)
 	router.Post("/login", s.postLogin)
@@ -84,54 +79,85 @@ func NewRouter(s *Server) http.Handler {
 	router.Group(func(r chi.Router) {
 		r.Use(s.requireSession)
 
-		r.Get("/", s.getHome)
-		r.Get("/partial/home", s.getHomePartial)
+		r.Get("/", s.getOverview)
 
-		r.Get("/ledger/halt", s.getLedgerHalt)
-		r.Post("/ledger/halt/set", s.postLedgerHaltSet)
-		r.Post("/ledger/halt/clear", s.postLedgerHaltClear)
+		r.Get("/orders", s.getOrders)
+		r.Get("/orders/{external_id}", s.getOrder)
 
-		r.Get("/watcher/cursor", s.getWatcherCursor)
-		r.Post("/watcher/cursor", s.postWatcherCursor)
+		r.Get("/deposits", s.getDeposits)
+		r.Post("/deposits/{chain}/{id}/resolve", s.postResolveDeposit)
 
-		r.Get("/broker/reservations", s.getBrokerReservations)
-		r.Get("/broker/reservations/{id}/reconcile", s.getBrokerReconcileForm)
-		r.Post("/broker/reservations/{id}/reconcile", s.postBrokerReconcile)
-		r.Get("/broker/fallback-events", s.getBrokerFallbackEvents)
-		r.Post("/broker/fallback-events/{id}/resolve", s.postBrokerFallbackResolve)
+		r.Get("/treasury", s.getTreasury)
+		r.Post("/treasury/sweeps/settings", s.postSweepSettings)
+		r.Post("/treasury/sweeps/run", s.postSweepRun)
 
-		r.Get("/screening/holds", s.getScreeningHolds)
-		r.Post("/screening/holds/{id}/release", s.postScreeningHoldRelease)
-		r.Post("/screening/holds/{id}/reject", s.postScreeningHoldReject)
+		r.Get("/wallets", redirect("/wallets/bsc"))
+		r.Get("/wallets/{chain}", s.getWallets)
+		r.Post("/wallets/{chain}/settings", s.postWalletSettings)
+		r.Post("/wallets/{chain}/add", s.postWalletAdd)
+		r.Post("/wallets/{chain}/{address}/enable", s.postWalletStatus(true))
+		r.Post("/wallets/{chain}/{address}/disable", s.postWalletStatus(false))
 
-		r.Get("/dispatcher/slots", s.getDispatcherSlots)
-		r.Post("/dispatcher/slots/{id}/retire", s.postDispatcherSlotRetire)
+		r.Get("/pricing", s.getPricing)
+		r.Post("/pricing", s.postPricing)
 
-		r.Get("/s1/approvals", s.getS1Approvals)
-		r.Post("/s1/approvals/{id}/approve", s.postS1Approve)
-		r.Post("/s1/approvals/{id}/reject", s.postS1Reject)
+		r.Get("/vendors", s.getVendors)
+		r.Post("/vendors/{service}/strategy", s.postVendorStrategy)
+		r.Post("/vendors/{service}/{name}", s.postVendor)
+		r.Post("/vendors/{service}/{name}/terms", s.postVendorTerms)
 
-		r.Get("/relayd/legs", s.getRelayLegs)
-		r.Get("/relayd/legs/{external_id}", s.getRelaydLeg)
-		r.Get("/relayd/pricing", s.getRelaydPricing)
-		r.Post("/relayd/pricing", s.postRelaydPricing)
-		r.Get("/relayd/vendors", s.getRelaydVendors)
-		r.Post("/relayd/vendors/{service}/strategy", s.postRelaydVendorStrategy)
-		r.Post("/relayd/vendors/{service}/{name}", s.postRelaydVendor)
-		r.Post("/relayd/vendors/{service}/{name}/terms", s.postRelaydVendorTerms)
-		r.Get("/relayd/sweeps", s.getRelaydSweeps)
-		r.Post("/relayd/sweeps/settings", s.postRelaydSweepSettings)
-		r.Post("/relayd/sweeps/run", s.postRelaydSweepRun)
-		r.Get("/relayd/pool/{chain}", s.getRelaydPool)
-		r.Post("/relayd/pool/{chain}/settings", s.postRelaydPoolSettings)
-		r.Post("/relayd/pool/{chain}/wallets", s.postRelaydPoolProvision)
-		r.Post("/relayd/pool/{chain}/wallets/{address}/enable", s.postRelaydPoolWallet(true))
-		r.Post("/relayd/pool/{chain}/wallets/{address}/disable", s.postRelaydPoolWallet(false))
+		r.Get("/screening", s.getScreening)
+		r.Post("/screening/{id}/release", s.postHold(true))
+		r.Post("/screening/{id}/reject", s.postHold(false))
+
+		r.Get("/approvals", s.getApprovals)
+		r.Post("/approvals/{id}/approve", s.postApproval(true))
+		r.Post("/approvals/{id}/reject", s.postApproval(false))
+
+		r.Get("/system", s.getSystem)
+		r.Post("/system/halt/set", s.postHalt(true))
+		r.Post("/system/halt/clear", s.postHalt(false))
+		r.Post("/system/watcher-cursor", s.postWatcherCursor)
 
 		r.Get("/audit", s.getAudit)
+
+		if s.Broker != nil {
+			r.Get("/legacy/broker", s.getBroker)
+			r.Get("/legacy/broker/{id}/reconcile", s.getBrokerReconcile)
+			r.Post("/legacy/broker/{id}/reconcile", s.postBrokerReconcile)
+			r.Get("/legacy/broker/fallback", s.getBrokerFallback)
+			r.Post("/legacy/broker/fallback/{id}/resolve", s.postBrokerFallbackResolve)
+		}
+		if s.Dispatcher != nil {
+			r.Get("/legacy/dispatcher", s.getDispatcher)
+			r.Post("/legacy/dispatcher/{id}/retire", s.postDispatcherSlotRetire)
+		}
+
+		// Where the previous version of the panel kept each page.
+		r.Get("/relayd/legs", redirect("/orders"))
+		r.Get("/relayd/legs/{external_id}", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/orders/"+chi.URLParam(r, "external_id"), http.StatusMovedPermanently)
+		})
+		r.Get("/relayd/pricing", redirect("/pricing"))
+		r.Get("/relayd/vendors", redirect("/vendors"))
+		r.Get("/relayd/sweeps", redirect("/treasury"))
+		r.Get("/relayd/pool/{chain}", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/wallets/"+chi.URLParam(r, "chain"), http.StatusMovedPermanently)
+		})
+		r.Get("/screening/holds", redirect("/screening"))
+		r.Get("/s1/approvals", redirect("/approvals"))
+		r.Get("/ledger/halt", redirect("/system"))
+		r.Get("/watcher/cursor", redirect("/system"))
+		r.Get("/partial/home", redirect("/"))
 	})
 
 	return router
+}
+
+func redirect(to string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, to, http.StatusMovedPermanently)
+	}
 }
 
 func (s *Server) healthzHandler(w http.ResponseWriter, r *http.Request) {

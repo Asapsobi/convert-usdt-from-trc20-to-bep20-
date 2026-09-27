@@ -1,0 +1,20 @@
+{{ define "content" }}
+<div class="tabs">
+  {{ range $st := (list "FAILED" "PENDING" "CONFIRMED") }}<a href="/legacy/broker?status={{ $st }}" class="{{ if eq $.Status $st }}active{{ end }}">{{ statusLabel $st }}</a>{{ end }}
+  <a href="/legacy/broker/fallback">Manual fallback events</a>
+</div>
+<div class="card card-flush">
+  <div class="table-wrap"><table>
+    <thead><tr><th>ID</th><th>Order</th><th>Target</th><th class="num">Energy</th><th>Status</th><th>Vendor</th><th>Deadline</th><th></th></tr></thead>
+    <tbody>
+    {{ range .Reservations }}
+    <tr>
+      <td class="mono">{{ .ID }}</td><td>{{ .ExternalID }}<div class="muted small">#{{ .OrderID }}</div></td><td>{{ template "addr" .TargetAddress }}</td>
+      <td class="num">{{ .EnergyUnits }}</td><td>{{ template "status" .Status }}</td><td>{{ .Vendor }}</td><td class="nowrap">{{ template "time" .Deadline }}</td>
+      <td>{{ if eq .Status "FAILED" }}<a class="btn btn-sm" href="/legacy/broker/{{ .ID }}/reconcile">Reconcile</a>{{ end }}</td>
+    </tr>
+    {{ else }}<tr><td colspan="8" class="empty">Nothing here.</td></tr>{{ end }}
+    </tbody>
+  </table></div>
+</div>
+{{ end }}

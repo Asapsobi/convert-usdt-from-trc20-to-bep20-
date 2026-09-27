@@ -9,10 +9,12 @@ import (
 	"relayd/internal/money"
 	"relayd/internal/upstream"
 	"strings"
+	"time"
 
 	"relayd/internal/driver"
 	"relayd/internal/httpapi"
 	"relayd/internal/orchestrate"
+	"relayd/internal/stats"
 	"relayd/internal/transfers"
 	"relayd/internal/vendors"
 )
@@ -68,6 +70,12 @@ func adminFromEnv(d *driver.Driver, orch *orchestrate.Orchestrator) (*httpapi.Ad
 	}
 	admin.Prices = func(ctx context.Context, amount string) (any, error) {
 		return vendorPrices(ctx, d, orch, amount)
+	}
+	admin.Stats = func(ctx context.Context) (any, error) {
+		return stats.Collect(ctx, orch.Store.DB(), time.Now())
+	}
+	admin.Energy = func(ctx context.Context) (any, error) {
+		return map[string]any{"energy": energyAccounts(ctx, orch)}, nil
 	}
 	for _, t := range orch.Treasuries() {
 		admin.Treasuries = append(admin.Treasuries, httpapi.TreasuryWallet{SlotID: t.SlotID, BSC: t.EVMAddress, TRON: t.TronAddress})
@@ -129,38 +137,50 @@ func vendorPrices(ctx context.Context, d *driver.Driver, orch *orchestrate.Orche
 			out[string(pair.From)+"_TO_"+string(pair.To)] = rows
 		}
 	}
-	if energy, ok := orch.Energy.(*vendors.EnergyRouter); ok {
-		orderCost := map[string]int64{}
-		for _, q := range energy.QuoteEach(ctx, orderEnergyUnits) {
-			if q.Err == nil && q.CostSun > 0 {
-				orderCost[q.Vendor] = q.CostSun
-			}
-		}
-		var rows []map[string]string
-		for _, q := range energy.QuoteEach(ctx, 65_000) {
-			row := map[string]string{"vendor": q.Vendor, "units": fmt.Sprint(q.Units)}
-			if q.Err != nil {
-				row["error"] = q.Err.Error()
-			} else {
-				row["cost_trx"] = formatRaw(big.NewInt(q.CostSun), 6)
-			}
-			cost, priced := orderCost[q.Vendor]
-			if priced {
-				row["order_units"] = fmt.Sprint(orderEnergyUnits)
-				row["order_cost_trx"] = formatRaw(big.NewInt(cost), 6)
-			}
-			if acct, ok, err := energy.Account(ctx, q.Vendor); ok && err != nil {
-				row["balance_error"] = err.Error()
-			} else if ok {
-				row["balance_trx"] = formatRaw(big.NewInt(acct.BalanceSun), 6)
-				row["top_up_address"] = acct.TopUpAddress
-				if priced {
-					row["orders_covered"] = fmt.Sprint(acct.BalanceSun / cost)
-				}
-			}
-			rows = append(rows, row)
-		}
+	if rows := energyAccounts(ctx, orch); rows != nil {
 		out["energy"] = rows
 	}
 	return out, nil
+}
+
+// energyAccounts is, per energy vendor: the price of one transfer's energy,
+// the price of one order's worst-case energy, our prepaid balance, how many
+// such orders it covers, and where to top it up. nil when relayd rents no
+// energy from vendors directly.
+func energyAccounts(ctx context.Context, orch *orchestrate.Orchestrator) []map[string]string {
+	energy, ok := orch.Energy.(*vendors.EnergyRouter)
+	if !ok {
+		return nil
+	}
+	orderCost := map[string]int64{}
+	for _, q := range energy.QuoteEach(ctx, orderEnergyUnits) {
+		if q.Err == nil && q.CostSun > 0 {
+			orderCost[q.Vendor] = q.CostSun
+		}
+	}
+	rows := []map[string]string{}
+	for _, q := range energy.QuoteEach(ctx, 65_000) {
+		row := map[string]string{"vendor": q.Vendor, "units": fmt.Sprint(q.Units)}
+		if q.Err != nil {
+			row["error"] = q.Err.Error()
+		} else {
+			row["cost_trx"] = formatRaw(big.NewInt(q.CostSun), 6)
+		}
+		cost, priced := orderCost[q.Vendor]
+		if priced {
+			row["order_units"] = fmt.Sprint(orderEnergyUnits)
+			row["order_cost_trx"] = formatRaw(big.NewInt(cost), 6)
+		}
+		if acct, ok, err := energy.Account(ctx, q.Vendor); ok && err != nil {
+			row["balance_error"] = err.Error()
+		} else if ok {
+			row["balance_trx"] = formatRaw(big.NewInt(acct.BalanceSun), 6)
+			row["top_up_address"] = acct.TopUpAddress
+			if priced {
+				row["orders_covered"] = fmt.Sprint(acct.BalanceSun / cost)
+			}
+		}
+		rows = append(rows, row)
+	}
+	return rows
 }

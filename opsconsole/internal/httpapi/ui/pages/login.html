@@ -1,0 +1,13 @@
+{{ define "content" }}
+<div class="card login-card">
+  <div class="brand"><div class="brand-mark">⇄</div><div>USDT Converter<small class="muted">Admin panel</small></div></div>
+  {{ with .EnvLabel }}<p><span class="env{{ if $.EnvLive }} env-live{{ end }}">{{ . }}</span></p>{{ end }}
+  {{ with .Err }}<div class="alert alert-bad" style="margin-bottom:14px"><div class="body">{{ . }}</div></div>{{ end }}
+  <form method="post" action="/login">
+    <div class="field"><label>Username</label><input type="text" name="username" required autofocus autocomplete="username"></div>
+    <div class="field"><label>Password</label><input type="password" name="password" required autocomplete="current-password"></div>
+    <div class="field"><label>S1 approver token <span class="muted">(optional)</span></label><input type="password" name="s1_approver_token" autocomplete="off"><div class="hint">Only needed to approve or reject signing requests.</div></div>
+    <button class="btn btn-primary" type="submit" style="width:100%">Log in</button>
+  </form>
+</div>
+{{ end }}

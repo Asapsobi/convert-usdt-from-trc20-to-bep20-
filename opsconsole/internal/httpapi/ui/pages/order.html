@@ -1,0 +1,76 @@
+{{ define "content" }}
+<p><a href="/orders">← All orders</a></p>
+{{ with .Leg }}
+<div class="card" style="margin-bottom:16px">
+  <div class="btn-row" style="justify-content:space-between">
+    <div class="btn-row">{{ template "status" .Status }} {{ template "dir" .Direction }} <span class="muted">#{{ .OrderID }} · created {{ template "time" $.Created }}</span></div>
+    <span class="addr muted">{{ .ExternalID }}<button class="copy" type="button" data-copy="{{ .ExternalID }}" title="Copy">⧉</button></span>
+  </div>
+</div>
+<div class="row">
+  <div class="card" style="flex:3 1 460px">
+    <h2>What happened</h2>
+    <ol class="timeline">
+      {{ range $.Steps }}
+      <li class="{{ .State }}"><span class="dot"></span>
+        <div class="step-title">{{ .Title }}</div>
+        <div class="step-body">
+          {{ range .Lines }}<div>{{ with .Label }}{{ . }}: {{ end }}{{ if .Tx }}{{ template "tx" (dict "Chain" .Chain "Hash" .Tx) }}{{ else if .Addr }}{{ template "addr" .Addr }}{{ else if not .Time.IsZero }}{{ template "time" .Time }}{{ else }}{{ .Text }}{{ end }}</div>{{ end }}
+        </div>
+      </li>
+      {{ end }}
+    </ol>
+  </div>
+  <div class="stack" style="flex:2 1 320px">
+    <div class="card">
+      <h2>Money</h2>
+      <table class="money">
+        <tr><td>Customer sent</td><td>{{ if .ReceivedAmount }}{{ num (deref .ReceivedAmount) }}{{ else }}<span class="muted">{{ num .AmountIn }} quoted</span>{{ end }} USDT</td></tr>
+        <tr class="minus"><td>Our fee{{ with .ProfitBPS }} ({{ bps . }}){{ end }}</td><td>{{ with .ProfitAmount }}− {{ num . }}{{ else }}—{{ end }}</td></tr>
+        <tr><td>Sent to the exchange</td><td>{{ with .ForwardAmount }}{{ num . }}{{ else }}—{{ end }}</td></tr>
+        <tr class="minus"><td>Exchange fee</td><td>{{ with .VendorFeeAmount }}− {{ num . }}{{ else }}—{{ end }}</td></tr>
+        <tr class="total"><td>Customer received</td><td>{{ if .AmountOutActual }}{{ num (deref .AmountOutActual) }}{{ else }}<span class="muted">≈ {{ num .AmountOutExpected }}</span>{{ end }} USDT</td></tr>
+      </table>
+      <h3 style="margin-top:14px">Our network costs</h3>
+      <table class="money">
+        <tr><td>BNB gas top-ups</td><td>{{ num $.Costs.GasBNB }} BNB</td></tr>
+        <tr><td>TRX top-ups</td><td>{{ num $.Costs.TopUpTRX }} TRX</td></tr>
+        <tr><td>Energy rentals</td><td>{{ num $.Costs.RentalsTRX }} TRX</td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <h2>Parties</h2>
+      <dl class="dl">
+        <dt>Customer</dt><dd>{{ with .CustomerLabel }}{{ . }} · {{ end }}<span class="muted">{{ .CustomerID }}</span></dd>
+        <dt>Paid from</dt><dd>{{ template "addr" (deref .SenderAddress) }}</dd>
+        <dt>Deposit wallet</dt><dd>{{ template "addr" .DepositAddress }}</dd>
+        <dt>Exchange</dt><dd>{{ with .UpstreamProviderName }}{{ . }}{{ else }}<span class="muted">—</span>{{ end }}{{ with .UpstreamOrderID }} · <span class="mono">{{ . }}</span>{{ end }}</dd>
+        <dt>Exchange address</dt><dd>{{ template "addr" (deref .UpstreamDepositAddress) }}</dd>
+        <dt>Pays out to</dt><dd>{{ template "addr" .DestinationAddress }}</dd>
+      </dl>
+    </div>
+  </div>
+</div>
+
+<div class="card card-flush" style="margin-top:16px">
+  <div class="card-head"><h2>Every transfer for this order</h2></div>
+  <div class="table-wrap" style="margin-top:12px"><table>
+    <thead><tr><th>When</th><th>What</th><th>Chain</th><th>From</th><th>To</th><th class="num">Amount</th><th>Status</th><th>Transaction</th></tr></thead>
+    <tbody>
+    {{ range $.Costs.Transfers }}
+    <tr class="{{ if eq .Status "FAILED" }}row-bad{{ end }}">
+      <td class="nowrap">{{ template "time" .CreatedAt }}</td>
+      <td>{{ statusLabel .Purpose }}</td><td>{{ template "chain" .Chain }}</td>
+      <td>{{ template "addr" .From }}</td><td>{{ template "addr" .To }}</td>
+      <td class="num">{{ num .Amount }} <span class="muted small">{{ .Asset }}</span></td>
+      <td>{{ template "status" .Status }}{{ with .Failure }}<div class="muted small">{{ . }}</div>{{ end }}</td>
+      <td>{{ template "tx" (dict "Chain" .Chain "Hash" (deref .TxHash)) }}</td>
+    </tr>
+    {{ else }}<tr><td colspan="8" class="empty">Nothing was sent for this order.</td></tr>{{ end }}
+    </tbody>
+  </table></div>
+</div>
+{{ else }}
+<div class="card empty">This order couldn't be loaded.</div>
+{{ end }}
+{{ end }}

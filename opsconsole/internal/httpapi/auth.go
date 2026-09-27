@@ -85,16 +85,21 @@ const loginContent = `
 
 type loginPageData struct {
 	basePageData
-	Error string
+}
+
+func (s *Server) loginPage(errMsg string) loginPageData {
+	d := loginPageData{basePageData: basePageData{Title: "Log in", EnvLabel: s.EnvLabel, EnvLive: strings.EqualFold(s.EnvLabel, "live")}}
+	d.Err = errMsg
+	return d
 }
 
 func (s *Server) getLogin(w http.ResponseWriter, r *http.Request) {
-	s.Templates.Render(w, "login", loginPageData{})
+	s.Templates.Render(w, "login", s.loginPage(""))
 }
 
 func (s *Server) postLogin(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
-		s.Templates.Render(w, "login", loginPageData{Error: "malformed form submission"})
+		s.Templates.Render(w, "login", s.loginPage("malformed form submission"))
 		return
 	}
 	username := r.FormValue("username")
@@ -103,7 +108,7 @@ func (s *Server) postLogin(w http.ResponseWriter, r *http.Request) {
 
 	op, ok := s.findOperator(username)
 	if !ok || bcrypt.CompareHashAndPassword([]byte(op.BcryptHash), []byte(password)) != nil {
-		s.Templates.Render(w, "login", loginPageData{Error: "invalid username or password"})
+		s.Templates.Render(w, "login", s.loginPage("invalid username or password"))
 		return
 	}
 

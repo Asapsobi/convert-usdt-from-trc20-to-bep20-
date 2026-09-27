@@ -1,0 +1,19 @@
+{{ define "content" }}
+<div class="card card-flush">
+  <div class="table-wrap"><table>
+    <thead><tr><th>Slot</th><th>TRON address</th><th>Status</th><th class="num">Balance</th><th class="num">Transactions</th><th></th></tr></thead>
+    <tbody>
+    {{ range .Slots }}
+    <tr>
+      <td class="mono">{{ .ID }}</td><td>{{ template "addr" .TronAddress }}</td><td>{{ template "status" .Status }}</td>
+      <td class="num">{{ .Balance }}</td><td class="num">{{ .TxCount }}</td>
+      <td class="right">{{ if eq .Status "ACTIVE" }}
+        <form class="inline" method="post" action="/legacy/dispatcher/{{ .ID }}/retire" data-confirm="Retire slot {{ .ID }}?"><button class="btn btn-sm" type="submit">Retire</button></form>
+        <form class="inline" method="post" action="/legacy/dispatcher/{{ .ID }}/retire" data-confirm="Retire slot {{ .ID }} immediately?"><input type="hidden" name="immediate" value="true"><button class="btn btn-sm btn-danger" type="submit">Retire now</button></form>
+      {{ end }}</td>
+    </tr>
+    {{ else }}<tr><td colspan="6" class="empty">No slots.</td></tr>{{ end }}
+    </tbody>
+  </table></div>
+</div>
+{{ end }}

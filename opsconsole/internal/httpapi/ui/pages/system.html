@@ -1,0 +1,68 @@
+{{ define "content" }}
+<div class="stack">
+  <div class="card">
+    <h2>Services</h2>
+    <div class="grid grid-3">
+      {{ range .Services }}
+      <div class="health"><span class="dot-s {{ if .Healthy }}dot-ok{{ else }}dot-bad{{ end }}"></span><div><b>{{ .Name }}</b><div class="muted small">{{ if .Healthy }}answering{{ else }}{{ .Error }}{{ end }}</div></div></div>
+      {{ end }}
+    </div>
+  </div>
+
+  <div class="grid grid-2">
+    <div class="card">
+      <h2>{{ template "chain" "BSC" }} deposit watcher</h2>
+      {{ with .BSC }}
+      <dl class="dl">
+        <dt>Behind the chain</dt><dd>{{ with .CursorLagBlocks }}{{ $lag := derefInt . }}{{ if gt $lag 400 }}<span class="badge tone-warn">{{ $lag }} blocks</span>{{ else }}<span class="badge tone-ok">{{ $lag }} blocks</span>{{ end }} <span class="muted small">(a BSC block is about 0.75 s)</span>{{ else }}<span class="muted">unknown</span>{{ end }}</dd>
+        <dt>Deposits confirming</dt><dd>{{ with .PendingFinalityCount }}{{ . }}{{ else }}0{{ end }}</dd>
+      </dl>
+      {{ else }}<p class="muted">Not answering.</p>{{ end }}
+    </div>
+    <div class="card">
+      <h2>{{ template "chain" "TRON" }} deposit watcher</h2>
+      {{ with .TRON }}
+      <dl class="dl">
+        <dt>Deposits confirming</dt><dd>{{ with .PendingFinalityCount }}{{ . }}{{ else }}0{{ end }}</dd>
+        <dt>Oldest waiting</dt><dd>{{ with .OldestPendingCandidateAgeSeconds }}{{ printf "%.0f" (derefFloat .) }} s{{ else }}<span class="muted">none</span>{{ end }}</dd>
+      </dl>
+      {{ else }}<p class="muted">Not answering.</p>{{ end }}
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Emergency stop</h2>
+    {{ if .LedgerHalted }}
+    <div class="alert alert-bad" style="margin-bottom:12px"><div><div class="title">The ledger is halted</div><div class="body">{{ .HaltText }}. No money moves until it is cleared.</div></div></div>
+    <form method="post" action="/system/halt/clear" data-confirm="Clear the halt? Orders start moving money again."><button class="btn btn-primary" type="submit">Clear the halt</button></form>
+    {{ else }}
+    <p class="muted">Halting the ledger stops every money movement at once. Use it if something looks wrong and you need time to investigate.</p>
+    <form method="post" action="/system/halt/set" data-confirm="Halt the ledger? No money moves until you clear it.">
+      <div class="field"><label>Reason</label><input type="text" name="reason" required placeholder="what you are investigating"></div>
+      <button class="btn btn-danger" type="submit">Halt everything</button>
+    </form>
+    {{ end }}
+  </div>
+
+  <details class="card">
+    <summary>Advanced: BSC watcher position</summary>
+    {{ with .Cursor }}
+    <p class="muted">Moves where the BSC watcher reads the chain from. Only move it forward past blocks that can't hold a deposit you care about: payments inside the skipped blocks are never seen.</p>
+    <dl class="dl" style="margin-bottom:14px">
+      <dt>Blocks read up to</dt><dd class="mono">{{ .LastScanned }}</dd>
+      <dt>Deposits checked up to</dt><dd class="mono">{{ with .LastCandidateScanned }}{{ . }}{{ else }}—{{ end }}</dd>
+      <dt>Last moved</dt><dd>{{ with .UpdatedAt }}{{ template "time" . }}{{ else }}—{{ end }}</dd>
+    </dl>
+    <form method="post" action="/system/watcher-cursor" data-confirm="Move the BSC watcher? Deposits in skipped blocks will never be seen.">
+      <div class="form-grid">
+        <div class="field"><label>Blocks read up to</label><input type="number" name="last_scanned" value="{{ .LastScanned }}" required></div>
+        <div class="field"><label>Deposits checked up to</label><input type="number" name="last_candidate_scanned" value="{{ with .LastCandidateScanned }}{{ . }}{{ end }}" required></div>
+      </div>
+      <div class="field"><label>Reason</label><input type="text" name="reason" required></div>
+      <button class="btn btn-danger" type="submit">Move the watcher</button>
+    </form>
+    {{ else }}<p class="muted">The BSC watcher's position is unavailable.</p>{{ end }}
+  </details>
+  {{ with .Version }}<p class="muted small">Admin panel {{ . }}</p>{{ end }}
+</div>
+{{ end }}

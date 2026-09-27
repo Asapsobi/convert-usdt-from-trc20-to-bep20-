@@ -1,0 +1,22 @@
+{{/* Shared pieces. Each takes its value as the pipeline ("."). */}}
+
+{{ define "status" }}<span class="badge tone-{{ statusTone . }}">{{ statusLabel . }}</span>{{ end }}
+
+{{ define "dir" }}<span class="nowrap"><span class="chip chip-{{ lower (srcChain .) }}">{{ srcChain . }}</span> → <span class="chip chip-{{ lower (dstChain .) }}">{{ dstChain . }}</span></span>{{ end }}
+
+{{ define "chain" }}<span class="chip chip-{{ lower . }}">{{ . }}</span>{{ end }}
+
+{{ define "addr" }}{{ if . }}<span class="addr"><a href="{{ addrURL . }}" target="_blank" rel="noopener" title="{{ . }}">{{ short . }}</a><button class="copy" type="button" data-copy="{{ . }}" title="Copy">⧉</button></span>{{ else }}<span class="muted">—</span>{{ end }}{{ end }}
+
+{{ define "addrfull" }}{{ if . }}<span class="addr"><a href="{{ addrURL . }}" target="_blank" rel="noopener">{{ . }}</a><button class="copy" type="button" data-copy="{{ . }}" title="Copy">⧉</button></span>{{ else }}<span class="muted">—</span>{{ end }}{{ end }}
+
+{{/* tx takes (dict "Chain" "BSC" "Hash" "0x...") */}}
+{{ define "tx" }}{{ if .Hash }}<span class="addr"><a href="{{ txURL .Chain .Hash }}" target="_blank" rel="noopener" title="{{ .Hash }}">{{ short .Hash }}</a><button class="copy" type="button" data-copy="{{ .Hash }}" title="Copy">⧉</button></span>{{ else }}<span class="muted">—</span>{{ end }}{{ end }}
+
+{{ define "time" }}{{ if not .IsZero }}<time datetime="{{ rfc3339 . }}">{{ fmtTime . }}</time>{{ else }}<span class="muted">—</span>{{ end }}{{ end }}
+
+{{ define "ago" }}{{ if not .IsZero }}<time datetime="{{ rfc3339 . }}" data-ago>{{ fmtTime . }}</time>{{ else }}<span class="muted">—</span>{{ end }}{{ end }}
+
+{{ define "usdt" }}{{ if . }}{{ num . }} <span class="muted small">USDT</span>{{ else }}<span class="muted">—</span>{{ end }}{{ end }}
+
+{{ define "balance" }}{{ if . }}{{ if .Error }}<span class="badge tone-bad" title="{{ .Error }}">unavailable</span>{{ else }}{{ num .Native }} {{ .NativeFor }} · {{ num .USDT }} USDT{{ end }}{{ else }}<span class="muted">—</span>{{ end }}{{ end }}

@@ -1,0 +1,18 @@
+{{ define "content" }}
+<p><a href="/legacy/broker">← Reservations</a></p>
+<div class="card" style="max-width:640px">
+  <h2>Reservation {{ .ID }}</h2>
+  <p class="muted">You are vouching for a delegation you verified yourself, for example read on-chain at the vendor's target address. This is not automatic.</p>
+  <form method="post" action="/legacy/broker/{{ .ID }}/reconcile" data-confirm="Confirm this reservation as delivered?">
+    <div class="form-grid">
+      <div class="field"><label>Order id</label><input type="number" name="order_id" required></div>
+      <div class="field"><label>Provider</label><input type="text" name="provider" required></div>
+      <div class="field"><label>Delegation id</label><input type="text" name="delegation_id" required></div>
+      <div class="field"><label>Target address</label><input type="text" name="target_address" required></div>
+      <div class="field"><label>Energy units</label><input type="number" name="energy_units" required></div>
+      <div class="field"><label>Cost (TRX, e.g. 1.950000)</label><input type="text" name="cost_trx" required></div>
+    </div>
+    <button class="btn btn-danger" type="submit">Confirm reservation</button>
+  </form>
+</div>
+{{ end }}
