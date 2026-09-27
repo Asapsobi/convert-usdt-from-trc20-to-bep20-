@@ -1,5 +1,9 @@
 # Model F — zero-float relay: strategy note
 
+> **Background (history).** Written during the design and build phase and kept as a
+> record. You don't need it to run or change today's product: start at
+> [docs/README.md](../README.md).
+
 _13 Sep 2026. Second product line alongside Model D (`findings-and-recommendation.md`).
 Does not re-open Model D — that verdict, and everything built against it, stands as is._
 

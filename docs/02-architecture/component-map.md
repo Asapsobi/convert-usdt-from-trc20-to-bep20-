@@ -1,5 +1,9 @@
 # Component map — build decomposition and dimensions
 
+> **Background (history).** Written during the design and build phase and kept as a
+> record. You don't need it to run or change today's product: start at
+> [docs/README.md](../README.md).
+
 _v1.0, 31 Aug 2026. Decomposition of decision 1 in `docs/02-architecture/product-operations-architecture.md` ("six services, one ledger, no smart contracts"). This is the build-order and scoping document; it does not re-open any architecture decision._
 
 ## The six services + three supporting pieces

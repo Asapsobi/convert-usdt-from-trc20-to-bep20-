@@ -1,5 +1,9 @@
 # S1 — Key management / signing: sequenced build prompts
 
+> **Background (history).** Written during the design and build phase and kept as a
+> record. You don't need it to run or change today's product: start at
+> [docs/README.md](../README.md).
+
 **Target:** Go + PostgreSQL, matching C1–C5's stack. **Consumer:** an AI coding
 agent (Claude Code or equivalent), same usage pattern as every prior
 build-prompts doc in this project.

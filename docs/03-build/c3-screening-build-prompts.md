@@ -1,5 +1,9 @@
 # C3 — Screening: sequenced build prompts
 
+> **Background (history).** Written during the design and build phase and kept as a
+> record. You don't need it to run or change today's product: start at
+> [docs/README.md](../README.md).
+
 **Target:** Go + PostgreSQL, matching C1's and C2's stack. **Consumer:** an AI coding agent (Claude Code or equivalent), same usage pattern as `c1-ledger-build-prompts.md` and `c2-deposit-watcher-build-prompts.md`.
 
 **How to use this file.** Paste §0 once at the start of the session — standing context the agent must hold for every chunk. Then paste chunks C3.0 → C3.9 one at a time, in order. Do not move to the next chunk until the current chunk's acceptance criteria pass against a real running C1 instance and a real (or sandbox) screening vendor — not a mock of your own assumptions about either.

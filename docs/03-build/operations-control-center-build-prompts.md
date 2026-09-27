@@ -1,5 +1,9 @@
 # Build prompt: Operations Control Center for `usdt-settlement-corridor`
 
+> **Background (history).** Written during the design and build phase and kept as a
+> record. You don't need it to run or change today's product: start at
+> [docs/README.md](../README.md).
+
 > **Status: not built, not reconciled.** While this doc was being written on
 > `origin/main`, a simpler operator dashboard covering much of the same need
 > was independently designed and built on another branch — see

@@ -1,5 +1,9 @@
 # C1 — Ledger Core: sequenced build prompts
 
+> **Background (history).** Written during the design and build phase and kept as a
+> record. You don't need it to run or change today's product: start at
+> [docs/README.md](../README.md).
+
 **Target:** Go + PostgreSQL. **Consumer:** an AI coding agent (Claude Code or equivalent).
 
 **How to use this file.** Paste §0 once at the start of the session — it is standing context the agent must hold for every chunk. Then paste chunks C1.0 → C1.10 one at a time, in order. Do not move to the next chunk until the current chunk's acceptance criteria pass. Each chunk is deliberately small enough to review in one sitting.

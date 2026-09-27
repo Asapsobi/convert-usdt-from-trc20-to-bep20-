@@ -1,3 +1,7 @@
+# NOTE (27 Sep 2026): this is not how to run the product locally -- use
+# scripts/dev.sh (see docs/local-setup.md). This file belongs to the earlier
+# "Model D" proof-run setup and has never been run with a real Docker daemon.
+#
 # Stands up the whole MVP: C1-C5, S1, C6 (the API gateway), the proofrun
 # driver, and the ops console, each service against its own real Postgres
 # (the ops console owns no database -- see its own section below). Scoped

@@ -1,3 +1,7 @@
+# NOTE (27 Sep 2026): this is not how to run the product locally -- use
+# scripts/dev.sh (see docs/local-setup.md). This file belongs to the earlier
+# "Model D" proof-run setup and has never been run with a real Docker daemon.
+#
 # Shared build for every Go module in this repo (ledger/, depositwatcher/,
 # screening/, energybroker/, dispatcher/, s1/, gateway/, proofrun/,
 # opsconsole/, tronwatcher/, relayd/) -- one Dockerfile, parametrized by

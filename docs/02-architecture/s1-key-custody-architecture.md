@@ -1,5 +1,9 @@
 # S1 — Key management / signing: custody architecture
 
+> **Design reference.** Describes a part that exists today, as designed at the time;
+> later changes may not be reflected here. For the current system see
+> [how-it-works.md](../how-it-works.md).
+
 _v1.0, 8 Sep 2026. Closes the gap `component-map.md` names but never designs
 ("S1 Keys — required before C5 touches mainnet") and the one
 `c5-payout-dispatcher-build-prompts.md`'s "Read this first" section explicitly

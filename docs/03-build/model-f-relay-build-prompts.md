@@ -1,5 +1,9 @@
 # Model F — zero-float relay: build prompts
 
+> **Background (history).** Written during the design and build phase and kept as a
+> record. You don't need it to run or change today's product: start at
+> [docs/README.md](../README.md).
+
 _13 Sep 2026. Turns `docs/02-architecture/model-f-relay-architecture.md`'s decisions
 into sequenced chunks (R0 → R6), written to be handed to an AI coding agent one chunk
 at a time — same convention as `c1-ledger-build-prompts.md` etc. Each chunk assumes the

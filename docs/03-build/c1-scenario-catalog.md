@@ -1,5 +1,9 @@
 # C1 / settlement corridor — full scenario catalog
 
+> **Design reference.** Describes a part that exists today, as designed at the time;
+> later changes may not be reflected here. For the current system see
+> [how-it-works.md](../how-it-works.md).
+
 _Companion to `c1-ledger-build-prompts.md` and `component-map.md`. Answers one question: what is the complete list of things that can happen to money in this corridor, and which of them are already engineered away versus which are irreducible risk that has to be priced, capped, or insured rather than fixed._
 
 ## How to read this

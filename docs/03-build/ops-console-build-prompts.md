@@ -1,5 +1,9 @@
 # Ops Console — build prompts
 
+> **Design reference.** Describes a part that exists today, as designed at the time;
+> later changes may not be reflected here. For the current system see
+> [how-it-works.md](../how-it-works.md).
+
 > **This is the built one.** A separate, much larger, unbuilt design for the
 > same "operator dashboard" concern exists at
 > `operations-control-center-build-prompts.md` — written independently on
