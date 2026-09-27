@@ -1,5 +1,9 @@
 # Product & operations architecture — decisions record
 
+> **Background (history).** Written during the design and build phase and kept as a
+> record. You don't need it to run or change today's product: start at
+> [docs/README.md](../README.md).
+
 _v1.0, 30 Aug 2026. Full document: interactive artifact "TRC20 Payout Engine" (claude.ai artifact gallery). Builds on `docs/01-strategy/findings-and-recommendation.md` — market viability is settled, not re-litigated here._
 
 Baseline carried through every number: TRX $0.34 · 74,750 blended energy per payout (85/15 existing/fresh at 65k/130k) · $255k working float.

@@ -1,5 +1,9 @@
 # C5 — Payout dispatcher (TRON): sequenced build prompts
 
+> **Background (history).** Written during the design and build phase and kept as a
+> record. You don't need it to run or change today's product: start at
+> [docs/README.md](../README.md).
+
 **Target:** Go + PostgreSQL, matching C1–C4's stack. **Consumer:** an AI coding agent (Claude Code or equivalent), same usage pattern as the prior build-prompt docs.
 
 **How to use this file.** Paste §0 once at the start of the session. Then paste chunks C5.0 → C5.11 one at a time, in order. Do not move to the next chunk until the current chunk's acceptance criteria pass. **More than any prior component, do not skip the "Read this" sections below** — one of them is not a documentation gap, it is the literal absence of any code anywhere in this repository that can sign a TRON transaction.

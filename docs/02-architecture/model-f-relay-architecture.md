@@ -1,5 +1,9 @@
 # Model F — zero-float relay: architecture
 
+> **Design reference.** Describes a part that exists today, as designed at the time;
+> later changes may not be reflected here. For the current system see
+> [how-it-works.md](../how-it-works.md).
+
 _13 Sep 2026. Decomposition for `docs/01-strategy/model-f-relay-findings.md`'s decision
 to build. Does not re-open `component-map.md` or `product-operations-architecture.md`
 — this is a second product line reusing C1/C3/C4/S1 as a substrate, not a replacement

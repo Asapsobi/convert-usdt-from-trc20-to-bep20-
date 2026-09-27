@@ -1,5 +1,9 @@
 # MVP proof run — decisions, deferred scope, and the next-stage prompt
 
+> **Background (history).** Written during the design and build phase and kept as a
+> record. You don't need it to run or change today's product: start at
+> [docs/README.md](../README.md).
+
 _Written 8 Sep 2026, from a cloud session working alongside the local session that's been building C1–C5/S1. Captures a scoping conversation that happened outside a commit: the "final MVP" end-to-end target (`c6-api-gateway-build-prompts.md`'s own eventual consumer, and the customer-facing flow `product-operations-architecture.md` describes) is real, but proving the pipeline works at all doesn't require building it in full first. This document is that narrower plan, so the next person picking this up doesn't have to reconstruct why the scope is smaller than the original MVP target — see "Read this first" below for the one thing that made mainnet non-optional for it, which took a real code check to find, not a spec read.**This document has not yet been reviewed against any code by a session other than the one that wrote it — treat the audit steps in §2 as required, not a formality.**
 
 ---

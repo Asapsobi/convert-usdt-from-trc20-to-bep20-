@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
+	"time"
 
 	"relayd/internal/upstream"
 	"relayd/internal/vendors"
@@ -19,6 +21,8 @@ import (
 //     (or UPSTREAM_BEST_RATE_PROVIDERS), e.g. "fixedfloat,changenow" --
 //     each opted in explicitly, never just because credentials exist
 //   - "placeholder" (with UPSTREAM_ALLOW_PLACEHOLDER=true): no vendor at all
+//   - "demo" (with UPSTREAM_ALLOW_DEMO=true): a simulated vendor, for trying
+//     the product locally without any vendor account
 func upstreamProviderFromEnv(ctx context.Context, store *vendors.Store) (upstream.SwapProvider, string, error) {
 	name := os.Getenv("UPSTREAM_PROVIDER")
 	var names []string
@@ -26,13 +30,30 @@ func upstreamProviderFromEnv(ctx context.Context, store *vendors.Store) (upstrea
 	case "":
 		return nil, "", fmt.Errorf("relayd: UPSTREAM_PROVIDER is not set -- set UPSTREAM_PROVIDER=fixedfloat, " +
 			"UPSTREAM_PROVIDER=changenow, UPSTREAM_PROVIDER=sideshift, or UPSTREAM_PROVIDER=router for a real vendor (or vendors), " +
-			"or UPSTREAM_PROVIDER=placeholder and UPSTREAM_ALLOW_PLACEHOLDER=true to run against a placeholder")
+			"or UPSTREAM_PROVIDER=placeholder and UPSTREAM_ALLOW_PLACEHOLDER=true to run against a placeholder, " +
+			"or UPSTREAM_PROVIDER=demo and UPSTREAM_ALLOW_DEMO=true to try the product locally")
 	case "placeholder":
 		if os.Getenv("UPSTREAM_ALLOW_PLACEHOLDER") != "true" {
 			return nil, "", fmt.Errorf("relayd: UPSTREAM_PROVIDER=placeholder also requires UPSTREAM_ALLOW_PLACEHOLDER=true " +
 				"-- upstream.PlaceholderProvider answers every call with ErrNoVendorConfigured, never a real quote")
 		}
 		return upstream.PlaceholderProvider{}, "placeholder", nil
+	case "demo":
+		// Quotes and orders come from upstream.MockProvider: nothing reaches a
+		// real exchange, and its deposit addresses are not real addresses, so
+		// nothing can ever be forwarded to it. Never part of a router list.
+		if os.Getenv("UPSTREAM_ALLOW_DEMO") != "true" {
+			return nil, "", fmt.Errorf("relayd: UPSTREAM_PROVIDER=demo also requires UPSTREAM_ALLOW_DEMO=true " +
+				"-- the demo vendor simulates quotes and orders and must never serve real customers")
+		}
+		slog.Warn("relayd: UPSTREAM_PROVIDER=demo -- quotes and orders are simulated; never use this with real deposits")
+		router, err := vendors.NewConversionRouter(ctx, store, map[string]upstream.SwapProvider{
+			"demo": upstream.NewMockProvider("demo", time.Now().UnixNano()),
+		})
+		if err != nil {
+			return nil, "", err
+		}
+		return router, "demo", nil
 	case "fixedfloat", "changenow", "sideshift":
 		names = []string{name}
 	case "router", "best_rate":
@@ -51,7 +72,7 @@ func upstreamProviderFromEnv(ctx context.Context, store *vendors.Store) (upstrea
 			}
 		}
 	default:
-		return nil, "", fmt.Errorf("relayd: unrecognized UPSTREAM_PROVIDER %q (supported: \"fixedfloat\", \"changenow\", \"sideshift\", \"router\", \"placeholder\")", name)
+		return nil, "", fmt.Errorf("relayd: unrecognized UPSTREAM_PROVIDER %q (supported: \"fixedfloat\", \"changenow\", \"sideshift\", \"router\", \"placeholder\", \"demo\")", name)
 	}
 
 	providers := make(map[string]upstream.SwapProvider, len(names))

@@ -1,5 +1,9 @@
 # C4 — Energy broker: sequenced build prompts
 
+> **Background (history).** Written during the design and build phase and kept as a
+> record. You don't need it to run or change today's product: start at
+> [docs/README.md](../README.md).
+
 **Target:** Go + PostgreSQL, matching C1/C2/C3's stack. **Consumer:** an AI coding agent (Claude Code or equivalent), same usage pattern as the prior build-prompt docs.
 
 **How to use this file.** Paste §0 once at the start of the session — standing context the agent must hold for every chunk. Then paste chunks C4.0 → C4.9 one at a time, in order. Do not move to the next chunk until the current chunk's acceptance criteria pass against a real (or sandbox) vendor endpoint, not a mock of your own assumptions about one.

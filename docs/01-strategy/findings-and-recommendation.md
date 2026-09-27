@@ -1,5 +1,9 @@
 # USDT BEP20 → TRC20 settlement layer — findings and recommendation
 
+> **Background (history).** Written during the design and build phase and kept as a
+> record. You don't need it to run or change today's product: start at
+> [docs/README.md](../README.md).
+
 _Assessment completed August 2026. Full report: interactive artifact + `USDT-Settlement-Corridor.docx`._
 
 ## Verdict
