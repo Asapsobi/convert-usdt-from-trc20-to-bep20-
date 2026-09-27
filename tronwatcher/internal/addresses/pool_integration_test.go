@@ -84,6 +84,57 @@ func TestPool_ReusesWalletsWithinItsLimit(t *testing.T) {
 	}
 }
 
+// A wallet that has received a deposit is leased before one that never
+// has, even when the unused one has been idle longer. While the used one
+// is busy, the unused one is leased rather than a new wallet created.
+func TestPool_PrefersWalletsThatWereUsedBefore(t *testing.T) {
+	pool := freshPool(t, 3, 0, 0)
+	ctx := context.Background()
+
+	a, b := uniqueOrderID(), uniqueOrderID()
+	unused, err := assign(t, pool, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	used, err := assign(t, pool, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordDeposit(t, pool, used, b, "REPORTED")
+	recordDeposit(t, pool, unused, a, "DROPPED") // reorged away: never really funded
+	if err := addresses.Retire(ctx, pool, a, "expired"); err != nil {
+		t.Fatal(err)
+	}
+	if err := addresses.Retire(ctx, pool, b, "settled"); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, err := assign(t, pool, uniqueOrderID()); err != nil || got != used {
+		t.Fatalf("both wallets free: got %s, %v; want the used wallet %s", got, err, used)
+	}
+	if got, err := assign(t, pool, uniqueOrderID()); err != nil || got != unused {
+		t.Fatalf("used wallet busy: got %s, %v; want the unused wallet %s", got, err, unused)
+	}
+	wallets, err := addresses.ListPool(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wallets) != 2 {
+		t.Fatalf("a free wallet existed, yet the pool grew to %d wallets", len(wallets))
+	}
+}
+
+// recordDeposit stores a deposit to addr for orderID, as the scanner would.
+func recordDeposit(t *testing.T, pool *pgxpool.Pool, addr addresses.Address, orderID int64, status string) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO deposits (tx_id, address, order_id, external_id, customer_id, amount, sender_address, block_time, classification, status)
+		VALUES ($1, $2, $3, $4, 'cust-pool', 1000000, 'TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf', now(), 0, $5)
+	`, fmt.Sprintf("pool-test-%d", orderID), string(addr), orderID, fmt.Sprintf("ext-pool-%d", orderID), status); err != nil {
+		t.Fatalf("recording a deposit to %s: %v", addr, err)
+	}
+}
+
 // An order that expired unpaid starts the long cooldown: its customer may
 // still pay late, and that payment must not land in the next order.
 func TestPool_ExpiredLeaseCoolsDownBeforeReuse(t *testing.T) {

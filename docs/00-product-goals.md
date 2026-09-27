@@ -66,6 +66,25 @@ significantly easier and less expensive.
 This is particularly important for the TRON network, where transaction resource
 requirements can create additional operational costs.
 
+### Reuse before adding (added 27 Sep 2026)
+
+Every wallet brought into use adds cost: its own gas or resource top-ups, its
+own profit sweep, and on TRON a one-time activation fee (about 1.1 TRX). So:
+
+* A new deposit wallet is created only when every existing wallet is busy —
+  leased to an open order, or cooling down after one — or when an
+  administrator adds one by hand.
+* Among free wallets, one that has received a deposit before is always chosen
+  before one that never has.
+* Each network's pool has a maximum size, set by an administrator. When every
+  wallet is busy and the pool is full, new orders are asked to try again
+  shortly.
+
+After each order a wallet cools down before its next one, so a late payment
+from the previous customer is never credited to the next customer. By default
+that is 30 minutes after a completed order and 6 hours after an order expires
+unpaid (its customer may still pay late); an administrator can change both.
+
 ## 4. BEP-20 Wallet Requirements
 
 For BEP-20 deposit wallets, the system must check whether the wallet has

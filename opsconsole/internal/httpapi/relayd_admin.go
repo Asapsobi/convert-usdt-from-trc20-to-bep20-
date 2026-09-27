@@ -346,7 +346,7 @@ const relaydPoolContent = relaydNav + `
 small keeps profit in few wallets and sweeps cheap. A disabled wallet is never handed out again.</p>
 {{ with .Settings }}
 <form method="post" action="/relayd/pool/{{ $.Chain }}/settings" class="card">
-  <label>Most wallets the pool may grow to (0 = no limit)</label><input type="number" name="max_wallets" min="0" value="{{ .MaxWallets }}">
+  <label>Most wallets the pool may grow to (0 = never add a new one)</label><input type="number" name="max_wallets" min="0" value="{{ .MaxWallets }}">
   <label>Cooldown after a finished order (e.g. 30m)</label><input type="text" name="cooldown_after_use" value="{{ .CooldownAfterUse }}">
   <label>Cooldown after an unpaid, expired order (e.g. 6h)</label><input type="text" name="cooldown_after_expiry" value="{{ .CooldownAfterExpiry }}">
   <p><button type="submit">Save</button></p>
