@@ -100,6 +100,12 @@ func formatRaw(raw *big.Int, decimals int) string {
 }
 
 // vendorPrices asks every configured vendor for its live price.
+// orderEnergyUnits is the most energy one order's TRON transfer needs:
+// sending USDT to an address that has never held any (order 16 needed
+// 130,285). The admin panel measures an energy vendor's prepaid balance in
+// orders of this size.
+const orderEnergyUnits = 131_000
+
 func vendorPrices(ctx context.Context, d *driver.Driver, orch *orchestrate.Orchestrator, amount string) (any, error) {
 	out := map[string]any{"amount": amount}
 	if router, ok := d.Upstream.(*vendors.ConversionRouter); ok {
@@ -124,6 +130,12 @@ func vendorPrices(ctx context.Context, d *driver.Driver, orch *orchestrate.Orche
 		}
 	}
 	if energy, ok := orch.Energy.(*vendors.EnergyRouter); ok {
+		orderCost := map[string]int64{}
+		for _, q := range energy.QuoteEach(ctx, orderEnergyUnits) {
+			if q.Err == nil && q.CostSun > 0 {
+				orderCost[q.Vendor] = q.CostSun
+			}
+		}
 		var rows []map[string]string
 		for _, q := range energy.QuoteEach(ctx, 65_000) {
 			row := map[string]string{"vendor": q.Vendor, "units": fmt.Sprint(q.Units)}
@@ -131,6 +143,20 @@ func vendorPrices(ctx context.Context, d *driver.Driver, orch *orchestrate.Orche
 				row["error"] = q.Err.Error()
 			} else {
 				row["cost_trx"] = formatRaw(big.NewInt(q.CostSun), 6)
+			}
+			cost, priced := orderCost[q.Vendor]
+			if priced {
+				row["order_units"] = fmt.Sprint(orderEnergyUnits)
+				row["order_cost_trx"] = formatRaw(big.NewInt(cost), 6)
+			}
+			if acct, ok, err := energy.Account(ctx, q.Vendor); ok && err != nil {
+				row["balance_error"] = err.Error()
+			} else if ok {
+				row["balance_trx"] = formatRaw(big.NewInt(acct.BalanceSun), 6)
+				row["top_up_address"] = acct.TopUpAddress
+				if priced {
+					row["orders_covered"] = fmt.Sprint(acct.BalanceSun / cost)
+				}
 			}
 			rows = append(rows, row)
 		}

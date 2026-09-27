@@ -23,6 +23,19 @@ type EnergyVendor interface {
 	Rent(ctx context.Context, target string, units int64) (Rental, error)
 }
 
+// EnergyAccountReader is an energy vendor that can report our prepaid
+// account with it.
+type EnergyAccountReader interface {
+	Account(ctx context.Context) (EnergyAccount, error)
+}
+
+// EnergyAccount is our prepaid account with an energy vendor: rentals are
+// paid from its balance.
+type EnergyAccount struct {
+	BalanceSun   int64
+	TopUpAddress string // TRX sent here tops the balance up
+}
+
 // Rental is a vendor's accepted rental.
 type Rental struct {
 	OrderID string
@@ -146,6 +159,17 @@ type EnergyQuote struct {
 	Units   int64
 	CostSun int64
 	Err     error
+}
+
+// Account reads our prepaid account with the vendor called name. ok is
+// false when that vendor can't report one.
+func (r *EnergyRouter) Account(ctx context.Context, name string) (acct EnergyAccount, ok bool, err error) {
+	reader, ok := r.vendors[name].(EnergyAccountReader)
+	if !ok {
+		return EnergyAccount{}, false, nil
+	}
+	acct, err = reader.Account(ctx)
+	return acct, true, err
 }
 
 // QuoteEach asks every configured energy vendor for its price on units
