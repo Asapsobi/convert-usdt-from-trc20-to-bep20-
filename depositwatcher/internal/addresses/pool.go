@@ -15,6 +15,11 @@ import (
 // treasury cheap. A wallet that finishes a lease cools down before its
 // next one, so a late payment from the previous customer is recorded as
 // orphaned instead of being credited to the next customer.
+//
+// Every wallet brought into use costs money, so a new wallet is created
+// only when every existing one is leased or cooling down, and a wallet
+// that has never received a deposit is leased only while every one that
+// has is busy.
 
 // ErrNoWalletAvailable means every pool wallet is leased or cooling down
 // and the pool is already at its configured size.
@@ -88,6 +93,12 @@ func PutPoolSettings(ctx context.Context, q Queryer, s PoolSettings) error {
 // one statement. ok is false when the order already has a lease, no
 // wallet was eligible, or another order took the same wallet first -- the
 // caller tells those apart.
+//
+// A wallet that has received a deposit before goes first (one later
+// dropped by a reorg doesn't count). A never-used wallet joins the flow
+// only while every used one is busy, since each wallet in use needs its
+// own gas top-ups and its own profit sweep. Within each group, the wallet
+// leased longest ago goes first.
 func leaseFromPool(ctx context.Context, q Queryer, orderID int64, externalID, customerID string, quotedAt, quoteExpiresAt time.Time) (Address, bool, error) {
 	var addr string
 	err := q.QueryRow(ctx, `
@@ -97,7 +108,8 @@ func leaseFromPool(ctx context.Context, q Queryer, orderID int64, externalID, cu
 		FROM pool_wallets pw
 		WHERE pw.status = 'ACTIVE' AND pw.available_after <= now()
 			AND NOT EXISTS (SELECT 1 FROM watched_addresses wa WHERE wa.address = pw.address AND wa.status <> 'RETIRED')
-		ORDER BY pw.last_leased_at NULLS FIRST, pw.derivation_index
+		ORDER BY EXISTS (SELECT 1 FROM deposits d WHERE d.address = pw.address AND d.status <> 'DROPPED') DESC,
+			pw.last_leased_at NULLS FIRST, pw.derivation_index
 		LIMIT 1
 		ON CONFLICT DO NOTHING
 		RETURNING address
