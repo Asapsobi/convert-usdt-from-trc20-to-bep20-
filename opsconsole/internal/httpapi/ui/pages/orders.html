@@ -1,0 +1,45 @@
+{{ define "content" }}
+<div class="tabs">
+  {{ range .Tabs }}<a href="{{ .URL }}" class="{{ if .Active }}active{{ end }}">{{ .Label }}<span class="n">{{ .Count }}</span></a>{{ end }}
+</div>
+<form class="toolbar" method="get" action="/orders">
+  {{ if ne .Tab "all" }}<input type="hidden" name="tab" value="{{ .Tab }}">{{ end }}
+  {{ with .Status }}<input type="hidden" name="status" value="{{ . }}">{{ end }}
+  <input type="search" name="q" value="{{ .Query }}" placeholder="Search order, address, customer, exchange order…">
+  <select name="dir">
+    <option value="">Both directions</option>
+    <option value="BEP20_TO_TRC20"{{ if eq .Dir "BEP20_TO_TRC20" }} selected{{ end }}>BSC → TRON</option>
+    <option value="TRC20_TO_BEP20"{{ if eq .Dir "TRC20_TO_BEP20" }} selected{{ end }}>TRON → BSC</option>
+  </select>
+  <button class="btn" type="submit">Filter</button>
+  {{ if or .Query .Dir .Status }}<a class="btn btn-ghost" href="/orders">Clear</a>{{ end }}
+  {{ with .Status }}<span class="muted small">Showing status: {{ template "status" . }}</span>{{ end }}
+</form>
+<div class="card card-flush">
+  <div class="table-wrap"><table>
+    <thead><tr><th>Created</th><th>Order</th><th>Customer</th><th>Direction</th><th class="num">Sent</th><th class="num">Receives</th><th class="num">Our fee</th><th>Status</th></tr></thead>
+    <tbody>
+    {{ range .Orders }}
+    <tr class="{{ if eq (statusTone .Status) "bad" }}row-bad{{ end }}">
+      <td class="nowrap">{{ template "time" (parseTime .CreatedAt) }}</td>
+      <td><a href="/orders/{{ .ExternalID }}" title="{{ .ExternalID }}">{{ short .ExternalID }}</a><div class="muted small">#{{ .OrderID }}</div></td>
+      <td>{{ with .CustomerLabel }}{{ . }}{{ else }}<span class="muted">{{ short .CustomerID }}</span>{{ end }}</td>
+      <td>{{ template "dir" .Direction }}</td>
+      <td class="num">{{ if .ReceivedAmount }}{{ num (deref .ReceivedAmount) }}{{ else }}<span class="muted" title="quoted">{{ num .AmountIn }}</span>{{ end }}</td>
+      <td class="num">{{ if .AmountOutActual }}{{ num (deref .AmountOutActual) }}{{ else }}<span class="muted" title="expected">≈ {{ num .AmountOutExpected }}</span>{{ end }}</td>
+      <td class="num">{{ with .ProfitAmount }}{{ num . }}{{ else }}<span class="muted">—</span>{{ end }}</td>
+      <td>{{ template "status" .Status }}</td>
+    </tr>
+    {{ else }}
+    <tr><td colspan="8" class="empty">No orders match.</td></tr>
+    {{ end }}
+    </tbody>
+  </table></div>
+  {{ if gt .Pages 1 }}
+  <div class="pager">
+    <span>Page {{ .Page }} of {{ .Pages }} · {{ .Total }} orders</span>
+    <span class="btn-row">{{ with .PrevURL }}<a class="btn btn-sm" href="{{ . }}">← Newer</a>{{ end }}{{ with .NextURL }}<a class="btn btn-sm" href="{{ . }}">Older →</a>{{ end }}</span>
+  </div>
+  {{ end }}
+</div>
+{{ end }}

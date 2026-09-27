@@ -1,0 +1,26 @@
+{{ define "content" }}
+{{ if not .HasApproverToken }}
+<div class="alert alert-info" style="margin-bottom:16px"><div class="body">To approve or reject, log out and log in again with your S1 approver token.</div></div>
+{{ end }}
+<div class="card card-flush">
+  <div class="table-wrap"><table>
+    <thead><tr><th>Requested</th><th>Request</th><th>Signing key</th><th class="num">Worth about</th><th>Decision</th></tr></thead>
+    <tbody>
+    {{ range .Requests }}
+    <tr>
+      <td class="nowrap">{{ template "time" .CreatedAt }}</td>
+      <td class="mono">#{{ .ID }}</td>
+      <td>slot {{ .SlotID }}</td>
+      <td class="num">${{ printf "%.2f" .EstimatedUSD }}</td>
+      <td>{{ if $.HasApproverToken }}
+        <form class="inline" method="post" action="/approvals/{{ .ID }}/approve" data-confirm="Approve signature #{{ .ID }} worth about ${{ printf "%.2f" .EstimatedUSD }}?"><button class="btn btn-sm btn-primary" type="submit">Approve</button></form>
+        <form class="inline" method="post" action="/approvals/{{ .ID }}/reject" data-confirm="Reject signature #{{ .ID }}?"><button class="btn btn-sm btn-danger" type="submit">Reject</button></form>
+      {{ else }}<span class="muted">needs approver token</span>{{ end }}</td>
+    </tr>
+    {{ else }}
+    <tr><td colspan="5" class="empty">No signature is waiting for approval.</td></tr>
+    {{ end }}
+    </tbody>
+  </table></div>
+</div>
+{{ end }}

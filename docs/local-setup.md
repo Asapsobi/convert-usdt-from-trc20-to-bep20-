@@ -75,11 +75,12 @@ an amount and a destination wallet, and click *See what I'll receive*. Confirm,
 and you get an order page with a deposit address from the local wallet pool.
 (Don't pay into it; see the warning above.)
 
-**As an operator:** log in to the admin panel. *Orders* lists orders, each
-with its money trail; *Pricing* sets the margin per direction; *Vendors* shows
-the simulated exchange; *BSC wallets* and *TRON wallets* show the pools and
-which wallet serves which order; *Profit & sweeps* shows balances and sweep
-settings.
+**As an operator:** log in to the admin panel. *Overview* lists anything that
+needs you (low balances, stuck orders, a watcher falling behind) with today's
+numbers; *Orders* has every order, and each order page shows what happened
+step by step with links to the blockchain; *Pricing* sets the fee per direction
+and checks live prices; *Vendors*, *Deposit wallets*, *Treasury & profit* and
+*System* cover the rest.
 
 **Through the API:**
 

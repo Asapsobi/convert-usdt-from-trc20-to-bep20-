@@ -60,6 +60,10 @@ type Admin struct {
 	// Balance reads what an address holds on chain ("BSC" or "TRON").
 	// Optional.
 	Balance func(ctx context.Context, chain, address string) (WalletBalance, error)
+	// Stats sums the books for the admin panel's overview. Optional.
+	Stats func(ctx context.Context) (any, error)
+	// Energy reads each energy vendor's prepaid account. Optional.
+	Energy func(ctx context.Context) (any, error)
 }
 
 // TreasuryWallet is one treasury wallet's S1 slot and addresses.
@@ -131,6 +135,8 @@ func (a *Admin) require(next http.Handler) http.Handler {
 func (s *Server) adminRoutes(r chi.Router) {
 	r.Use(s.Admin.require)
 	r.Get("/overview", s.getAdminOverview)
+	r.Get("/stats", s.getAdminStats)
+	r.Get("/energy", s.getAdminEnergy)
 	r.Get("/pricing", s.getPricing)
 	r.Put("/pricing", s.putPricing)
 	r.Get("/vendors", s.getVendors)
@@ -721,6 +727,35 @@ func (s *Server) getTreasury(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	out["wallets"] = wallets
+	respondJSON(w, http.StatusOK, out)
+}
+
+// getAdminStats is the overview's numbers: orders by status, volume,
+// profit and network costs per period, and orders needing attention.
+func (s *Server) getAdminStats(w http.ResponseWriter, r *http.Request) {
+	s.respondOptional(w, r, s.Admin.Stats, 10*time.Second)
+}
+
+// getAdminEnergy is each energy vendor's prepaid balance, what one order's
+// energy costs, and how many orders the balance covers.
+func (s *Server) getAdminEnergy(w http.ResponseWriter, r *http.Request) {
+	s.respondOptional(w, r, s.Admin.Energy, 30*time.Second)
+}
+
+// respondOptional answers with what an optional admin source returns, or
+// 503 when this relayd has none configured.
+func (s *Server) respondOptional(w http.ResponseWriter, r *http.Request, source func(context.Context) (any, error), timeout time.Duration) {
+	if source == nil {
+		writeError(w, http.StatusServiceUnavailable, errNotConfigured)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+	out, err := source(ctx)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
 	respondJSON(w, http.StatusOK, out)
 }
 

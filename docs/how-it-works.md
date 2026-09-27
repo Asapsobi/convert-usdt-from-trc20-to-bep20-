@@ -177,10 +177,14 @@ are off until an admin turns them on (Sweeps page).
 - The ledger holds a double-entry record of every order.
 - relayd keeps, per order: deposit, sender, profit, amount forwarded, exchange
   fee, payout transaction, and each network-fee cost.
-- The admin panel (`opsconsole`) shows orders with their full money trail,
-  pricing, vendors and live rates, both wallet pools, treasury and deposit
-  wallet balances, and sweeps. Every change made there is written to an audit
-  log.
+- The admin panel (`opsconsole`) opens on an overview of what needs attention
+  (orders stuck or failed, late payments, low treasury or CatFee balances, an
+  exchange out of rotation, a watcher behind the chain, a service down) and the
+  day's numbers. It also has every order with a step-by-step story and
+  blockchain links, unmatched deposits to refund, pricing with a live price
+  check, vendors, both wallet pools, treasury and profit with sweeps, screening
+  holds, signing approvals, system health with an emergency stop, and an audit
+  log of every change made there.
 
 ## Where it runs
 

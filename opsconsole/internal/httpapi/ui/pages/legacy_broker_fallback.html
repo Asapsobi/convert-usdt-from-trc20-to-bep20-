@@ -1,0 +1,18 @@
+{{ define "content" }}
+<p><a href="/legacy/broker">← Reservations</a></p>
+<div class="card card-flush">
+  <div class="table-wrap"><table>
+    <thead><tr><th>ID</th><th>Reason</th><th>Triggered</th><th>Resolved</th></tr></thead>
+    <tbody>
+    {{ range .Events }}
+    <tr>
+      <td class="mono">{{ .ID }}</td><td>{{ .Reason }}</td><td class="nowrap">{{ template "time" .TriggeredAt }}</td>
+      <td>{{ with .ResolvedAt }}{{ template "time" . }}{{ else }}
+        <form class="inline" method="post" action="/legacy/broker/fallback/{{ .ID }}/resolve">
+          <input type="text" name="resolution" placeholder="resolution" class="w-md" required><button class="btn btn-sm" type="submit">Resolve</button></form>{{ end }}</td>
+    </tr>
+    {{ else }}<tr><td colspan="4" class="empty">No fallback events.</td></tr>{{ end }}
+    </tbody>
+  </table></div>
+</div>
+{{ end }}

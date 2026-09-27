@@ -1,0 +1,91 @@
+{{ define "content" }}
+<div class="stack">
+  <div class="card">
+    <div class="card-head"><h2>Needs attention</h2><span class="muted small">Checked {{ template "ago" .GeneratedAt }} · refreshes every minute</span></div>
+    {{ range .Attention }}
+    <div class="alert alert-{{ .Tone }}"><div>
+      <div class="title">{{ .Title }}</div>
+      {{ if or .Detail .Link }}<div class="body">{{ .Detail }}{{ if .Link }} <a href="{{ .Link }}">{{ .LinkText }} →</a>{{ end }}</div>{{ end }}
+    </div></div>
+    {{ else }}
+    <div class="alert alert-ok"><div><div class="title">All clear</div><div class="body">Every service answers, balances are healthy and no order is waiting for you.</div></div></div>
+    {{ end }}
+  </div>
+
+  {{ if .StatsOK }}
+  <div class="grid grid-4">
+    <div class="card kpi">
+      <div class="label">Orders · last 24 h</div>
+      <div class="value">{{ .Day.Orders }}</div>
+      <div class="sub">{{ .Day.Settled }} completed · {{ .Week.Orders }} in 7 days</div>
+    </div>
+    <div class="card kpi">
+      <div class="label">Volume · last 24 h</div>
+      <div class="value">{{ num .Day.Volume }} <span class="muted small">USDT</span></div>
+      <div class="sub">{{ num .Week.Volume }} in 7 days · {{ num .All.Volume }} in total</div>
+    </div>
+    <div class="card kpi">
+      <div class="label">Profit · last 24 h</div>
+      <div class="value">{{ num .Day.Profit }} <span class="muted small">USDT</span></div>
+      <div class="sub">{{ num .Week.Profit }} in 7 days · {{ num .All.Profit }} in total</div>
+    </div>
+    <div class="card kpi">
+      <div class="label">Network costs · last 7 days</div>
+      <div class="value" style="font-size:17px">{{ num .Week.GasBNB }} <span class="muted small">BNB</span> · {{ num .Week.EnergyTRX }} <span class="muted small">TRX energy</span></div>
+      <div class="sub">plus {{ num .Week.TRX }} TRX in top-ups · paid from the treasury</div>
+    </div>
+  </div>
+  {{ end }}
+
+  <div class="grid grid-2">
+    <div class="card">
+      <div class="card-head"><h2>Balances</h2><a href="/treasury" class="small">Treasury &amp; profit →</a></div>
+      <div class="table-wrap"><table>
+        <tbody>
+        {{ with .Treasury }}
+        <tr><td>{{ template "chain" "BSC" }} Treasury</td><td>{{ template "addr" .BSC.Treasury }}</td><td class="num">{{ template "balance" .BSC.Balance }}</td></tr>
+        <tr><td>{{ template "chain" "TRON" }} Treasury</td><td>{{ template "addr" .TRON.Treasury }}</td><td class="num">{{ template "balance" .TRON.Balance }}</td></tr>
+        {{ else }}<tr><td colspan="3" class="muted">Treasury balances are unavailable.</td></tr>{{ end }}
+        {{ range .Energy }}
+        <tr{{ if eq (index . "orders_covered") "0" }} class="row-bad"{{ end }}><td>{{ index . "vendor" }} energy</td><td>{{ template "addr" (index . "top_up_address") }}</td>
+          <td class="num">{{ with index . "balance_trx" }}{{ num . }} TRX{{ end }}{{ with index . "orders_covered" }} · covers {{ . }} order(s){{ end }}{{ index . "balance_error" }}</td></tr>
+        {{ end }}
+        {{ range $asset, $amount := .Unswept }}
+        <tr><td>Unswept profit</td><td><span class="chip chip-{{ if eq $asset "USDT_BEP20" }}bsc">BSC{{ else }}tron">TRON{{ end }}</span></td><td class="num">{{ num $amount }} USDT</td></tr>
+        {{ end }}
+        </tbody>
+      </table></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>Orders by status</h2><a href="/orders" class="small">All orders →</a></div>
+      <div class="btn-row" style="margin-bottom:18px">
+        {{ if not .StatsOK }}<span class="muted">Order figures are unavailable right now.</span>{{ else }}{{ range .ByStatus }}<a href="/orders?status={{ .Status }}" class="badge tone-{{ statusTone .Status }}">{{ statusLabel .Status }} · {{ .Count }}</a>{{ else }}<span class="muted">No orders yet.</span>{{ end }}{{ end }}
+      </div>
+      <h3>System</h3>
+      <div class="grid grid-3" style="gap:8px">
+        {{ range .Services }}<div class="health" title="{{ .Error }}"><span class="dot-s {{ if .Healthy }}dot-ok{{ else }}dot-bad{{ end }}"></span>{{ .Name }}</div>{{ end }}
+        {{ with .BSCLag }}{{ $lag := derefInt . }}<div class="health"><span class="dot-s {{ if gt $lag 400 }}dot-warn{{ else }}dot-ok{{ end }}"></span>BSC watcher {{ $lag }} blocks behind</div>{{ end }}
+      </div>
+    </div>
+  </div>
+
+  <div class="card card-flush">
+    <div class="card-head"><h2>Recent orders</h2><a href="/orders" class="small">All orders →</a></div>
+    <div class="table-wrap" style="margin-top:12px"><table>
+      <thead><tr><th>Created</th><th>Order</th><th>Direction</th><th class="num">Sent</th><th class="num">Receives</th><th>Status</th></tr></thead>
+      <tbody>
+      {{ range .Recent }}
+      <tr>
+        <td class="nowrap">{{ template "ago" (parseTime .CreatedAt) }}</td>
+        <td><a href="/orders/{{ .ExternalID }}">{{ short .ExternalID }}</a></td>
+        <td>{{ template "dir" .Direction }}</td>
+        <td class="num">{{ if .ReceivedAmount }}{{ num (deref .ReceivedAmount) }}{{ else }}<span class="muted">{{ num .AmountIn }}</span>{{ end }}</td>
+        <td class="num">{{ if .AmountOutActual }}{{ num (deref .AmountOutActual) }}{{ else }}<span class="muted">≈ {{ num .AmountOutExpected }}</span>{{ end }}</td>
+        <td>{{ template "status" .Status }}</td>
+      </tr>
+      {{ else }}<tr><td colspan="6" class="empty">No orders yet.</td></tr>{{ end }}
+      </tbody>
+    </table></div>
+  </div>
+</div>
+{{ end }}

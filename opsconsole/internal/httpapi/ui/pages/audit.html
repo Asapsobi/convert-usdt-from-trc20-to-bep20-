@@ -1,0 +1,20 @@
+{{ define "content" }}
+<div class="card card-flush">
+  <div class="table-wrap"><table>
+    <thead><tr><th>When</th><th>Who</th><th>What</th><th>On</th><th>Details</th></tr></thead>
+    <tbody>
+    {{ range .Entries }}
+    <tr>
+      <td class="nowrap">{{ template "time" .Time }}</td>
+      <td>{{ .Operator }}</td>
+      <td class="mono">{{ .Action }}</td>
+      <td class="mono">{{ .Target }}</td>
+      <td class="small">{{ range $k, $v := .Detail }}<div><span class="muted">{{ $k }}:</span> {{ $v }}</div>{{ end }}</td>
+    </tr>
+    {{ else }}
+    <tr><td colspan="5" class="empty">No changes recorded yet.</td></tr>
+    {{ end }}
+    </tbody>
+  </table></div>
+</div>
+{{ end }}

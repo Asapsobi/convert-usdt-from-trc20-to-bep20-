@@ -1,0 +1,38 @@
+{{ define "content" }}
+<div class="alert alert-info" style="margin-bottom:16px"><div>
+  <div class="title">What these are</div>
+  <div class="body">Usually a customer who paid after their order expired, or paid twice. The money sits in the deposit wallet: refund the sender from there, then record what you did here so it isn't handled twice.</div>
+</div></div>
+<div class="tabs">
+  <a href="/deposits" class="{{ if not .Resolved }}active{{ end }}">Open</a>
+  <a href="/deposits?show=resolved" class="{{ if .Resolved }}active{{ end }}">Resolved</a>
+</div>
+<div class="card card-flush">
+  <div class="table-wrap"><table>
+    <thead><tr><th>Detected</th><th>Chain</th><th>Wallet last used by</th><th class="num">Amount</th><th>Transaction</th><th>Order was</th><th>{{ if .Resolved }}Resolution{{ else }}Record what you did{{ end }}</th></tr></thead>
+    <tbody>
+    {{ range .Deposits }}
+    <tr>
+      <td class="nowrap">{{ template "time" .DetectedAt }}</td>
+      <td>{{ template "chain" .Chain }}</td>
+      <td>{{ with .ExternalID }}<a href="/orders/{{ . }}">{{ short . }}</a>{{ else }}<span class="muted">order #{{ .OrderID }}</span>{{ end }}</td>
+      <td class="num">{{ num .Amount }} <span class="muted small">USDT</span></td>
+      <td>{{ template "tx" (dict "Chain" .Chain "Hash" .Tx) }}</td>
+      <td>{{ template "status" .OrderStateAtDetection }}</td>
+      <td>
+        {{ if .Resolution }}{{ deref .Resolution }}<div class="muted small">{{ with .ResolvedBy }}{{ . }}{{ end }}{{ with .ResolvedAt }} · {{ template "time" . }}{{ end }}</div>
+        {{ else }}
+        <form class="inline" method="post" action="/deposits/{{ .Key }}/{{ .ID }}/resolve" data-confirm="Mark this payment as handled? Do this only after you have refunded it.">
+          <input type="text" name="resolution" class="w-md" placeholder="e.g. refunded in tx 0x…" required>
+          <button class="btn btn-sm" type="submit">Mark resolved</button>
+        </form>
+        {{ end }}
+      </td>
+    </tr>
+    {{ else }}
+    <tr><td colspan="7" class="empty">{{ if .Resolved }}Nothing resolved yet.{{ else }}No unmatched payments. Every deposit belonged to an order.{{ end }}</td></tr>
+    {{ end }}
+    </tbody>
+  </table></div>
+</div>
+{{ end }}

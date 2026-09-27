@@ -298,22 +298,24 @@ type relayLegSummary struct {
 	UpdatedAt            string  `json:"updated_at"`
 
 	// What actually happened, for full transaction tracking.
-	CustomerLabel   *string `json:"customer_label,omitempty"`
-	DepositAddress  string  `json:"deposit_address"`
-	SenderAddress   *string `json:"sender_address,omitempty"`
-	ProfitBPS       *int64  `json:"profit_bps,omitempty"`
-	ReceivedAmount  *string `json:"received_amount,omitempty"`
-	ProfitAmount    *string `json:"profit_amount,omitempty"`
-	ForwardAmount   *string `json:"forward_amount,omitempty"`
-	VendorFeeAmount *string `json:"vendor_fee_amount,omitempty"`
-	LeaseReleasedAt *string `json:"lease_released_at,omitempty"`
-	PayoutTxID      *string `json:"payout_tx_id,omitempty"`
+	UpstreamDepositAddress *string `json:"upstream_deposit_address,omitempty"`
+	CustomerLabel          *string `json:"customer_label,omitempty"`
+	DepositAddress         string  `json:"deposit_address"`
+	SenderAddress          *string `json:"sender_address,omitempty"`
+	ProfitBPS              *int64  `json:"profit_bps,omitempty"`
+	ReceivedAmount         *string `json:"received_amount,omitempty"`
+	ProfitAmount           *string `json:"profit_amount,omitempty"`
+	ForwardAmount          *string `json:"forward_amount,omitempty"`
+	VendorFeeAmount        *string `json:"vendor_fee_amount,omitempty"`
+	LeaseReleasedAt        *string `json:"lease_released_at,omitempty"`
+	PayoutTxID             *string `json:"payout_tx_id,omitempty"`
 }
 
 // addTracking fills in what actually happened on leg.
 func addTracking(summary *relayLegSummary, leg relay.Leg) {
 	summary.CustomerLabel, summary.DepositAddress, summary.SenderAddress = leg.CustomerLabel, leg.DepositAddress, leg.SenderAddress
 	summary.ProfitBPS, summary.PayoutTxID = leg.ProfitBPS, leg.PayoutTxID
+	summary.UpstreamDepositAddress = leg.UpstreamDepositAddress
 	for _, f := range []struct {
 		src *money.Amount
 		dst **string

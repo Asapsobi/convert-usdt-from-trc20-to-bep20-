@@ -1,0 +1,51 @@
+{{ define "content" }}
+<div class="tabs">
+  <a href="/wallets/bsc" class="{{ if eq .Chain "bsc" }}active{{ end }}">BSC</a>
+  <a href="/wallets/tron" class="{{ if eq .Chain "tron" }}active{{ end }}">TRON</a>
+</div>
+<div class="row">
+  <div class="card" style="flex:1 1 300px">
+    <h2>{{ .ChainName }} pool</h2>
+    <div class="stats">
+      <div class="kpi"><div class="label">Wallets</div><div class="value">{{ len .Wallets }}{{ with .Settings }}<span class="muted small"> / {{ if eq .MaxWallets 0 }}no new{{ else }}{{ .MaxWallets }}{{ end }}</span>{{ end }}</div></div>
+      <div class="kpi"><div class="label">Serving orders</div><div class="value">{{ .InUse }}</div></div>
+      <div class="kpi"><div class="label">Free now</div><div class="value">{{ .Free }}</div></div>
+    </div>
+    <p class="muted small">A wallet that has been used before is always chosen first. A new wallet is added only when every wallet is busy, since each one costs money (its own top-ups and sweeps, and on TRON an activation).</p>
+    {{ with .Settings }}
+    <form method="post" action="/wallets/{{ $.Chain }}/settings" data-confirm="Change the {{ $.ChainName }} pool settings?">
+      <div class="field"><label>Most wallets the pool may grow to</label><input type="number" name="max_wallets" min="0" value="{{ .MaxWallets }}"><div class="hint">0 = never add a new wallet; only the existing ones are used.</div></div>
+      <div class="field"><label>Rest after a completed order</label><input type="text" name="cooldown_after_use" value="{{ .CooldownAfterUse }}"><div class="hint">e.g. 30m. Keeps a late second payment from landing in the next customer's order.</div></div>
+      <div class="field"><label>Rest after an unpaid order expires</label><input type="text" name="cooldown_after_expiry" value="{{ .CooldownAfterExpiry }}"><div class="hint">e.g. 6h. That customer may still pay late.</div></div>
+      <button class="btn btn-primary" type="submit">Save</button>
+    </form>
+    {{ end }}
+    <form method="post" action="/wallets/{{ .Chain }}/add" style="margin-top:14px" data-confirm="Add a new {{ .ChainName }} deposit wallet now? It costs money once used, and the pool adds wallets by itself when all are busy.">
+      <button class="btn btn-sm" type="submit">Add a wallet by hand</button>
+    </form>
+  </div>
+  <div class="card card-flush" style="flex:3 1 560px">
+    <div class="card-head"><h2>Wallets</h2></div>
+    <div class="table-wrap" style="margin-top:12px"><table>
+      <thead><tr><th>Wallet</th><th>Now</th><th class="num">Orders</th><th class="num">Unswept profit</th><th>On chain</th><th>Last used</th><th></th></tr></thead>
+      <tbody>
+      {{ range .Wallets }}
+      <tr>
+        <td>{{ template "addr" .Address }}<div class="muted small">index {{ .DerivationIndex }}</div></td>
+        <td>{{ if ne .Status "ACTIVE" }}<span class="badge tone-neutral">Disabled</span>
+            {{ else if .Lease }}<span class="badge tone-info">Serving</span> <a href="/orders/{{ .Lease.ExternalID }}">{{ short .Lease.ExternalID }}</a>
+            {{ else if .Available }}<span class="badge tone-ok">Free</span>
+            {{ else }}<span class="badge tone-warn">Resting until {{ .AvailableAfter.Local.Format "15:04" }}</span>{{ end }}</td>
+        <td class="num">{{ with .Profit }}{{ .Legs }}{{ else }}0{{ end }}</td>
+        <td class="num">{{ with .Profit }}{{ num .Unswept }}{{ else }}0{{ end }}</td>
+        <td class="small">{{ with .Profit }}{{ template "balance" .OnChain }}{{ else }}<span class="muted">—</span>{{ end }}</td>
+        <td class="nowrap">{{ with .LastLeasedAt }}{{ template "ago" . }}{{ else }}<span class="muted">never</span>{{ end }}</td>
+        <td class="right"><form class="inline" method="post" action="/wallets/{{ $.Chain }}/{{ .Address }}/{{ if eq .Status "ACTIVE" }}disable{{ else }}enable{{ end }}"{{ if eq .Status "ACTIVE" }} data-confirm="Disable this wallet? It won't be given to new orders, but stays watched and sweepable."{{ end }}>
+          <button class="btn btn-sm{{ if eq .Status "ACTIVE" }} btn-danger{{ end }}" type="submit">{{ if eq .Status "ACTIVE" }}Disable{{ else }}Enable{{ end }}</button></form></td>
+      </tr>
+      {{ else }}<tr><td colspan="7" class="empty">No wallets yet. The first order creates one.</td></tr>{{ end }}
+      </tbody>
+    </table></div>
+  </div>
+</div>
+{{ end }}
